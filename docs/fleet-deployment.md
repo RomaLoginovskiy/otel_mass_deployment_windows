@@ -41,10 +41,14 @@ Two ideas do the heavy lifting:
    the repo's local-mode `config.yaml`.
 
 2. **Selector attributes.** `Detect-Workloads.ps1` sets machine-level
-   `OTEL_RESOURCE_ATTRIBUTES`. The base config's `resourcedetection/env` promotes
-   those into resource attributes; the Supervisor reports the collector's resource
+   `OTEL_RESOURCE_ATTRIBUTES`. `Install-CoralogixSupervisor.ps1` then writes those
+   `cx.host.role` / `workload.*` pairs into the OpAMP Supervisor config's
+   `agent.description.non_identifying_attributes`, so the Supervisor advertises them
    in its OpAMP **AgentDescription**. Coralogix Fleet Management can then group /
-   target agents by `cx.host.role` and `workload.*`.
+   target agents by `cx.host.role` and `workload.*`. (The base config's
+   `resourcedetection/env` also stamps them onto the telemetry **data**, but the
+   AgentDescription — not the data — is what Fleet Management reads for selectors, so
+   the Supervisor-side injection is what actually makes them selectable.)
 
 ---
 
@@ -333,7 +337,7 @@ in production. To exercise a Fleet-Management-managed agent on a SMBIOS-less VM,
 | --- | --- |
 | Service won't start | Base config needs `file_storage` → installer must pass `-EnableDynamicIISParsing` (it does). Run `validate`. Confirm `CORALOGIX_PRIVATE_KEY` set on the service. |
 | Agent not in Fleet Management | Supervisor can't reach OpAMP: check `CORALOGIX_DOMAIN`/key, and that the **base config has no opamp extension**. |
-| Selector attributes missing | `OTEL_RESOURCE_ATTRIBUTES` not set (detection needs elevation) or collector not restarted after detection. Orchestrator restarts it; re-run if needed. |
+| Selector attributes (`cx.host.role`/`workload.*`) not shown in Fleet Management | They must be in the **Supervisor** config `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` (the vendor template writes only static `service.name`/`cx.agent.type`). `Install-CoralogixSupervisor.ps1` injects them post-install + restarts `opampsupervisor`. If still absent: detection didn't run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed the `non_identifying_attributes:` anchor. Re-run deploy, or patch `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml` + restart. |
 | No IIS telemetry | ASP.NET Core pool not "No Managed Code"; recycle after fixing. |
 | GitHub download TLS error | Older Server defaults to TLS 1.0; scripts enable TLS 1.2 first. |
 | BatchPatch row failed | Read `install-agent.log` on the host; `deploy.bat` propagates the PowerShell exit code. |

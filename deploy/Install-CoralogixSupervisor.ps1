@@ -45,7 +45,11 @@ param(
     [string] $KeyFile    = (Join-Path $PSScriptRoot 'SendDataKey.txt'),
     [string] $BaseConfig = (Join-Path $PSScriptRoot 'config.supervisor.yaml'),
     [string] $StageDir   = 'C:\otel',
-    [string] $Version    = $null
+    [string] $Version    = $null,
+    # Comma-separated key=value selector attributes (cx.host.role, workload.*) to publish
+    # in the OpAMP AgentDescription. Defaults to machine OTEL_RESOURCE_ATTRIBUTES (set by
+    # Detect-Workloads.ps1) when omitted.
+    [string] $ResourceAttributes = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,7 +62,71 @@ function Assert-Admin {
     }
 }
 
+function Set-SupervisorDescriptionAttributes {
+    <#
+      Inject the detected selector attributes (cx.host.role, workload.*) into the OpAMP
+      Supervisor's config.yaml `agent.description.non_identifying_attributes`, so they show
+      up in the Coralogix Fleet Management AgentDescription. The vendor installer writes
+      only static service.name/cx.agent.type there. Best-effort: never fails the install.
+    #>
+    param([string] $ConfigPath, [string] $Attributes)
+
+    if ([string]::IsNullOrWhiteSpace($Attributes)) {
+        Write-Warning "[supervisor] no OTEL_RESOURCE_ATTRIBUTES to publish to AgentDescription; skipping"
+        return
+    }
+    if (-not (Test-Path $ConfigPath)) {
+        Write-Warning "[supervisor] supervisor config not found at $ConfigPath; cannot publish selector attributes"
+        return
+    }
+
+    # Parse "k1=v1,k2=v2" -> ordered pairs (split each token on the FIRST '=' only).
+    $pairs = [ordered]@{}
+    foreach ($tok in ($Attributes -split ',')) {
+        $t = $tok.Trim(); if (-not $t) { continue }
+        $eq = $t.IndexOf('='); if ($eq -lt 1) { continue }
+        $pairs[$t.Substring(0, $eq).Trim()] = $t.Substring($eq + 1).Trim()
+    }
+    if ($pairs.Count -eq 0) { Write-Warning "[supervisor] no valid key=value pairs parsed; skipping"; return }
+
+    $lines  = Get-Content -Path $ConfigPath
+    $anchor = -1; $indent = ''
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^(\s*)non_identifying_attributes:\s*$') { $anchor = $i; $indent = $Matches[1]; break }
+    }
+    if ($anchor -lt 0) {
+        Write-Warning "[supervisor] 'non_identifying_attributes:' not found in $ConfigPath (vendor template changed?); skipping selector publish"
+        return
+    }
+    $itemIndent = $indent + '  '
+
+    # Keys already present in the block (child lines indented under the anchor).
+    $existing = @{}
+    for ($j = $anchor + 1; $j -lt $lines.Count; $j++) {
+        if ($lines[$j] -match '^\s*#') { continue }
+        if ($lines[$j] -notmatch ("^" + [regex]::Escape($itemIndent) + "\S")) { break }
+        if ($lines[$j] -match '^\s*([^:\s]+)\s*:') { $existing[$Matches[1]] = $true }
+    }
+
+    $insert = @(); $added = @()
+    foreach ($k in $pairs.Keys) {
+        if ($existing.ContainsKey($k)) { continue }
+        $insert += ('{0}{1}: "{2}"' -f $itemIndent, $k, $pairs[$k]); $added += $k
+    }
+    if ($insert.Count -eq 0) { Write-Host "[supervisor] AgentDescription already carries the selector attributes"; return }
+
+    $new = @($lines[0..$anchor]) + $insert
+    if (($anchor + 1) -le ($lines.Count - 1)) { $new += $lines[($anchor + 1)..($lines.Count - 1)] }
+    Set-Content -Path $ConfigPath -Value $new -Encoding utf8
+    Write-Host "[supervisor] published selector attributes to AgentDescription ($($insert.Count) added): $($added -join ', ')"
+}
+
 Assert-Admin
+
+# Default the selector attributes to what Detect-Workloads.ps1 persisted machine-wide.
+if (-not $ResourceAttributes) {
+    $ResourceAttributes = [Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES', 'Machine')
+}
 
 # TLS 1.2 for GitHub downloads on older Windows Server SKUs
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
@@ -114,6 +182,19 @@ Write-Host "[supervisor] running installer: -Supervisor -SupervisorCollectorBase
 if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
     throw "Vendor installer exited with code $LASTEXITCODE"
 }
+
+# ---- Publish selector attributes to the OpAMP AgentDescription ----------------
+# The vendor installer writes only static service.name/cx.agent.type into the supervisor
+# config's agent.description. Inject the detected cx.host.role/workload.* so Coralogix
+# Fleet Management can group / assign config by them, then restart to apply.
+$supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Supervisor\config.yaml'
+Set-SupervisorDescriptionAttributes -ConfigPath $supervisorConfig -Attributes $ResourceAttributes
+try {
+    if (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue) {
+        Restart-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
+        Write-Host "[supervisor] restarted opampsupervisor to apply AgentDescription attributes"
+    }
+} catch { Write-Warning "[supervisor] could not restart opampsupervisor: $_" }
 
 # ---- Verify -------------------------------------------------------------------
 Start-Sleep -Seconds 6

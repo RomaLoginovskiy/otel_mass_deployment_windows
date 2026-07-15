@@ -102,6 +102,8 @@ try {
     # -- 2. Install collector in Supervisor mode --------------------------------
     $supArgs = @{ Domain = $Domain; BaseConfig = (Join-Path $here 'config.supervisor.yaml') }
     if ($PrivateKey) { $supArgs['PrivateKey'] = $PrivateKey } else { $supArgs['KeyFile'] = $KeyFile }
+    # Publish the detected selector attributes in the OpAMP AgentDescription (Fleet Mgmt).
+    if ($roles.OtelResourceAttributes) { $supArgs['ResourceAttributes'] = $roles.OtelResourceAttributes }
     & (Join-Path $here 'Install-CoralogixSupervisor.ps1') @supArgs
     $status.supervisor = $true
 
