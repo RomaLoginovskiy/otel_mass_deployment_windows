@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SQL Server client. OTel .NET auto-instrumentation traces SqlClient calls,
+         producing db.system=mssql spans that populate the DB span-metrics pipeline. -->
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.*" />
+  </ItemGroup>
+
+</Project>

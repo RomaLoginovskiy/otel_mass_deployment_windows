@@ -1,0 +1,44 @@
+# === Large blobs / VM images ===
+vm_images/
+*.iso
+*.vhd
+*.vhdx
+*.vmdk
+*.ova
+*.img
+
+# === Archives ===
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.rar
+
+# === .NET build output ===
+[Bb]in/
+[Oo]bj/
+publish/
+[Pp]ublish/
+*.dll
+*.exe
+*.pdb
+
+# === Visual Studio ===
+.vs/
+*.user
+*.suo
+
+# === Logs ===
+*.log
+
+# === Secrets ===
+SendDataKey.txt
+*.env
+.env
+
+# === Windows junk ===
+nul
+Thumbs.db
+Desktop.ini

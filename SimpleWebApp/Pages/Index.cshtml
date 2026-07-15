@@ -1,0 +1,16 @@
+﻿@page
+@model IndexModel
+@{
+    ViewData["Title"] = "IIS Instrumentation Test";
+}
+
+<div class="text-center">
+    <h1 class="display-4">IIS Instrumentation Test — running on ASP.NET Core 8</h1>
+    <p class="lead">This Razor Pages app is hosted under IIS via the ASP.NET Core Module (in-process).</p>
+    <p>
+        Server time (UTC): <strong>@DateTime.UtcNow.ToString("u")</strong><br />
+        Machine: <strong>@Environment.MachineName</strong><br />
+        Runtime: <strong>@System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription</strong>
+    </p>
+    <p><a href="/health">/health</a> returns JSON liveness info.</p>
+</div>
