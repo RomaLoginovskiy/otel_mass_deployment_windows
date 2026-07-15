@@ -111,8 +111,13 @@ switch ($Action) {
         VBox @gc mkdir "$GuestStageDir" --parents
         VBox @gc copyto "$cfg" "$GuestStageDir\Configure-Guest.ps1"
         Write-Host "[poc] running Configure-Guest.ps1 in guest ..."
-        VBox @gc run --exe 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' --wait-stdout --wait-stderr -- `
-            powershell -NoProfile -ExecutionPolicy Bypass -File "$GuestStageDir\Configure-Guest.ps1"
+        # NOTE: '--' MUST be quoted. PowerShell strips a bare -- token (its
+        # end-of-parameters marker) before it reaches VBoxManage, which then
+        # parses -NoProfile as its own option and fails. Quoting passes it through.
+        # Args after -- go straight to powershell.exe (arg0 = the --exe path), so
+        # do NOT repeat a leading 'powershell' token.
+        VBox @gc run --exe 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' --wait-stdout --wait-stderr `
+            '--' -NoProfile -ExecutionPolicy Bypass -File "$GuestStageDir\Configure-Guest.ps1"
         Write-Host "[poc] guest configured (IIS + WinRM/firewall). Ready for BatchPatch / Deploy."
     }
 
@@ -147,8 +152,8 @@ switch ($Action) {
         VBox @gc copyto "$PackagePath" "$guestZip"
 
         Write-Host "[poc] expanding + running deploy.bat in guest ..."
-        VBox @gc run --exe 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' --wait-stdout --wait-stderr -- `
-            powershell -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '$guestZip' -DestinationPath '$GuestStageDir\pkg' -Force"
+        VBox @gc run --exe 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' --wait-stdout --wait-stderr `
+            '--' -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '$guestZip' -DestinationPath '$GuestStageDir\pkg' -Force"
         VBox @gc run --exe "$GuestStageDir\pkg\deploy.bat" --wait-stdout --wait-stderr
         Write-Host "[poc] deploy.bat completed in guest. Check Coralogix Fleet Management for the agent."
     }

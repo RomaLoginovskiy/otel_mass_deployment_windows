@@ -273,21 +273,15 @@ processors:
     system:
       resource_attributes:
         # host.cpu.* require SMBIOS Type 4 (processor info). Some VMs (VirtualBox)
-        # and cloud hosts do not expose it, and the system detector then FAILS,
-        # crashing the whole collector on startup. Disabled for portability -
-        # host.id/ip/mac/os.description are enough for entity correlation.
-        host.cpu.cache.l2.size:
-          enabled: false
-        host.cpu.family:
-          enabled: false
-        host.cpu.model.id:
-          enabled: false
-        host.cpu.model.name:
-          enabled: false
-        host.cpu.stepping:
-          enabled: false
-        host.cpu.vendor.id:
-          enabled: false
+        # and cloud hosts do not expose it, and the system detector then FAILS to
+        # start ("failed getting host cpuinfo: SMBIOS processor information not
+        # found"), crash-looping the whole collector. These attributes are
+        # DISABLED BY DEFAULT, so we simply do NOT list them here: in collector
+        # v0.155.0 the mere PRESENCE of a host.cpu.* key (even `enabled: false`)
+        # initializes the SMBIOS CPU reader and triggers the fatal read. The sister
+        # detector resourcedetection/env lists no host.cpu.* keys and never crashes.
+        # host.id/ip/mac/os.description do NOT use SMBIOS and are enough for entity
+        # correlation. Real hardware exposes SMBIOS; this keeps the config portable.
         host.id:
           enabled: true
         host.ip:

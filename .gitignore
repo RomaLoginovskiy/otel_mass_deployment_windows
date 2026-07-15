@@ -1,5 +1,7 @@
 # === Large blobs / VM images ===
 vm_images/
+misc/
+
 *.iso
 *.vhd
 *.vhdx
