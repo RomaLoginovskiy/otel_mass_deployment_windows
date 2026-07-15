@@ -117,17 +117,31 @@ try {
     }
 
     # -- 4. Restart collector to pick up OTEL_RESOURCE_ATTRIBUTES ----------------
-    $svc = Get-Service -Name 'otelcol-contrib' -ErrorAction SilentlyContinue
-    if ($svc) {
+    # In Supervisor mode there is NO 'otelcol-contrib' service - the collector runs
+    # as a CHILD process of 'opampsupervisor'. Restart the supervisor (which
+    # relaunches the collector) so it re-reads the machine OTEL_RESOURCE_ATTRIBUTES.
+    # Fall back to the 'otelcol-contrib' service for local (non-supervisor) mode.
+    $sup = Get-Service -Name 'opampsupervisor'  -ErrorAction SilentlyContinue
+    $col = Get-Service -Name 'otelcol-contrib'  -ErrorAction SilentlyContinue
+    if ($sup) {
+        Write-Host "[agent] restarting opampsupervisor to apply resource attributes"
+        Restart-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
+    } elseif ($col) {
         Write-Host "[agent] restarting otelcol-contrib to apply resource attributes"
         Restart-Service -Name 'otelcol-contrib' -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 5
     }
 
-    try {
-        $r = Invoke-WebRequest -Uri 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 10
-        $status.healthOk = ($r.StatusCode -eq 200)
-    } catch { $status.healthOk = $false }
+    # Health check WITH RETRIES: the collector needs a moment to come up, and the
+    # supervisor may relaunch it once during the initial OpAMP handshake. A single
+    # immediate probe reports a false negative (503 while starting).
+    $status.healthOk = $false
+    for ($i = 0; $i -lt 12; $i++) {
+        Start-Sleep -Seconds 5
+        try {
+            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 8
+            if ($r.StatusCode -eq 200) { $status.healthOk = $true; break }
+        } catch { }
+    }
 
     $status.result = if ($status.supervisor) { 'success' } else { 'partial' }
     Write-Host "=== done: role=$($status.primaryRole) workloads=[$($status.workloads -join ',')] iisInstrumented=$($status.iisInstrumented) health=$($status.healthOk) ==="
