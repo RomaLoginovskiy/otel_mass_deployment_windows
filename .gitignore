@@ -23,6 +23,7 @@ misc/
 [Oo]bj/
 publish/
 [Pp]ublish/
+.claude
 *.dll
 *.exe
 *.pdb
@@ -39,7 +40,7 @@ publish/
 SendDataKey.txt
 *.env
 .env
-.*claude
+
 
 # === Windows junk ===
 nul
