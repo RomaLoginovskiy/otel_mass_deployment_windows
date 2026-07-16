@@ -191,10 +191,15 @@ $supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Superviso
 Set-SupervisorDescriptionAttributes -ConfigPath $supervisorConfig -Attributes $ResourceAttributes
 try {
     if (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue) {
+        # The vendor installer registers the service with StartType=Manual. After a reboot the
+        # supervisor stays Stopped -> the agent silently drops off Fleet Management and no
+        # telemetry ships until someone starts it by hand. Force Automatic so it survives reboots.
+        Set-Service -Name 'opampsupervisor' -StartupType Automatic -ErrorAction SilentlyContinue
+        Write-Host "[supervisor] set opampsupervisor StartType=Automatic (survives reboot)"
         Restart-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
         Write-Host "[supervisor] restarted opampsupervisor to apply AgentDescription attributes"
     }
-} catch { Write-Warning "[supervisor] could not restart opampsupervisor: $_" }
+} catch { Write-Warning "[supervisor] could not configure/restart opampsupervisor: $_" }
 
 # ---- Verify -------------------------------------------------------------------
 Start-Sleep -Seconds 6
@@ -202,7 +207,7 @@ Write-Host ""
 Write-Host "[supervisor] services:"
 Get-Service -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -match 'otel|coralogix|opamp|supervisor' } |
-    Format-Table Name, Status, DisplayName -AutoSize | Out-String | Write-Host
+    Format-Table Name, Status, StartType, DisplayName -AutoSize | Out-String | Write-Host
 
 $health = $false
 try {
