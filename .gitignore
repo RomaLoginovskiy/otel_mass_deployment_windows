@@ -39,6 +39,7 @@ publish/
 SendDataKey.txt
 *.env
 .env
+.*claude
 
 # === Windows junk ===
 nul
