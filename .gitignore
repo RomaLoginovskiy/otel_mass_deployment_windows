@@ -38,6 +38,7 @@ publish/
 
 # === Secrets ===
 SendDataKey.txt
+admin_coralogix.txt
 *.env
 .env
 
