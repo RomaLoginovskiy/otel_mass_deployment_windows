@@ -40,8 +40,10 @@ Follow [`docs/iis-instrumentation.md`](docs/iis-instrumentation.md). In short:
    `config.yaml`.
 2. Install the OpenTelemetry .NET auto-instrumentation (Windows PowerShell **5.1**,
    elevated): `Import-Module` → `Install-OpenTelemetryCore` → `Register-OpenTelemetryForIIS`.
-3. Point apps at the local collector (`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`)
-   and set `OTEL_SERVICE_NAME` per app.
+3. Point apps at the local collector (`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`).
+   `Instrument-IIS.ps1` (or `deploy-app.ps1 -InstrumentAllApps`) auto-discovers every IIS
+   site/app and sets a distinct `OTEL_SERVICE_NAME` per app from the site name + app path
+   (root app → site name; nested `/api` → `Site/api`).
 4. ASP.NET **Core** pools must be **"No Managed Code"** or they emit nothing.
 
 ### Fleet (scripted)

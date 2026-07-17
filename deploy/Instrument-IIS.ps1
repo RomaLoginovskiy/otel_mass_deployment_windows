@@ -11,7 +11,10 @@
        before core files are in place).
     2. Set the OTLP endpoint host-wide via applicationPoolDefaults environment
        variables (so all pools inherit it) - the fleet-friendly "set once" pattern.
-       OTEL_SERVICE_NAME is intentionally left per-app / auto-generated.
+    2b. Enumerate every IIS site + application and assign each a distinct
+       OTEL_SERVICE_NAME derived from the site name + app path (see
+       Resolve-IISServiceNames.ps1). Dedicated pools get the name on the pool; apps
+       that share a pool get it in their own web.config.
     3. Recycle IIS so workers pick up the new environment.
 
   IMPORTANT: This requires Windows PowerShell 5.1 (NOT PowerShell 7) for the
@@ -28,6 +31,13 @@
   Pass -NoReset to Register-OpenTelemetryForIIS and skip the final iisreset (recycle
   manually later, e.g. during a maintenance window).
 
+.PARAMETER ServiceNameOverrides
+  Optional hashtable to rename specific apps, keyed by the auto-derived service name
+  (e.g. @{ 'Wallet/api' = 'wallet-api' }). Merged over the JSON file if both are given.
+
+.PARAMETER OverridesJson
+  Optional path to a JSON file of the same { autoName = overrideName } shape.
+
 .NOTES
   Run elevated. The host-wide OTLP vars are set on <applicationPoolDefaults>, which
   only reaches pools that do not declare their own <environmentVariables> collection.
@@ -35,9 +45,11 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Version      = 'v1.16.0-beta.1',
-    [string] $OtlpEndpoint = 'http://localhost:4318',
-    [switch] $NoReset
+    [string]    $Version              = 'v1.16.0-beta.1',
+    [string]    $OtlpEndpoint          = 'http://localhost:4318',
+    [switch]    $NoReset,
+    [hashtable] $ServiceNameOverrides  = @{},
+    [string]    $OverridesJson
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,10 +99,49 @@ function Set-PoolDefaultEnv {
     Write-Host "[iis-instr] applicationPoolDefaults env: $Name=$Value"
 }
 
+function Set-PoolEnv {
+    # Set an env var on a specific named pool (not the defaults template).
+    param([string] $Pool, [string] $Name, [string] $Value)
+    & $appcmd set config -section:system.applicationHost/applicationPools `
+        "/-[name='$Pool'].environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
+    & $appcmd set config -section:system.applicationHost/applicationPools `
+        "/+[name='$Pool'].environmentVariables.[name='$Name',value='$Value']" /commit:apphost | Out-Null
+}
+
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
 
-Write-Host "[iis-instr] NOTE: OTEL_SERVICE_NAME is left per-app (web.config / appSettings) or auto-generated as SiteName\\VirtualDir."
+# ---- 2b. Per-app OTEL_SERVICE_NAME (auto-discovered) --------------------------
+# Merge overrides: JSON file first, then the -ServiceNameOverrides hashtable on top.
+if ($OverridesJson) {
+    if (-not (Test-Path $OverridesJson)) { throw "Overrides JSON not found: $OverridesJson" }
+    $fromFile = Get-Content -LiteralPath $OverridesJson -Raw | ConvertFrom-Json
+    foreach ($p in $fromFile.PSObject.Properties) {
+        if (-not $ServiceNameOverrides.ContainsKey($p.Name)) { $ServiceNameOverrides[$p.Name] = $p.Value }
+    }
+}
+
+. (Join-Path $PSScriptRoot 'Resolve-IISServiceNames.ps1')
+$svcMap = Get-IISServiceMap -Overrides $ServiceNameOverrides
+
+if (-not $svcMap -or @($svcMap).Count -eq 0) {
+    Write-Warning "[iis-instr] no IIS sites/applications found - no per-app service names set."
+} else {
+    Write-Host "[iis-instr] assigning per-app OTEL_SERVICE_NAME ($(@($svcMap).Count) app(s)):"
+    foreach ($r in $svcMap) {
+        Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}]" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope)
+        if ($r.Scope -eq 'pool') {
+            # A pool that declares its own <environmentVariables> stops inheriting the
+            # applicationPoolDefaults entries (see .NOTES), so re-set the OTLP vars here.
+            Set-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'           -Value $r.ServiceName
+            Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
+            Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+        } else {
+            # Shared pool: keep inheriting OTLP defaults, set only the per-app name in web.config.
+            [void](Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName)
+        }
+    }
+}
 
 # ---- 3. Recycle IIS -----------------------------------------------------------
 if ($NoReset) {
