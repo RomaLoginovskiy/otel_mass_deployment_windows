@@ -227,6 +227,14 @@ This is a REG_MULTI_SZ value with one `NAME=VALUE` entry per line. Add lines suc
 
 There is also a per app pool option: `Enable-OpenTelemetryForIISAppPool -AppPoolName <name>` and its `Disable-` counterpart toggle instrumentation for a single pool. An app pool environment variable takes precedence over the host-wide W3SVC registration. For setting the OTLP variables once across the apps that share a pool, see Part 4.
 
+**Automated multi-app naming (recommended).** Instead of editing each app by hand, `deploy/Instrument-IIS.ps1` (fleet) and `misc/deploy-app.ps1 -InstrumentAllApps` (single host) enumerate every IIS site and application via `deploy/Resolve-IISServiceNames.ps1` and assign each a distinct `OTEL_SERVICE_NAME`:
+
+- **Naming (site + app path).** A site's root application takes the site name (e.g. `Wallet`); a nested application mounted at `/api` becomes `Wallet/api`. This is the clean, explicit form of the `SiteName\VirtualDirectoryPath` name the profiler would otherwise auto-generate.
+- **Scope (dedicated pool vs shared pool).** An application that owns its app pool gets the name set on the pool — and the OTLP endpoint/protocol are re-set on that pool too, because a pool that declares its own `<environmentVariables>` stops inheriting `applicationPoolDefaults` (see Part 4). Applications that **share** a pool instead get the name written into each one's own `web.config`, since a single pool-level variable cannot distinguish co-hosted apps. Note: ASP.NET Core **in-process** hosting allows only one app per pool (a second in-process app in the same pool returns HTTP 500), so pool-sharing in practice means **out-of-process** or ASP.NET **Framework** apps — in-process apps each land on their own pool and take the pool-scoped path anyway.
+- **Overrides.** Rename specific apps with `-ServiceNameOverrides @{ 'Wallet/api' = 'wallet-api' }` or `-OverridesJson <file>` (keys are the auto-derived names).
+
+Classic ASP.NET **Framework** apps have no `<aspNetCore>` element, so the web.config writer skips them with a warning — set their name via `appSettings` as shown above. Because no app's name is stamped host-wide, host/infrastructure signals (hostmetrics, IIS receiver, event logs, access logs) no longer collapse under one app; they fall back to the collector's neutral `subsystem_name`.
+
 ### 4. Restart IIS or the pools
 
 After changing config, recycle so the workers pick up the new environment.
@@ -570,6 +578,10 @@ Redis and similar components are optional add-ons rather than a baseline, so kee
           hostname_sources: ["os"]
         override: false
     
+      # Only service.namespace is inserted (never a hard-coded service.name), so a
+      # multi-app host does not stamp one app's name onto shared signals. Per-app
+      # service.name arrives from each app's OTEL_SERVICE_NAME; signals without one
+      # fall back to the exporter's subsystem_name below.
       resource:
         attributes:
           - key: service.namespace
@@ -588,7 +600,9 @@ Redis and similar components are optional add-ons rather than a baseline, so kee
         domain: "eu1.coralogix.com"
         private_key: "${env:CORALOGIX_PRIVATE_KEY}"
         application_name: "iis-instrumentation-test"
-        subsystem_name: "SimpleWebApp"
+        # Neutral fallback subsystem for signals with no service.name (host/infra).
+        # Per-app telemetry keeps its own service.name -> subsystem via *_attributes.
+        subsystem_name: "windows"
         timeout: 30s
         sending_queue:
           enabled: true

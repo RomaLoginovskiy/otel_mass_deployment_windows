@@ -41,7 +41,7 @@ SendDataKey.txt
 admin_coralogix.txt
 *.env
 .env
-
+*[Kk]ey*.txt
 
 # === Windows junk ===
 nul

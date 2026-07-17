@@ -250,17 +250,17 @@ processors:
     - action: upsert
       key: k8s.cluster.name
       value: windows-iis
-  # service.name: links host/infra signals (hostmetrics, iis receiver, windows event
-  # logs, IIS access logs) that arrive without one to the app's service; insert = only
-  # when absent, so app telemetry (OTEL_SERVICE_NAME=SimpleWebApp) and collector
-  # self-metrics (service.name=opentelemetry-collector) keep theirs.
-  # service.namespace: absent everywhere, so insert unifies ALL signals under one
-  # Coralogix application (exporter maps service.namespace -> application name).
+  # Multi-app hosts: do NOT stamp a single app's service.name onto shared signals.
+  # Per-app service.name arrives from each app's OTEL_SERVICE_NAME (set by
+  # Instrument-IIS.ps1 / deploy-app.ps1 from the site + app path). Host/infra signals
+  # (hostmetrics, iis receiver, windows event logs, IIS access logs) that arrive
+  # without a service.name fall back to the exporter's subsystem_name default
+  # ('windows') instead of hijacking one app's name; collector self-metrics keep
+  # service.name=opentelemetry-collector. This matches deploy/config.supervisor.yaml.
+  # service.namespace: absent everywhere, so insert unifies ALL signals of this host
+  # under one Coralogix application (exporter maps service.namespace -> application name).
   resource/service:
     attributes:
-    - action: insert
-      key: service.name
-      value: SimpleWebApp
     - action: insert
       key: service.namespace
       value: iis-instrumentation-test

@@ -18,15 +18,14 @@ Open `config.yaml` in Notepad and replace the following values. Use **Edit → F
 
 | Find | Current value | Replace with |
 |---|---|---|
-| `resource/service:` → the `service.name` entry's `value:` | `SimpleWebApp` | Your application's service name |
 | `resource/service:` → the `service.namespace` entry's `value:` | `iis-instrumentation-test` | Your application grouping — becomes the Coralogix **application** name |
 | `k8s.cluster.name` → the `value:` line below it | `windows-iis` | A name that groups this host or fleet (display only) |
 | `domain:` (appears **twice**, under both `coralogix` exporters) and the `opamp` endpoint URL | `eu1.coralogix.com` | Your Coralogix region domain (e.g. `eu2.coralogix.com`, `us1.coralogix.com`) — replace in **all three places** |
 | `application_name:` under `exporters.coralogix` | `otel` | Optional: your application grouping name |
 | `subsystem_name:` under `exporters.coralogix` | `windows` | Optional: fallback subsystem for signals without a service name |
 
-What these two values control:
-- `service.name` — the service identity on host/infrastructure metrics, logs, and the host entity in Resource Catalog (used for ownership in Infrastructure Explorer). Signals that already have their own `service.name` — your instrumented application's traces, logs, and metrics — are never overwritten.
+What these values control:
+- **Per-app `service.name` comes from the apps, not this file.** Each IIS application sets its own `OTEL_SERVICE_NAME` (via `Instrument-IIS.ps1` / `deploy-app.ps1`, derived from the site name + app path), so this config deliberately does **not** insert a hard-coded `service.name` — that would stamp one app's name onto every host/infra signal on a multi-app host. Signals that arrive without a `service.name` (hostmetrics, IIS receiver, event logs, access logs) fall back to the `subsystem_name` value below.
 - `service.namespace` — mapped by the Coralogix exporter to the **application** name; applied to every signal that lacks it, so the whole host reports under one application.
 
 > **Do not** paste the API key into the file. It is read from an environment variable (next step).

@@ -167,7 +167,13 @@ When detection reports IIS, the orchestrator runs `Instrument-IIS.ps1`:
 - Sets the OTLP endpoint **host-wide** on `applicationPoolDefaults`
   (`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`,
   `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`) — the fleet "set once" pattern.
-- Leaves `OTEL_SERVICE_NAME` per-app / auto-generated.
+- Auto-discovers every IIS site + application (`Resolve-IISServiceNames.ps1`) and sets
+  a distinct `OTEL_SERVICE_NAME` for each, from the site name + app path (root app →
+  site name; nested app `/api` → `Site/api`). Apps on a **dedicated** pool get the name
+  on the pool (the OTLP endpoint/protocol are re-set there too, per the inheritance
+  rule below); apps that **share** a pool get it in their own `web.config`. Rename
+  specific apps with `-ServiceNameOverrides @{ 'Site/api' = 'custom' }` or
+  `-OverridesJson <path>`.
 
 Reminders from `iis-instrumentation.md`:
 - Requires **Windows PowerShell 5.1** (not 7).
