@@ -168,6 +168,8 @@ If the agent does not appear within a few minutes:
 6. **Activate** the configuration
 7. On the agent, ensure **Remote configuration** is enabled
 
+<img width="1136" height="702" alt="image" src="https://github.com/user-attachments/assets/394b3031-2bf4-448a-aa0e-b4a41eeeb467" />
+<img width="1888" height="814" alt="image" src="https://github.com/user-attachments/assets/fb229f3f-bc98-44da-833f-0cdeffc82a0a" />
 
 
 After Activate, on the host:
@@ -292,6 +294,7 @@ Screenshots show the expected Coralogix UI after Supervisor install + remote con
 
 Fleet Management Configurations list
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/1c745c4f-e2bc-4278-8e6a-e41ca221c087" />
 
 
 **What you are looking at**
@@ -311,6 +314,7 @@ This is where you control updates for a group of database hosts. Activate a new 
 
 Configuration editor with Agent selector and preview
 
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e247dc5a-d97b-4687-9b66-9e7098492b73" />
 
 
 **What you are looking at**
@@ -331,7 +335,7 @@ Metrics Explore showing Valkey labels on Redis-named metrics.
 
 **IMPORTANT NOTE: otel doesn’t have separate receiver for valkey, so we are using the redis receiver instead. The metrics for redis and valkey are same and below is how identify the valkey metirc.**
 
-
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/87502577-ff03-4f0f-925e-53dcceec5170" />
 
 **What you are looking at**
 
@@ -346,7 +350,7 @@ Valkey is scraped with the Redis receiver (same metric names). The remote config
 
 ### 4. Explore → Metrics — PostgreSQL flowing
 
-
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/ec2682b7-4508-4290-a13f-f54e04c426a8" />
 
 Metrics Explore showing PostgreSQL connection metric
 
