@@ -29,6 +29,7 @@ flowchart LR
 | `SimpleWebApp/` | A minimal ASP.NET Core 8 app (with a SQL Server call) used as an instrumentation target for testing. |
 | `misc/` | One-off / earlier scripts (single-host install, config fixes, load generation). |
 | `batchpatch.zip` | The BatchPatch tool itself — **not** the deploy package. |
+| `OtelLinuxDeployment/` | **Linux** path: OpAMP Supervisor install for Linux DB hosts (Redis/Valkey/PostgreSQL/Elasticsearch), managed via Fleet Management. See [`OtelLinuxDeployment/README.md`](OtelLinuxDeployment/README.md). |
 
 ## Two paths
 
@@ -62,6 +63,32 @@ Follow [`docs/fleet-deployment.md`](docs/fleet-deployment.md).
 # 3. Assign remote config in Coralogix Fleet Management, targeting agents by
 #    the cx.host.role / workload.* selector attributes detection published.
 ```
+
+### Linux (database hosts)
+
+For Linux DB servers (Redis, Valkey, PostgreSQL, Elasticsearch), follow
+[`OtelLinuxDeployment/README.md`](OtelLinuxDeployment/README.md). It installs the
+Coralogix **OpAMP Supervisor + OTel Collector** so config is owned remotely by
+Fleet Management — same pattern as the Windows fleet path.
+
+```bash
+# Copy the installer to the host, then run it with Fleet labels + DB credentials:
+sudo env \
+  CORALOGIX_PRIVATE_KEY="<send-your-data-key>" \
+  CORALOGIX_DOMAIN="<region-domain>" \
+  APP_TYPE="postgresql" \
+  ENV_TYPE="prod" \
+  POSTGRES_OTEL_PASSWORD="<otel_monitor_password>" \
+  ./install-supervisor-default.sh
+
+# Then create + Activate a Configuration group in Fleet Management, targeting
+# agents by the app.type / env.type labels set at install time.
+```
+
+The Supervisor tags each agent with `app.type` / `env.type` for Fleet grouping;
+`OtelLinuxDeployment/config.yaml` is a metrics/logs starting point to Activate
+remotely. Full env-var reference, verification steps, and troubleshooting live in
+that folder's README.
 
 ## The `deploy/` package
 
