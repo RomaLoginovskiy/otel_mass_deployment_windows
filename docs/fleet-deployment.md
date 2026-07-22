@@ -59,10 +59,14 @@ Two ideas do the heavy lifting:
 | File | Role |
 | --- | --- |
 | `deploy.bat` | BatchPatch remote-command entry; launches the orchestrator under PowerShell 5.1 |
+| `uninstall.bat` | BatchPatch remote-command entry for uninstall; launches `Uninstall-Agent.ps1` |
 | `Install-Agent.ps1` | Orchestrator: detect → install supervisor → conditional IIS → verify |
+| `Uninstall-Agent.ps1` | Reverse the install (manifest-guided); see **Uninstall** below |
 | `Detect-Workloads.ps1` | Workload detection → `OTEL_RESOURCE_ATTRIBUTES` + JSON summary |
 | `Install-CoralogixSupervisor.ps1` | Collector install with `-Supervisor` |
 | `Instrument-IIS.ps1` | Zero-code .NET auto-instrumentation (IIS hosts only) |
+| `Resolve-IISServiceNames.ps1` | Per-app service-name mapping + `web.config` read/write helpers |
+| `Backup-Config.ps1` | Backup + manifest helper; snapshots every config the install mutates |
 | `config.supervisor.yaml` | Base config = repo `config.yaml` **minus the opamp extension** |
 | `SendDataKey.txt` | Send-Your-Data key (or supply at deploy time — see below) |
 
@@ -97,6 +101,10 @@ BatchPatch has no atomic "copy + run" object, so we ship one folder and one
    - **Option A (key in package):** `deploy.bat`
    - **Option B (key at deploy time):**
      `set CORALOGIX_PRIVATE_KEY=cxtp_xxx && deploy.bat`
+   - **Environment label (optional, combine with either):** prepend
+     `set CX_ENVIRONMENT=<production|staging|dev> &&` to tag this host's telemetry
+     for the Coralogix per-environment split (see *Environment labeling* below), e.g.
+     `set CX_ENVIRONMENT=staging && set CORALOGIX_PRIVATE_KEY=cxtp_xxx && deploy.bat`.
 4. Run. BatchPatch executes `deploy.bat` elevated; a **non-zero exit code marks
    the row failed**. Per-host logs land next to the scripts:
    `install-agent.log`, `install-agent-status.json`, `detect-workloads.json`.
@@ -119,6 +127,26 @@ BatchPatch has no atomic "copy + run" object, so we ship one folder and one
    - `workload.elasticsearch = true` → Elasticsearch receiver overlay
 4. The remote config is **merged on top of** `config.supervisor.yaml`, so a fresh
    agent already ships host + Windows + IIS signals before any assignment.
+
+---
+
+## Environment labeling (per-environment split in Infra Explorer)
+
+Set **`CX_ENVIRONMENT`** on a host (via `deploy.bat`, or `Install-Agent.ps1
+-Environment <env>`) to tag *all* of that host's telemetry with the deployment
+environment, so Coralogix can separate `production` / `staging` / `dev` in Infra
+Explorer and APM.
+
+- Persisted as a machine env var by `Install-CoralogixSupervisor.ps1`.
+- The base `config.supervisor.yaml` has a `resource/environment` processor that
+  upserts it (from `${env:CX_ENVIRONMENT:-unspecified}`) onto every pipeline — host
+  metrics/logs, IIS logs, app spans, **and** the Infra Explorer host entity
+  (`logs/resource_catalog`) — under three keys: `tags.cx_environment`,
+  `tags.cx_env`, and the OTel semconv `deployment.environment.name`.
+- Unset → `unspecified` (a forgotten host is obvious, not silently "production").
+- The same value is also fed to the OpAMP AgentDescription
+  (`deployment.environment.name`) so you can **group by environment** in Fleet
+  Management.
 
 ---
 
@@ -321,6 +349,61 @@ in production. To exercise a Fleet-Management-managed agent on a SMBIOS-less VM,
 
 ---
 
+## Config backup
+
+Every install run opens a **backup session** and snapshots each config *before* it
+is mutated, plus a JSON manifest recording exactly what was added (so uninstall can
+reverse only the installer's own changes). Handled by `Backup-Config.ps1`, wired
+into the install scripts.
+
+- Location: `C:\ProgramData\CoralogixDeploy\backups\<yyyyMMddHHmmss>\`
+  - `manifest.json` — env vars (with `added`/prior value), pool env (with
+    `preexisted`), web.config edits (with prior value), backed-up files, registry exports.
+  - `applicationHost.config.bak`, `<app>-web.config.bak` — copies of the mutated configs.
+  - `W3SVC.reg` / `WAS.reg` — CLR-profiler registry export (pre-Register).
+  - supervisor `config.yaml` copy (pre-`non_identifying_attributes` inject).
+- `C:\ProgramData\CoralogixDeploy\backups\latest.json` points at the newest session;
+  uninstall reads it automatically.
+- `install-agent-status.json` includes the `backupDir` for the run.
+
+## Uninstall
+
+Reverse the install with the `uninstall.bat` remote command (mirrors `deploy.bat`),
+or run `Uninstall-Agent.ps1` directly (elevated). It reads the latest backup manifest
+and undoes **only fleet artifacts** — never a hosted app or any IIS site/pool.
+
+```
+# BatchPatch remote command (default: keep staged config + binaries):
+uninstall.bat
+
+# also delete staged config + vendor binaries:
+set CX_PURGE=1 && uninstall.bat
+
+# restore mutated configs from backup instead of surgical edits:
+set CX_RESTORE=1 && uninstall.bat
+```
+
+What it does, in order:
+1. **IIS de-instrument** — strip the installer's `OTEL_SERVICE_NAME` from each app
+   `web.config` (value-matched; a value someone else set is left alone, a pre-existing
+   value is restored), remove the `OTEL_*` `applicationHost.config` pool env vars the
+   installer added (entries flagged `preexisted` are kept), then vendor
+   `Unregister-OpenTelemetryForIIS` + `Uninstall-OpenTelemetryCore`.
+2. **Collector/supervisor** — vendor `-Uninstall`, then a hard fallback that stops +
+   `sc.exe delete`s `opampsupervisor` / `otelcol-contrib` if they remain. (The old
+   standalone uninstaller only ever removed `otelcol-contrib`.)
+3. **Machine env vars** — delete the ones the install created
+   (`OTEL_RESOURCE_ATTRIBUTES`, `CORALOGIX_DOMAIN`, `CORALOGIX_PRIVATE_KEY`,
+   `CX_ENVIRONMENT`); restore any that had a prior value.
+4. **`-Purge`** (opt-in) — also delete `C:\otel`, `C:\ProgramData\OpenTelemetry\Collector`,
+   `C:\ProgramData\opampsupervisor`, and the `OpenTelemetry {OpAMP Supervisor,Collector,
+   .NET AutoInstrumentation}` Program Files dirs. Off by default so a re-install is fast.
+5. **`iisreset`** (unless `-NoReset`) so workers drop the profiler + env changes.
+
+No manifest (e.g. an install done before backups existed)? Uninstall falls back to a
+conservative removal of the installer-owned names/services only. Result is written to
+`uninstall-agent-status.json`.
+
 ## Verification
 
 1. **Detection** — run `Detect-Workloads.ps1 -SetEnv:$false` on a host; confirm the
@@ -346,7 +429,9 @@ in production. To exercise a Fleet-Management-managed agent on a SMBIOS-less VM,
 | Selector attributes (`cx.host.role`/`workload.*`) not shown in Fleet Management | They must be in the **Supervisor** config `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` (the vendor template writes only static `service.name`/`cx.agent.type`). `Install-CoralogixSupervisor.ps1` injects them post-install + restarts `opampsupervisor`. If still absent: detection didn't run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed the `non_identifying_attributes:` anchor. Re-run deploy, or patch `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml` + restart. |
 | No IIS telemetry | ASP.NET Core pool not "No Managed Code"; recycle after fixing. |
 | GitHub download TLS error | Older Server defaults to TLS 1.0; scripts enable TLS 1.2 first. |
-| BatchPatch row failed | Read `install-agent.log` on the host; `deploy.bat` propagates the PowerShell exit code. |
+| BatchPatch row failed | Read `install-agent.log` (or `uninstall-agent.log`) on the host; `deploy.bat`/`uninstall.bat` propagate the PowerShell exit code. |
+| `opampsupervisor` still present after uninstall | Vendor `-Uninstall` doesn't always remove the supervisor service; `Uninstall-Agent.ps1` hard-deletes it via `sc.exe delete`. If it lingers, re-run `uninstall.bat`, or `Stop-Service opampsupervisor; sc.exe delete opampsupervisor`. |
+| IIS won't start after uninstall | A stale profiler entry in the W3SVC/WAS `Environment` REG_MULTI_SZ. `Unregister-OpenTelemetryForIIS` clears it; if hand-edited, restore `W3SVC.reg`/`WAS.reg` from the backup dir (`reg import`). |
 | Collector crash-loops, health → 503, log `failed getting host cpuinfo: SMBIOS processor information not found` | Host has no SMBIOS Type 4 (VirtualBox / some VMs). The base drops `host.cpu.*`, but a **Fleet-Management remote config** that re-adds them (or the `system` detector) overrides the base and re-triggers it. Remove `host.cpu.*` from the *assigned remote config* too, or don't assign one. Real fleet hardware is unaffected. |
 | `guestcontrol` fails after unattended install (`guest execution service not ready`) | Guest still in first-boot/OOBE. GA run level can read 3 before the exec service is up; wait for the desktop (a first-boot reboot settles it), then poll `guestcontrol run … echo <token>` on **exit code 0**, not a string match. |
 | POC `Deploy`/`Configure` fails `Unknown option: -NoProfile` | Old `Run-TestVM.ps1` passed a bare `--` to `VBoxManage`; PowerShell strips it. Fixed to `'--'`. Update the script. |

@@ -195,6 +195,15 @@ The apps need a few environment variables. The most important are the OTLP endpo
 | `OTEL_SERVICE_NAME` | unique per app | Names the service in APM |
 | `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=production,service.version=1.0.0` | Extra APM dimensions |
 
+> **Environment label.** To split telemetry by environment in Coralogix (Infra
+> Explorer / APM), set `CX_ENVIRONMENT` on the host. `deploy-app.ps1 -Environment
+> <staging|production|...>` sets the machine var and appends `tags.cx_environment`,
+> `tags.cx_env`, and `deployment.environment.name` to the app pool's
+> `OTEL_RESOURCE_ATTRIBUTES`; the collector's `resource/environment` processor (in
+> `SimpleWebApp\coralogix\config.yaml`) stamps the same three keys onto host/infra
+> signals from `${env:CX_ENVIRONMENT:-unspecified}`. Restart the collector after
+> setting the machine var so host signals pick it up.
+
 There are three places to set these, in increasing order of scope.
 
 **Per app, ASP.NET Core.** Add an `<environmentVariables>` block inside `<aspNetCore>` in that app's `web.config`.
@@ -227,7 +236,7 @@ This is a REG_MULTI_SZ value with one `NAME=VALUE` entry per line. Add lines suc
 
 There is also a per app pool option: `Enable-OpenTelemetryForIISAppPool -AppPoolName <name>` and its `Disable-` counterpart toggle instrumentation for a single pool. An app pool environment variable takes precedence over the host-wide W3SVC registration. For setting the OTLP variables once across the apps that share a pool, see Part 4.
 
-**Automated multi-app naming (recommended).** Instead of editing each app by hand, `deploy/Instrument-IIS.ps1` (fleet) and `misc/deploy-app.ps1 -InstrumentAllApps` (single host) enumerate every IIS site and application via `deploy/Resolve-IISServiceNames.ps1` and assign each a distinct `OTEL_SERVICE_NAME`:
+**Automated multi-app naming (recommended).** Instead of editing each app by hand, `deploy/Instrument-IIS.ps1` (fleet) and `scripts/deploy-app.ps1 -InstrumentAllApps` (single host) enumerate every IIS site and application via `deploy/Resolve-IISServiceNames.ps1` and assign each a distinct `OTEL_SERVICE_NAME`:
 
 - **Naming (site + app path).** A site's root application takes the site name (e.g. `Wallet`); a nested application mounted at `/api` becomes `Wallet/api`. This is the clean, explicit form of the `SiteName\VirtualDirectoryPath` name the profiler would otherwise auto-generate.
 - **Scope (dedicated pool vs shared pool).** An application that owns its app pool gets the name set on the pool — and the OTLP endpoint/protocol are re-set on that pool too, because a pool that declares its own `<environmentVariables>` stops inheriting `applicationPoolDefaults` (see Part 4). Applications that **share** a pool instead get the name written into each one's own `web.config`, since a single pool-level variable cannot distinguish co-hosted apps. Note: ASP.NET Core **in-process** hosting allows only one app per pool (a second in-process app in the same pool returns HTTP 500), so pool-sharing in practice means **out-of-process** or ASP.NET **Framework** apps — in-process apps each land on their own pool and take the pool-scoped path anyway.
@@ -250,6 +259,29 @@ Start-Service -Name W3SVC
 ```
 
 If the registry value has a trailing blank line, IIS refuses to start with "cannot contain empty strings". Remove the empty entry.
+
+### 5. Uninstall / rollback (single host)
+
+To reverse the instrumentation on one box, run the inverse of the register steps
+(elevated, Windows PowerShell 5.1). This clears the CLR-profiler entries from the
+`W3SVC`/`WAS` service `Environment` and removes the core files:
+
+```powershell
+Import-Module .\OpenTelemetry.DotNet.Auto.psm1
+Unregister-OpenTelemetryForIIS      # removes the profiler env from W3SVC/WAS + recycles IIS
+Uninstall-OpenTelemetryCore         # removes the auto-instrumentation core files
+```
+
+Then remove the per-app `OTEL_SERVICE_NAME` from any `web.config` you set it in,
+and the OTLP variables from `applicationPoolDefaults` / individual pools
+(the `appcmd ... /-` removal form — note `applicationPoolDefaults` takes **no**
+`[name=...]` predicate). Finally `iisreset`. Confirm `Get-Service W3SVC` is
+**Running** — a leftover trailing blank line in the profiler `Environment` value
+blocks IIS start (see the note above).
+
+> On a **fleet-deployed** host, do NOT do this by hand — run `uninstall.bat` /
+> `Uninstall-Agent.ps1`, which reverses all of the above from the backup manifest
+> (and removes the collector/supervisor too). See `docs/fleet-deployment.md`.
 
 ---
 
