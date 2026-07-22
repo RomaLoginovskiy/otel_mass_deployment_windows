@@ -33,6 +33,12 @@
 .PARAMETER Version
   Optional collector version to pin (passed to the vendor installer -Version).
 
+.PARAMETER Environment
+  Optional deployment environment (e.g. production/staging/dev). Persisted as the
+  machine env var CX_ENVIRONMENT, which the base config's resource/environment
+  processor stamps onto all signals (tags.cx_environment, tags.cx_env,
+  deployment.environment.name) so Coralogix can split telemetry by environment.
+
 .NOTES
   Run elevated (Administrator). The base config uses file_storage, so this script
   passes -EnableDynamicIISParsing to the vendor installer (otherwise the service
@@ -46,13 +52,24 @@ param(
     [string] $BaseConfig = (Join-Path $PSScriptRoot 'config.supervisor.yaml'),
     [string] $StageDir   = 'C:\otel',
     [string] $Version    = $null,
+    # Deployment environment -> machine env var CX_ENVIRONMENT (read by the base
+    # config's resource/environment processor).
+    [string] $Environment = $null,
     # Comma-separated key=value selector attributes (cx.host.role, workload.*) to publish
     # in the OpAMP AgentDescription. Defaults to machine OTEL_RESOURCE_ATTRIBUTES (set by
     # Detect-Workloads.ps1) when omitted.
-    [string] $ResourceAttributes = $null
+    [string] $ResourceAttributes = $null,
+    # Optional backup/manifest session (from Backup-Config.ps1, created by the
+    # orchestrator). When supplied, machine env vars and the supervisor config are
+    # recorded/backed up before they are set so uninstall can reverse them.
+    $Session = $null
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Optional backup/manifest recording (shared session from the orchestrator).
+$backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
+if (Test-Path $backupHelper) { . $backupHelper }
 
 function Assert-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -157,11 +174,27 @@ if ($cfgText -match '(?m)^\s{2}opamp\s*:') {
 }
 
 # ---- Persist domain + key as machine env vars ---------------------------------
+# Record prior values BEFORE overwriting so uninstall deletes what we created and
+# restores what was already set.
+if ($Session) {
+    Record-EnvChange -Session $Session -Name 'CORALOGIX_DOMAIN'      -PriorValue ([Environment]::GetEnvironmentVariable('CORALOGIX_DOMAIN', 'Machine'))
+    Record-EnvChange -Session $Session -Name 'CORALOGIX_PRIVATE_KEY' -PriorValue ([Environment]::GetEnvironmentVariable('CORALOGIX_PRIVATE_KEY', 'Machine'))
+}
 [Environment]::SetEnvironmentVariable('CORALOGIX_DOMAIN', $Domain, 'Machine')
 [Environment]::SetEnvironmentVariable('CORALOGIX_PRIVATE_KEY', $PrivateKey, 'Machine')
 $env:CORALOGIX_DOMAIN      = $Domain
 $env:CORALOGIX_PRIVATE_KEY = $PrivateKey
 Write-Host "[supervisor] CORALOGIX_DOMAIN=$Domain (machine env set)"
+
+# ---- Persist deployment environment (read by resource/environment processor) --
+if ($Environment) {
+    if ($Session) {
+        Record-EnvChange -Session $Session -Name 'CX_ENVIRONMENT' -PriorValue ([Environment]::GetEnvironmentVariable('CX_ENVIRONMENT', 'Machine'))
+    }
+    [Environment]::SetEnvironmentVariable('CX_ENVIRONMENT', $Environment, 'Machine')
+    $env:CX_ENVIRONMENT = $Environment
+    Write-Host "[supervisor] CX_ENVIRONMENT=$Environment (machine env set)"
+}
 
 # ---- Download vendor installer ------------------------------------------------
 $u = 'https://github.com/coralogix/telemetry-shippers/releases/latest/download/coralogix-otel-collector.ps1'
@@ -188,6 +221,7 @@ if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
 # config's agent.description. Inject the detected cx.host.role/workload.* so Coralogix
 # Fleet Management can group / assign config by them, then restart to apply.
 $supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Supervisor\config.yaml'
+if ($Session) { Backup-DeployFile -Session $Session -Path $supervisorConfig | Out-Null }
 Set-SupervisorDescriptionAttributes -ConfigPath $supervisorConfig -Attributes $ResourceAttributes
 try {
     if (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue) {
