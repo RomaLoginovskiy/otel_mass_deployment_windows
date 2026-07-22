@@ -391,7 +391,7 @@ What it does, in order:
    `Unregister-OpenTelemetryForIIS` + `Uninstall-OpenTelemetryCore`.
 2. **Collector/supervisor** — vendor `-Uninstall`, then a hard fallback that stops +
    `sc.exe delete`s `opampsupervisor` / `otelcol-contrib` if they remain. (The old
-   `misc/uninstall-coralogix-collector.ps1` only ever removed `otelcol-contrib`.)
+   standalone uninstaller only ever removed `otelcol-contrib`.)
 3. **Machine env vars** — delete the ones the install created
    (`OTEL_RESOURCE_ATTRIBUTES`, `CORALOGIX_DOMAIN`, `CORALOGIX_PRIVATE_KEY`,
    `CX_ENVIRONMENT`); restore any that had a prior value.

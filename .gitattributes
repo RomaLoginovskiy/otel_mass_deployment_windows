@@ -1,0 +1,21 @@
+# Normalize line endings. Default to LF in the repo; check out platform-native.
+* text=auto eol=lf
+
+# Windows-only tooling must stay CRLF (PowerShell 5.1 / cmd).
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# POSIX shell scripts stay LF.
+*.sh   text eol=lf
+
+# Keep GitHub language stats meaningful: don't count vendored front-end libs.
+SimpleWebApp/wwwroot/lib/** linguist-vendored
+
+# Treat known binary assets as binary (no EOL munging, no diff noise).
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.gif  binary
