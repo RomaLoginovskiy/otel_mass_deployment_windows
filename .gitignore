@@ -1,6 +1,5 @@
 # === Large blobs / VM images ===
 vm_images/
-misc/
 
 *.iso
 *.vhd
@@ -23,13 +22,13 @@ misc/
 [Oo]bj/
 publish/
 [Pp]ublish/
-.claude
 *.dll
 *.exe
 *.pdb
 
-# === Visual Studio ===
+# === Editor / IDE / local tooling ===
 .vs/
+.claude
 *.user
 *.suo
 
@@ -47,3 +46,6 @@ admin_coralogix.txt
 nul
 Thumbs.db
 Desktop.ini
+
+# === Local scratch (untracked, not part of the repo) ===
+misc/
