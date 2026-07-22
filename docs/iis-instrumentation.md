@@ -195,6 +195,15 @@ The apps need a few environment variables. The most important are the OTLP endpo
 | `OTEL_SERVICE_NAME` | unique per app | Names the service in APM |
 | `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=production,service.version=1.0.0` | Extra APM dimensions |
 
+> **Environment label.** To split telemetry by environment in Coralogix (Infra
+> Explorer / APM), set `CX_ENVIRONMENT` on the host. `deploy-app.ps1 -Environment
+> <staging|production|...>` sets the machine var and appends `tags.cx_environment`,
+> `tags.cx_env`, and `deployment.environment.name` to the app pool's
+> `OTEL_RESOURCE_ATTRIBUTES`; the collector's `resource/environment` processor (in
+> `SimpleWebApp\coralogix\config.yaml`) stamps the same three keys onto host/infra
+> signals from `${env:CX_ENVIRONMENT:-unspecified}`. Restart the collector after
+> setting the machine var so host signals pick it up.
+
 There are three places to set these, in increasing order of scope.
 
 **Per app, ASP.NET Core.** Add an `<environmentVariables>` block inside `<aspNetCore>` in that app's `web.config`.
@@ -250,6 +259,29 @@ Start-Service -Name W3SVC
 ```
 
 If the registry value has a trailing blank line, IIS refuses to start with "cannot contain empty strings". Remove the empty entry.
+
+### 5. Uninstall / rollback (single host)
+
+To reverse the instrumentation on one box, run the inverse of the register steps
+(elevated, Windows PowerShell 5.1). This clears the CLR-profiler entries from the
+`W3SVC`/`WAS` service `Environment` and removes the core files:
+
+```powershell
+Import-Module .\OpenTelemetry.DotNet.Auto.psm1
+Unregister-OpenTelemetryForIIS      # removes the profiler env from W3SVC/WAS + recycles IIS
+Uninstall-OpenTelemetryCore         # removes the auto-instrumentation core files
+```
+
+Then remove the per-app `OTEL_SERVICE_NAME` from any `web.config` you set it in,
+and the OTLP variables from `applicationPoolDefaults` / individual pools
+(the `appcmd ... /-` removal form — note `applicationPoolDefaults` takes **no**
+`[name=...]` predicate). Finally `iisreset`. Confirm `Get-Service W3SVC` is
+**Running** — a leftover trailing blank line in the profiler `Environment` value
+blocks IIS start (see the note above).
+
+> On a **fleet-deployed** host, do NOT do this by hand — run `uninstall.bat` /
+> `Uninstall-Agent.ps1`, which reverses all of the above from the backup manifest
+> (and removes the collector/supervisor too). See `docs/fleet-deployment.md`.
 
 ---
 

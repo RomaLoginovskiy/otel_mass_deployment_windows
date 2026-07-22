@@ -49,7 +49,11 @@ param(
     [string]    $OtlpEndpoint          = 'http://localhost:4318',
     [switch]    $NoReset,
     [hashtable] $ServiceNameOverrides  = @{},
-    [string]    $OverridesJson
+    [string]    $OverridesJson,
+    # Optional backup/manifest session (from Backup-Config.ps1, created by the
+    # orchestrator). When supplied, mutated configs are backed up and recorded so
+    # Uninstall-Agent.ps1 can reverse only the installer's own changes.
+    $Session = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,6 +74,10 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
+# Optional backup/manifest recording (shared session from the orchestrator).
+$backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
+if (Test-Path $backupHelper) { . $backupHelper }
+
 # ---- 1. Install the auto-instrumentation module (STRICT order) ----------------
 $module_url    = "https://github.com/open-telemetry/opentelemetry-dotnet-instrumentation/releases/download/$Version/OpenTelemetry.DotNet.Auto.psm1"
 $download_path = Join-Path $env:TEMP 'OpenTelemetry.DotNet.Auto.psm1'
@@ -81,15 +89,48 @@ Import-Module $download_path -Force
 Write-Host "[iis-instr] Install-OpenTelemetryCore ..."
 Install-OpenTelemetryCore
 
+# Snapshot the CLR-profiler registry (REG_MULTI_SZ Environment) BEFORE the vendor
+# register writes it, and mark the run as IIS-instrumented in the manifest.
+if ($Session) {
+    Backup-RegistryKey -Session $Session -Path 'HKLM\SYSTEM\CurrentControlSet\Services\W3SVC' | Out-Null
+    Backup-RegistryKey -Session $Session -Path 'HKLM\SYSTEM\CurrentControlSet\Services\WAS'   | Out-Null
+    $Session.Manifest.iisInstrumented   = $true
+    $Session.Manifest.instrumentVersion = $Version
+}
+
 Write-Host "[iis-instr] Register-OpenTelemetryForIIS ..."
 if ($NoReset) { Register-OpenTelemetryForIIS -NoReset } else { Register-OpenTelemetryForIIS }
 
 # ---- 2. Host-wide OTLP endpoint via applicationPoolDefaults -------------------
 $appcmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
 if (-not (Test-Path $appcmd)) { throw "appcmd.exe not found - is the IIS management role installed?" }
+$appHostConfig = Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'
+
+function Test-PoolEnvPresent {
+    # True if an environment variable is already declared on a pool (or, when
+    # $Pool is empty, on applicationPoolDefaults). Used to flag entries that the
+    # installer did NOT add, so uninstall leaves them alone.
+    param([string] $Pool, [string] $Name)
+    try {
+        if (-not (Test-Path $appHostConfig)) { return $false }
+        [xml]$c = Get-Content -LiteralPath $appHostConfig -Raw
+        $base = if ($Pool) {
+            "/configuration/system.applicationHost/applicationPools/add[@name='$Pool']"
+        } else {
+            "/configuration/system.applicationHost/applicationPools/applicationPoolDefaults"
+        }
+        return [bool]$c.SelectSingleNode("$base/environmentVariables/add[@name='$Name']")
+    } catch { return $false }
+}
 
 function Set-PoolDefaultEnv {
     param([string] $Name, [string] $Value)
+    # Back up applicationHost.config once + record whether this entry pre-existed,
+    # BEFORE the remove/add, so uninstall removes only what we add.
+    if ($Session) {
+        Backup-DeployFile -Session $Session -Path $appHostConfig | Out-Null
+        Record-PoolEnv    -Session $Session -Pool 'applicationPoolDefaults' -Name $Name -Value $Value -Preexisted (Test-PoolEnvPresent -Pool '' -Name $Name)
+    }
     # Idempotent: remove any existing entry, then add. Removal is best-effort.
     & $appcmd set config -section:system.applicationHost/applicationPools `
         "/-[name='applicationPoolDefaults'].environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
@@ -102,6 +143,10 @@ function Set-PoolDefaultEnv {
 function Set-PoolEnv {
     # Set an env var on a specific named pool (not the defaults template).
     param([string] $Pool, [string] $Name, [string] $Value)
+    if ($Session) {
+        Backup-DeployFile -Session $Session -Path $appHostConfig | Out-Null
+        Record-PoolEnv    -Session $Session -Pool $Pool -Name $Name -Value $Value -Preexisted (Test-PoolEnvPresent -Pool $Pool -Name $Name)
+    }
     & $appcmd set config -section:system.applicationHost/applicationPools `
         "/-[name='$Pool'].environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
     & $appcmd set config -section:system.applicationHost/applicationPools `
@@ -138,7 +183,7 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
         } else {
             # Shared pool: keep inheriting OTLP defaults, set only the per-app name in web.config.
-            [void](Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName)
+            [void](Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName -Session $Session)
         }
     }
 }

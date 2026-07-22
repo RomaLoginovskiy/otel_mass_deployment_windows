@@ -33,9 +33,14 @@ $ErrorActionPreference = 'Stop'
 $deployDir = Join-Path $PSScriptRoot 'deploy'
 if (-not (Test-Path $deployDir)) { throw "deploy/ folder not found at $deployDir" }
 
-# Required members of the package
-$required = @('deploy.bat','Install-Agent.ps1','Install-CoralogixSupervisor.ps1',
-              'Detect-Workloads.ps1','Instrument-IIS.ps1','config.supervisor.yaml')
+# Required members of the package. Includes the install + uninstall entry points,
+# the shared helpers they dot-source (Resolve-IISServiceNames, Backup-Config), and
+# the base config.
+$required = @('deploy.bat','uninstall.bat',
+              'Install-Agent.ps1','Uninstall-Agent.ps1',
+              'Install-CoralogixSupervisor.ps1','Detect-Workloads.ps1',
+              'Instrument-IIS.ps1','Resolve-IISServiceNames.ps1','Backup-Config.ps1',
+              'config.supervisor.yaml')
 foreach ($r in $required) {
     if (-not (Test-Path (Join-Path $deployDir $r))) { throw "Missing package file: deploy\$r" }
 }
@@ -68,3 +73,4 @@ finally {
 
 Write-Host ""
 Write-Host "Next: in BatchPatch, deploy '$OutFile' to the target servers, then run remote command 'deploy.bat'."
+Write-Host "To uninstall later, run remote command 'uninstall.bat' (set CX_PURGE=1 to also delete staged config + binaries)."
