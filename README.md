@@ -27,9 +27,8 @@ flowchart LR
 | `Build-DeploymentPackage.ps1` | Zips `deploy/` into `coralogix-agent-deploy.zip`. |
 | `poc/` | VirtualBox harness to validate the package on a throwaway Windows Server 2025 VM before fleet rollout. |
 | `SimpleWebApp/` | A minimal ASP.NET Core 8 app (with a SQL Server call) used as an instrumentation target for testing. |
-| `misc/` | One-off / earlier scripts (single-host install, config fixes, load generation). |
-| `batchpatch.zip` | The BatchPatch tool itself — **not** the deploy package. |
-| `OtelLinuxDeployment/` | **Linux** path: OpAMP Supervisor install for Linux DB hosts (Redis/Valkey/PostgreSQL/Elasticsearch), managed via Fleet Management. See [`OtelLinuxDeployment/README.md`](OtelLinuxDeployment/README.md). |
+| `scripts/` | Single-host / test helpers: `deploy-app.ps1` (build + zero-code instrument `SimpleWebApp` on IIS in one pass), `generate-load.ps1` (emit test traffic). See [`scripts/README.md`](scripts/README.md). |
+| `deploy-linux/` | **Linux** path: OpAMP Supervisor install for Linux DB hosts (Redis/Valkey/PostgreSQL/Elasticsearch), managed via Fleet Management. See [`deploy-linux/README.md`](deploy-linux/README.md). |
 
 ## Two paths
 
@@ -82,7 +81,7 @@ in [`docs/fleet-deployment.md`](docs/fleet-deployment.md).
 ### Linux (database hosts)
 
 For Linux DB servers (Redis, Valkey, PostgreSQL, Elasticsearch), follow
-[`OtelLinuxDeployment/README.md`](OtelLinuxDeployment/README.md). It installs the
+[`deploy-linux/README.md`](deploy-linux/README.md). It installs the
 Coralogix **OpAMP Supervisor + OTel Collector** so config is owned remotely by
 Fleet Management — same pattern as the Windows fleet path.
 
@@ -101,7 +100,7 @@ sudo env \
 ```
 
 The Supervisor tags each agent with `app.type` / `env.type` for Fleet grouping;
-`OtelLinuxDeployment/config.yaml` is a metrics/logs starting point to Activate
+`deploy-linux/config.yaml` is a metrics/logs starting point to Activate
 remotely. Full env-var reference, verification steps, and troubleshooting live in
 that folder's README.
 
