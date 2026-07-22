@@ -55,6 +55,12 @@ $logDir = $here
 $transcript = Join-Path $logDir 'install-agent.log'
 try { Start-Transcript -Path $transcript -Append | Out-Null } catch {}
 
+# Backup/manifest helper: every config the child scripts mutate is snapshotted
+# under a single timestamped session dir, and each change recorded, so
+# Uninstall-Agent.ps1 can reverse exactly what this run added.
+. (Join-Path $here 'Backup-Config.ps1')
+$session = $null
+
 $status = [ordered]@{
     host          = $env:COMPUTERNAME
     started       = (Get-Date).ToString('s')
@@ -63,6 +69,7 @@ $status = [ordered]@{
     supervisor    = $false
     iisInstrumented = $false
     healthOk      = $false
+    backupDir     = $null
     result        = 'unknown'
     error         = $null
 }
@@ -79,10 +86,15 @@ try {
     Assert-Admin
     Write-Host "=== Coralogix fleet agent install on $($env:COMPUTERNAME) ==="
 
+    # Open a backup/manifest session for this install run.
+    $session = New-BackupSession
+    $status.backupDir = $session.Dir
+    Write-Host "[agent] config backup session -> $($session.Dir)"
+
     # -- 1. Detect workloads ----------------------------------------------------
     $extra = @{}
     if ($Environment) { $extra['deployment.environment.name'] = $Environment }
-    $roles = & (Join-Path $here 'Detect-Workloads.ps1') -SetEnv $true -ExtraAttributes $extra
+    $roles = & (Join-Path $here 'Detect-Workloads.ps1') -SetEnv $true -ExtraAttributes $extra -Session $session
     $status.primaryRole = $roles.PrimaryRole
     $status.workloads = @('iis','dotnet','nodejs','rabbitmq','redis','valkey','sqlserver','db2','elasticsearch' |
         Where-Object {
@@ -102,15 +114,19 @@ try {
     # -- 2. Install collector in Supervisor mode --------------------------------
     $supArgs = @{ Domain = $Domain; BaseConfig = (Join-Path $here 'config.supervisor.yaml') }
     if ($PrivateKey) { $supArgs['PrivateKey'] = $PrivateKey } else { $supArgs['KeyFile'] = $KeyFile }
+    # Persist CX_ENVIRONMENT (machine) so the collector's resource/environment
+    # processor stamps the env label onto all signals.
+    if ($Environment) { $supArgs['Environment'] = $Environment }
     # Publish the detected selector attributes in the OpAMP AgentDescription (Fleet Mgmt).
     if ($roles.OtelResourceAttributes) { $supArgs['ResourceAttributes'] = $roles.OtelResourceAttributes }
+    $supArgs['Session'] = $session
     & (Join-Path $here 'Install-CoralogixSupervisor.ps1') @supArgs
     $status.supervisor = $true
 
     # -- 3. Conditional IIS zero-code instrumentation ---------------------------
     if ($roles.IIS -and -not $SkipInstrument) {
         Write-Host "[agent] IIS detected -> configuring zero-code .NET instrumentation"
-        & (Join-Path $here 'Instrument-IIS.ps1') -Version $InstrumentVersion
+        & (Join-Path $here 'Instrument-IIS.ps1') -Version $InstrumentVersion -Session $session
         $status.iisInstrumented = $true
     } elseif ($roles.IIS) {
         Write-Host "[agent] IIS detected but -SkipInstrument set; skipping instrumentation"
@@ -155,6 +171,8 @@ catch {
 }
 finally {
     $status.finished = (Get-Date).ToString('s')
+    # Persist the backup manifest (+ refresh latest.json) so uninstall can find it.
+    if ($session) { try { Save-Manifest -Session $session } catch {} }
     try { $status | ConvertTo-Json -Depth 5 | Out-File -FilePath (Join-Path $logDir 'install-agent-status.json') -Encoding utf8 } catch {}
     try { Stop-Transcript | Out-Null } catch {}
 }
