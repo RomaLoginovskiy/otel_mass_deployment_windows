@@ -265,6 +265,23 @@ processors:
     - action: insert
       key: service.namespace
       value: iis-instrumentation-test
+  # Per-host environment label (production/staging/dev/...). The deploy scripts set
+  # the machine env var CX_ENVIRONMENT; this stamps it under both the Coralogix
+  # visible-tag keys (cx_environment/cx_env) and the OTel semconv key so it drives
+  # Infra Explorer labels AND the native environment facet. upsert so the host value
+  # wins over any app-supplied value. Default "unspecified" makes a host that forgot
+  # to set it obvious rather than silently mislabeled "production".
+  resource/environment:
+    attributes:
+    - action: upsert
+      key: tags.cx_environment
+      value: ${env:CX_ENVIRONMENT:-unspecified}
+    - action: upsert
+      key: tags.cx_env
+      value: ${env:CX_ENVIRONMENT:-unspecified}
+    - action: upsert
+      key: deployment.environment.name
+      value: ${env:CX_ENVIRONMENT:-unspecified}
   resourcedetection/entity:
     detectors:
     - system
@@ -317,12 +334,12 @@ processors:
     trace_statements:
     - context: resource
       statements:
-      - keep_keys(resource.attributes, ["service.name", "k8s.cluster.name", "host.name", "deployment.environment.name"])
+      - keep_keys(resource.attributes, ["service.name", "k8s.cluster.name", "host.name", "deployment.environment.name", "tags.cx_environment", "tags.cx_env"])
   transform/db_compact:
     trace_statements:
     - context: resource
       statements:
-      - keep_keys(resource.attributes, ["service.name", "k8s.cluster.name", "host.name", "deployment.environment.name"])
+      - keep_keys(resource.attributes, ["service.name", "k8s.cluster.name", "host.name", "deployment.environment.name", "tags.cx_environment", "tags.cx_env"])
     - context: span
       statements:
       - keep_keys(span.attributes, ["db.namespace", "db.system"])
@@ -666,6 +683,7 @@ service:
       - resourcedetection/env
       - resource/metadata
       - resource/service
+      - resource/environment
       - transform/reduce
       - transform/iis
       - batch
@@ -682,6 +700,7 @@ service:
       - memory_limiter
       - resource/metadata
       - resource/service
+      - resource/environment
       - resourcedetection/entity
       - resourcedetection/region
       - transform/entity-event
@@ -696,6 +715,7 @@ service:
       - resourcedetection/env
       - resource/metadata
       - resource/service
+      - resource/environment
       - transform/spanmetrics
       - transform/reduce
       - transform/prometheus
@@ -738,6 +758,7 @@ service:
       - resourcedetection/env
       - resource/metadata
       - resource/service
+      - resource/environment
       - transform/spanmetrics
       - redaction/spanname
       - transform/reduce

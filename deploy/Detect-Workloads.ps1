@@ -48,10 +48,18 @@
 param(
     [bool]   $SetEnv = $true,
     [string] $LogPath = (Join-Path $PSScriptRoot 'detect-workloads.json'),
-    [hashtable] $ExtraAttributes = @{}
+    [hashtable] $ExtraAttributes = @{},
+    # Optional backup/manifest session (from Backup-Config.ps1). When supplied, the
+    # prior OTEL_RESOURCE_ATTRIBUTES value is recorded so uninstall can restore or
+    # remove it correctly.
+    $Session = $null
 )
 
 $ErrorActionPreference = 'Continue'
+
+# Optional backup/manifest recording (shared session from the orchestrator).
+$backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
+if (Test-Path $backupHelper) { . $backupHelper }
 
 # ---------------------------------------------------------------------------
 # Signal helpers (all safe / non-throwing)
@@ -314,6 +322,10 @@ try {
 
 if ($SetEnv) {
     try {
+        if ($Session) {
+            $priorAttrs = [Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES', 'Machine')
+            Record-EnvChange -Session $Session -Name 'OTEL_RESOURCE_ATTRIBUTES' -PriorValue $priorAttrs
+        }
         [Environment]::SetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES', $otelAttrs, 'Machine')
         # Also set in the current process so a same-session install picks it up.
         $env:OTEL_RESOURCE_ATTRIBUTES = $otelAttrs

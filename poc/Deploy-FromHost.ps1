@@ -25,6 +25,7 @@ param(
     [string] $Password    = 'Otel!Passw0rd2026',
     [string] $Package     = (Join-Path $PSScriptRoot '..\coralogix-agent-deploy.zip'),
     [string] $GuestStage  = 'C:\cx-deploy',
+    [string] $Environment = '',   # deployment env (staging/production/...); -> guest CX_ENVIRONMENT -> deploy.bat -Environment
     [string] $TranscriptLog = (Join-Path $PSScriptRoot '..\poc-deploy-fromhost.log')
 )
 
@@ -67,12 +68,15 @@ try {
 
     # 5. Expand + run deploy.bat (the BatchPatch remote command).
     Write-Host "[ctl] expanding + running deploy.bat in guest (collector supervisor install + detect + IIS instr) ..."
-    $out = Invoke-Command -Session $s -ArgumentList $GuestStage {
-        param($d)
+    $out = Invoke-Command -Session $s -ArgumentList $GuestStage, $Environment {
+        param($d, $envName)
         $pkg = Join-Path $d 'pkg'
         if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
         Expand-Archive -Path (Join-Path $d 'coralogix-agent-deploy.zip') -DestinationPath $pkg -Force
         $bat = Join-Path $pkg 'deploy.bat'
+        # deploy.bat forwards CX_ENVIRONMENT as -Environment; set it in this process
+        # so the child cmd.exe inherits it.
+        if ($envName) { $env:CX_ENVIRONMENT = $envName }
         & cmd.exe /c "`"$bat`""
         "deploy.bat exit=$LASTEXITCODE"
     }
@@ -85,7 +89,8 @@ try {
                ForEach-Object { "$($_.Name)=$($_.Status)" }
         $health = try { (Invoke-WebRequest 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 8).StatusCode } catch { 'no' }
         $attrs = [Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES','Machine')
-        [pscustomobject]@{ services = ($svc -join '; '); health13133 = $health; otelResourceAttributes = $attrs }
+        $cxEnv = [Environment]::GetEnvironmentVariable('CX_ENVIRONMENT','Machine')
+        [pscustomobject]@{ services = ($svc -join '; '); health13133 = $health; otelResourceAttributes = $attrs; cxEnvironment = $cxEnv }
     }
     $verify | Format-List | Out-String | Write-Host
 

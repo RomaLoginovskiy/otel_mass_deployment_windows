@@ -9,20 +9,24 @@ REM  version the .NET auto-instrumentation module requires) with the execution
 REM  policy bypassed for this process only, and propagates the exit code so
 REM  BatchPatch marks the row failed on any error.
 REM
-REM  Optional: set the key out-of-band before running instead of shipping
-REM  SendDataKey.txt, e.g. in the BatchPatch remote command:
-REM      set CORALOGIX_PRIVATE_KEY=cxtp_xxx && deploy.bat
+REM  Optional: set the key and/or the deployment environment out-of-band before
+REM  running instead of shipping SendDataKey.txt, e.g. in the BatchPatch remote
+REM  command:
+REM      set CX_ENVIRONMENT=staging && set CORALOGIX_PRIVATE_KEY=cxtp_xxx && deploy.bat
+REM  CX_ENVIRONMENT labels this host's telemetry (production/staging/dev/...) so
+REM  Coralogix can split it by environment in Infra Explorer.
 REM ===========================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-if defined CORALOGIX_PRIVATE_KEY (
-    "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1" -PrivateKey "%CORALOGIX_PRIVATE_KEY%"
-) else (
-    "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1"
-)
+REM Build optional args from env vars (each independent; either/both/neither).
+set ARGS=
+if defined CORALOGIX_PRIVATE_KEY set ARGS=%ARGS% -PrivateKey "%CORALOGIX_PRIVATE_KEY%"
+if defined CX_ENVIRONMENT set ARGS=%ARGS% -Environment "%CX_ENVIRONMENT%"
+
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1"%ARGS%
 
 set "RC=%ERRORLEVEL%"
 echo deploy.bat exit code: %RC%
