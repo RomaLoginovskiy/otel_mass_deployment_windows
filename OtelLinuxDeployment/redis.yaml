@@ -1,0 +1,414 @@
+exporters:
+  coralogix:
+    application_name: otel
+    application_name_attributes:
+    - cx.application.name
+    - service.namespace
+    domain: eu2.coralogix.com
+    domain_settings:
+      keepalive:
+        enabled: true
+        permit_without_stream: false
+        time: 30s
+        timeout: 10s
+    logs:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.43
+    metrics:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.43
+    private_key: ${env:CORALOGIX_PRIVATE_KEY}
+    profiles:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.43
+        x-coralogix-ingress: otlp/v1.10.0
+    sending_queue:
+      batch:
+        flush_timeout: 250ms
+        max_size: 2097152
+        min_size: 1048576
+        sizer: bytes
+      enabled: true
+      num_consumers: 20
+      queue_size: 209715200
+      sizer: bytes
+    subsystem_name: integration
+    subsystem_name_attributes:
+    - cx.subsystem.name
+    - service.name
+    timeout: 30s
+  coralogix/resource_catalog:
+    application_name: resource
+    domain: eu2.coralogix.com
+    logs:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.43
+        x-coralogix-ingress: metadata-as-otlp-logs/v1
+    private_key: ${CORALOGIX_PRIVATE_KEY}
+    sending_queue:
+      batch:
+        flush_timeout: 250ms
+        max_size: 2097152
+        min_size: 1048576
+        sizer: bytes
+      enabled: true
+      num_consumers: 20
+      queue_size: 209715200
+      sizer: bytes
+    subsystem_name: catalog
+    timeout: 30s
+processors:
+  batch:
+    send_batch_max_size: 2048
+    send_batch_size: 1024
+    timeout: 1s
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: ${env:OTEL_MEMORY_LIMIT_MIB:-512}
+  resource/metadata:
+    attributes:
+    - action: upsert
+      key: cx.otel_integration.name
+      value: coralogix-linux-standalone
+  # Fleet / Explore grouping labels. Override per host by database role, e.g.:
+  #   APP_TYPE=redis | valkey | postgresql | elasticsearch | databases
+  #   DEPLOYMENT_ENVIRONMENT=production | staging | ...
+  resource/app:
+    attributes:
+    - action: upsert
+      key: app.type
+      value: ${env:APP_TYPE:-databases}
+    - action: upsert
+      key: deployment.environment
+      value: ${env:DEPLOYMENT_ENVIRONMENT:-production}
+  resourcedetection/entity:
+    detectors:
+    - system
+    - env
+    override: false
+    system:
+      resource_attributes:
+        host.cpu.cache.l2.size:
+          enabled: true
+        host.cpu.family:
+          enabled: true
+        host.cpu.model.id:
+          enabled: true
+        host.cpu.model.name:
+          enabled: true
+        host.cpu.stepping:
+          enabled: true
+        host.cpu.vendor.id:
+          enabled: true
+        host.id:
+          enabled: true
+        host.ip:
+          enabled: true
+        host.mac:
+          enabled: true
+        os.description:
+          enabled: true
+    timeout: 2s
+  resourcedetection/env:
+    detectors:
+    - system
+    - env
+    override: false
+    system:
+      resource_attributes:
+        host.id:
+          enabled: true
+    timeout: 2s
+  transform/entity-event:
+    error_mode: silent
+    log_statements:
+    - context: log
+      statements:
+      - set(log.attributes["otel.entity.id"]["host.id"], resource.attributes["host.id"])
+      - merge_maps(log.attributes, resource.attributes, "insert")
+    - context: resource
+      statements:
+      - keep_keys(resource.attributes, [""])
+  transform/prometheus:
+    error_mode: ignore
+    metric_statements:
+    - context: metric
+      statements:
+      - replace_pattern(metric.name, "_total$", "") where resource.attributes["service.name"]
+        == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_cpu_seconds_seconds$", "otelcol_process_cpu_seconds")
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_runtime_heap_alloc_bytes_bytes$",
+        "otelcol_process_runtime_heap_alloc_bytes") where resource.attributes["service.name"]
+        == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_runtime_total_alloc_bytes_bytes$",
+        "otelcol_process_runtime_total_alloc_bytes") where resource.attributes["service.name"]
+        == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_runtime_total_sys_memory_bytes_bytes$",
+        "otelcol_process_runtime_total_sys_memory_bytes") where resource.attributes["service.name"]
+        == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_fileconsumer_open_files$", "otelcol_fileconsumer_open_files_ratio")
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_fileconsumer_reading_files$", "otelcol_fileconsumer_reading_files_ratio")
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_ip_lookup_miss$", "otelcol_otelsvc_k8s_ip_lookup_miss_ratio")
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_pod_added$", "otelcol_otelsvc_k8s_pod_added_ratio")
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_pod_updated$", "otelcol_otelsvc_k8s_pod_updated_ratio")
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_pod_deleted$", "otelcol_otelsvc_k8s_pod_deleted_ratio")
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_processor_filter_spans\\.filtered$",
+        "otelcol_processor_filter_spans.filtered_ratio") where resource.attributes["service.name"]
+        == "opentelemetry-collector"
+    - context: resource
+      statements:
+      - set(resource.attributes["k8s.pod.ip"], resource.attributes["net.host.name"])
+        where resource.attributes["service.name"] == "opentelemetry-collector"
+      - delete_key(resource.attributes, "service_name") where resource.attributes["service.name"]
+        == "opentelemetry-collector"
+    - context: datapoint
+      statements:
+      - delete_key(datapoint.attributes, "service_name") where resource.attributes["service.name"]
+        == "opentelemetry-collector"
+      - delete_key(datapoint.attributes, "otel_scope_name") where datapoint.attributes["service.name"]
+        == "opentelemetry-collector"
+  transform/reduce:
+    error_mode: silent
+    log_statements:
+    - context: log
+      statements:
+      - delete_key(resource.attributes, "os.type")
+      - delete_key(resource.attributes, "os.version")
+      - delete_key(resource.attributes, "container.id")
+      - delete_key(resource.attributes, "telemetry.distro.name")
+      - delete_key(resource.attributes, "telemetry.distro.version")
+      - delete_key(resource.attributes, "telemetry.sdk.language")
+      - delete_key(resource.attributes, "telemetry.sdk.name")
+      - delete_key(resource.attributes, "telemetry.sdk.version")
+      - delete_key(resource.attributes, "cx.otel_integration.name")
+      - delete_key(resource.attributes, "process.command")
+      - delete_key(resource.attributes, "process.command_line")
+      - delete_key(resource.attributes, "process.command_args")
+      - delete_key(resource.attributes, "process.executable.name")
+      - delete_key(resource.attributes, "process.executable.path")
+      - delete_key(resource.attributes, "process.owner")
+      - delete_key(resource.attributes, "process.pid")
+      - delete_key(resource.attributes, "process.parent_pid")
+      - delete_key(resource.attributes, "process.runtime.description")
+      - delete_key(resource.attributes, "process.runtime.name")
+      - delete_key(resource.attributes, "process.runtime.version")
+    metric_statements:
+    - context: metric
+      statements:
+      - delete_key(resource.attributes, "os.type")
+      - delete_key(resource.attributes, "os.version")
+      - delete_key(resource.attributes, "container.id")
+      - delete_key(resource.attributes, "telemetry.distro.name")
+      - delete_key(resource.attributes, "telemetry.distro.version")
+      - delete_key(resource.attributes, "telemetry.sdk.language")
+      - delete_key(resource.attributes, "telemetry.sdk.name")
+      - delete_key(resource.attributes, "telemetry.sdk.version")
+      - delete_key(resource.attributes, "cx.otel_integration.name")
+      - delete_key(resource.attributes, "process.command") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.command_line") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.command_args") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.executable.name") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.executable.path") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.owner") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.pid") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.parent_pid") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.runtime.description") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.runtime.name") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "process.runtime.version") where not IsMatch(metric.name,
+        "^process\\.")
+      - delete_key(resource.attributes, "net.host.name")
+      - delete_key(resource.attributes, "net.host.port")
+receivers:
+  redis:
+    endpoint: ${env:REDIS_ENDPOINT:-localhost:6379}
+    password: ${env:REDIS_PASSWORD:-}
+    collection_interval: 15s
+    transport: tcp
+  # redis/valkey:
+  #   endpoint: ${env:VALKEY_ENDPOINT:-localhost:6380}
+  #   password: ${env:VALKEY_PASSWORD:-}
+  #   collection_interval: 15s
+  #   transport: tcp
+  # postgresql:
+  #   endpoint: ${env:POSTGRES_ENDPOINT:-localhost:5432}
+  #   transport: tcp
+  #   username: ${env:POSTGRES_OTEL_USER:-otel_monitor}
+  #   password: ${env:POSTGRES_OTEL_PASSWORD}
+  #   databases:
+  #     - ${env:POSTGRES_OTEL_DATABASE:-appdb}
+  #   collection_interval: 15s
+  #   tls:
+  #     insecure: true
+  # elasticsearch:
+  #   endpoint: ${env:ELASTICSEARCH_ENDPOINT:-http://localhost:9200}
+  #   collection_interval: 15s
+  #   nodes: ["_all"]
+  #   skip_cluster_metrics: false
+  hostmetrics:
+    collection_interval: 10s
+    root_path: /
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      disk: null
+      filesystem:
+        exclude_fs_types:
+          fs_types:
+          - autofs
+          - binfmt_misc
+          - bpf
+          - cgroup2
+          - configfs
+          - debugfs
+          - devpts
+          - devtmpfs
+          - fusectl
+          - hugetlbfs
+          - iso9660
+          - mqueue
+          - nsfs
+          - overlay
+          - proc
+          - procfs
+          - pstore
+          - rpc_pipefs
+          - securityfs
+          - selinuxfs
+          - squashfs
+          - sysfs
+          - tracefs
+          match_type: strict
+        exclude_mount_points:
+          match_type: regexp
+          mount_points:
+          - /dev/*
+          - /proc/*
+          - /sys/*
+          - /run/k3s/containerd/*
+          - /run/containerd/runc/*
+          - /var/lib/docker/*
+          - /var/lib/kubelet/*
+          - /snap/*
+      load: null
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      network: null
+      process:
+        metrics:
+          process.cpu.utilization:
+            enabled: true
+          process.memory.utilization:
+            enabled: true
+          process.threads:
+            enabled: true
+        mute_process_exe_error: true
+        mute_process_name_error: true
+        mute_process_user_error: true
+  # journald removed: on some Ubuntu hosts otelcol 0.155.0 fails to start with
+  #   'journalctl _SYSTEMD_UNIT' is not a valid Systemd field name
+  # Re-add only after verifying: journalctl --version && id (needs journal read access)
+  otlp:
+    protocols:
+      grpc:
+        endpoint: ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}:4317
+        max_recv_msg_size_mib: 20
+      http:
+        endpoint: ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}:4318
+  prometheus:
+    config:
+      scrape_configs:
+      - job_name: opentelemetry-collector
+        scrape_interval: '30s'
+        static_configs:
+        - targets:
+          - ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}:8888
+  systemd:
+    collection_interval: 30s
+    scope: system
+service:
+  pipelines:
+    logs:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - resourcedetection/env
+      - resource/metadata
+      - resource/app
+      - transform/reduce
+      - batch
+      receivers:
+      - otlp
+    logs/resource_catalog:
+      exporters:
+      - coralogix/resource_catalog
+      processors:
+      - memory_limiter
+      - resource/metadata
+      - resource/app
+      - resourcedetection/entity
+      - transform/entity-event
+      receivers:
+      - hostmetrics
+    metrics:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - resourcedetection/env
+      - resource/metadata
+      - resource/app
+      - transform/reduce
+      - transform/prometheus
+      - batch
+      receivers:
+      - hostmetrics
+      - prometheus
+      - systemd
+      - otlp
+    metrics/databases:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - resourcedetection/env
+      - resource/metadata
+      - resource/app
+      - transform/reduce
+      - batch
+      receivers:
+      - redis
+  telemetry:
+    logs:
+      encoding: json
+    metrics:
+      readers:
+      - pull:
+          exporter:
+            prometheus:
+              host: ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}
+              port: 8888
+              without_scope_info: false
+              without_type_suffix: false
+              without_units: false
