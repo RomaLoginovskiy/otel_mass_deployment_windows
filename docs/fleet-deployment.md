@@ -87,6 +87,8 @@ tool itself — **not** this package.
 - With `-KeyFile`, the real key is baked into the package as `SendDataKey.txt`.
 - Without `-KeyFile`, the package ships **keyless**; supply the key at deploy time
   (Step 2, option B). Treat the keyed zip as a secret.
+- Override the output path with `-OutFile`. Full flags: see
+  [Command & flag reference](#command--flag-reference).
 
 ## Step 2 — Deploy across the fleet with BatchPatch
 
@@ -240,7 +242,7 @@ When detection reports IIS, the orchestrator runs `Instrument-IIS.ps1`:
   on the pool (the OTLP endpoint/protocol are re-set there too, per the inheritance
   rule below); apps that **share** a pool get it in their own `web.config`. Rename
   specific apps with `-ServiceNameOverrides @{ 'Site/api' = 'custom' }` or
-  `-OverridesJson <path>`.
+  `-OverridesJson <path>` (see [Command & flag reference](#command--flag-reference)).
 
 Reminders from `iis-instrumentation.md`:
 - Requires **Windows PowerShell 5.1** (not 7).
@@ -422,6 +424,9 @@ set CX_PURGE=1 && uninstall.bat
 set CX_RESTORE=1 && uninstall.bat
 ```
 
+Full flags (including `-NoReset` / `-BackupRoot` when running `Uninstall-Agent.ps1`
+directly): see [Command & flag reference](#command--flag-reference).
+
 What it does, in order:
 1. **IIS de-instrument** — strip the installer's `OTEL_SERVICE_NAME` from each app
    `web.config` (value-matched; a value someone else set is left alone, a pre-existing
@@ -458,6 +463,108 @@ conservative removal of the installer-owned names/services only. Result is writt
 5. **IIS APM** — on an IIS host, spans reach the APM Service Catalog (allow a few
    minutes for span-metrics flush).
 6. **Status file** — `install-agent-status.json` shows `result: success`.
+
+## Command & flag reference
+
+Every script below is **Windows PowerShell 5.1**, run **elevated**. On the fleet
+the orchestrator is driven by `deploy.bat` / `uninstall.bat` (BatchPatch remote
+command), which map a few env vars onto flags; each `.ps1` can also be run
+directly. Defaults are taken verbatim from each script's `param()` block.
+
+### Package build — `Build-DeploymentPackage.ps1` (repo root)
+
+Zips `deploy/` into the artifact BatchPatch pushes.
+
+| Flag | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `-KeyFile` | string | *(none)* | Path to a real Send-Your-Data key, baked into the package as `SendDataKey.txt`. Omit → **keyless** zip (supply the key at deploy time). |
+| `-OutFile` | string | `.\coralogix-agent-deploy.zip` | Output zip path. |
+
+```powershell
+.\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx.key -OutFile C:\build\cx-agent.zip
+```
+
+### Deploy entry point — `deploy.bat` (env var → `Install-Agent.ps1` flag)
+
+Set either/both/neither before the call; each is independent.
+
+| Env var | Maps to | Effect |
+| --- | --- | --- |
+| `CORALOGIX_PRIVATE_KEY` | `-PrivateKey` | Send-Your-Data key at deploy time (overrides a baked-in `SendDataKey.txt`). |
+| `CX_ENVIRONMENT` | `-Environment` | Stamps the deployment environment on all of this host's telemetry. |
+
+### Uninstall entry point — `uninstall.bat` (env var → `Uninstall-Agent.ps1` flag)
+
+| Env var | Maps to | Effect |
+| --- | --- | --- |
+| `CX_PURGE=1` | `-Purge` | Also delete staged config + vendor binaries. |
+| `CX_RESTORE=1` | `-RestoreConfigs` | Restore mutated configs from the backup manifest instead of surgical edits. |
+
+### Install orchestrator — `Install-Agent.ps1`
+
+The single entry point `deploy.bat` invokes; runnable directly when not using BatchPatch.
+
+| Flag | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `-Domain` | string | `eu1.coralogix.com` | Coralogix region domain. |
+| `-KeyFile` | string | `$null` → `<scriptdir>\SendDataKey.txt` | File holding the Send-Your-Data key. |
+| `-PrivateKey` | string | `$null` | Key value; overrides `-KeyFile`. Prefer a secured file / BatchPatch env var. |
+| `-Environment` | string | `$null` | `deployment.environment.name` resource attribute (e.g. `production`). |
+| `-SkipInstrument` | switch | off | Skip IIS zero-code instrumentation even if IIS is detected. |
+| `-InstrumentVersion` | string | `v1.16.0-beta.1` | Auto-instrumentation release tag forwarded to `Instrument-IIS.ps1`. |
+
+```powershell
+.\Install-Agent.ps1 -Environment production -PrivateKey cxtp_xxx
+```
+
+### Uninstall orchestrator — `Uninstall-Agent.ps1`
+
+Manifest-guided reversal; runnable directly when not using BatchPatch.
+
+| Flag | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `-Purge` | switch | off | Also delete `C:\otel`, the collector/supervisor ProgramData dirs, and the OpenTelemetry Program Files dirs. Off by default so a re-install stays fast. |
+| `-RestoreConfigs` | switch | off | Restore configs from the backup instead of surgical edits (profiler still unregistered, services still removed). |
+| `-NoReset` | switch | off | Skip the final `iisreset`. |
+| `-InstrumentVersion` | string | `v1.16.0-beta.1` | Vendor module tag used to unregister; falls back to the manifest version, then this default. |
+| `-BackupRoot` | string | `C:\ProgramData\CoralogixDeploy\backups` | Where to read the backup manifest. |
+
+### IIS instrumentation — `Instrument-IIS.ps1`
+
+Invoked by the orchestrator on IIS hosts; runnable standalone.
+
+| Flag | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `-Version` | string | `v1.16.0-beta.1` | Auto-instrumentation release tag. |
+| `-OtlpEndpoint` | string | `http://localhost:4318` | Local collector OTLP HTTP endpoint. |
+| `-NoReset` | switch | off | Skip the final `iisreset` (and pass `-NoReset` to `Register-OpenTelemetryForIIS`). |
+| `-ServiceNameOverrides` | hashtable | `@{}` | Rename apps, keyed by the auto-derived service name, e.g. `@{ 'Wallet/api' = 'wallet-api' }`. Merged over `-OverridesJson` if both are given. |
+| `-OverridesJson` | string | *(unset)* | Path to a JSON file of the same `{ autoName = overrideName }` shape. |
+
+### Collector install — `Install-CoralogixSupervisor.ps1`
+
+Invoked by the orchestrator; documented for standalone supervisor installs.
+
+| Flag | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `-Domain` | string | `eu1.coralogix.com` | Coralogix region domain. |
+| `-PrivateKey` | string | `$null` | Send-Your-Data key; if omitted, read from `-KeyFile`. |
+| `-KeyFile` | string | `<scriptdir>\SendDataKey.txt` | Key file (falls back to `..\SimpleWebApp\coralogix\SendDataKey.txt`). |
+| `-BaseConfig` | string | `<scriptdir>\config.supervisor.yaml` | Base config passed as `-SupervisorCollectorBaseConfig` (must have **no** `opamp` extension). |
+| `-StageDir` | string | `C:\otel` | Where the base config is staged on the host. |
+| `-Version` | string | `$null` | Collector version to pin (vendor installer `-Version`). |
+| `-Environment` | string | `$null` | Persisted as machine env var `CX_ENVIRONMENT`. |
+| `-ResourceAttributes` | string | `$null` → machine `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` selector attrs published in the OpAMP AgentDescription. |
+
+### Workload detection — `Detect-Workloads.ps1`
+
+Invoked by the orchestrator; run standalone (with `-SetEnv:$false`) to preview detection.
+
+| Flag | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `-SetEnv` | bool | `$true` | Persist the attr string to machine `OTEL_RESOURCE_ATTRIBUTES` (requires elevation). `-SetEnv:$false` = dry run. |
+| `-LogPath` | string | `.\detect-workloads.json` | JSON detection summary path. |
+| `-ExtraAttributes` | hashtable | `@{}` | Additional resource attributes to merge. |
 
 ## Troubleshooting
 
