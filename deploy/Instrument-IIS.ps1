@@ -171,6 +171,17 @@ $svcMap = Get-IISServiceMap -Overrides $ServiceNameOverrides
 
 if (-not $svcMap -or @($svcMap).Count -eq 0) {
     Write-Warning "[iis-instr] no IIS sites/applications found - no per-app service names set."
+    # Clear any stale CX_IIS_SERVICES left by a prior run (site decommissioned) so the collector
+    # stops stamping a now-removed service onto this host's infra/ownership telemetry.
+    $staleIisSvc = [Environment]::GetEnvironmentVariable('CX_IIS_SERVICES', 'Machine')
+    if ($staleIisSvc) {
+        if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+            Record-EnvChange -Session $Session -Name 'CX_IIS_SERVICES' -PriorValue $staleIisSvc
+        }
+        [Environment]::SetEnvironmentVariable('CX_IIS_SERVICES', $null, 'Machine')
+        $env:CX_IIS_SERVICES = $null
+        Write-Host "[iis-instr] cleared stale CX_IIS_SERVICES (no IIS apps present)" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "[iis-instr] assigning per-app OTEL_SERVICE_NAME ($(@($svcMap).Count) app(s)):"
     foreach ($r in $svcMap) {
@@ -186,6 +197,20 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             [void](Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName -Session $Session)
         }
     }
+
+    # Machine env var CX_IIS_SERVICES = comma-joined distinct IIS service name(s), built from
+    # the SAME $svcMap whose .ServiceName was just assigned as each app's OTEL_SERVICE_NAME
+    # above. The collector's transform/iis_service_labels processor (remote Fleet config)
+    # splits it into an array and stamps it onto INFRASTRUCTURE telemetry, so every host
+    # Service-ownership item equals a per-app OTEL_SERVICE_NAME (APM service name) - aligned.
+    $iisServices = Get-IISServiceLabelValue -Map $svcMap
+    if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+        $priorIisSvc = [Environment]::GetEnvironmentVariable('CX_IIS_SERVICES', 'Machine')
+        Record-EnvChange -Session $Session -Name 'CX_IIS_SERVICES' -PriorValue $priorIisSvc
+    }
+    [Environment]::SetEnvironmentVariable('CX_IIS_SERVICES', $iisServices, 'Machine')
+    $env:CX_IIS_SERVICES = $iisServices
+    Write-Host "[iis-instr] set machine CX_IIS_SERVICES=$iisServices (collector stamps it on infra telemetry)" -ForegroundColor Green
 }
 
 # ---- 3. Recycle IIS -----------------------------------------------------------

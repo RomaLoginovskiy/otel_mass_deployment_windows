@@ -271,7 +271,7 @@ try {
     }
 
     # -- 3. Machine env vars ----------------------------------------------------
-    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT')
+    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_IIS_SERVICES')
     if ($manifest -and $manifest.envVars) {
         foreach ($e in @($manifest.envVars)) {
             if (-not $e) { continue }
