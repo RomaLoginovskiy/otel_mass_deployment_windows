@@ -1,0 +1,185 @@
+# IIS → Coralogix Service Ownership
+
+How this repo populates the **Service** ownership attribute for a Windows/IIS host in
+Coralogix Infrastructure Explorer, which resource-attribute keys are used, and the exact
+value format — with the empirical test results that chose them.
+
+## What it does
+
+A bare Windows/IIS host is not an EC2/Azure instance and not a Kubernetes workload, so
+Coralogix cannot read Service ownership from cloud tags or k8s labels. The only remaining
+path is **runtime discovery** — Coralogix reads resource attributes off the host telemetry
+and its Infrastructure-Explorer host **entity**.
+
+The collector therefore stamps the name(s) of the service(s) running on IIS onto the
+host-entity/log telemetry, under a set of ownership keys, so that Infrastructure Explorer →
+Hosts → *host* → **Ownership → Service** is populated. On a host running several IIS apps,
+the value is a multi-item list so each app appears as a distinct Service value.
+
+## Which keys are used
+
+Stamped by the `transform/iis_service_labels` processor (7 keys). All were **verified to
+resolve to Service ownership and to split a multi-value array into distinct items**:
+
+| Key | Resolves to Service ownership | Multi-app array splits |
+| --- | --- | --- |
+| `service` | ✅ | ✅ |
+| `tags.service` | ✅ | ✅ |
+| `tags.cx_svc` | ✅ | ✅ |
+| `tags.CX_SERVICE_NAME` | ✅ | ✅ |
+| `cx.infra.labels.service` | ✅ | ✅ |
+| `cx.infra.labels.cx_svc` | ✅ | ✅ |
+| `cx.infra.labels.CX_SERVICE_NAME` | ✅ | ✅ |
+
+All seven resolve to the **same** Service ownership attribute, so Coralogix merges and
+de-duplicates them — the set is intentionally redundant for robustness. The minimal
+equivalent is the single OTel-standard key `service`.
+
+### Keys that were tested and dropped
+
+| Key | Result |
+| --- | --- |
+| `cx_service` (bare) | ❌ **ignored** by Service ownership |
+| `CX_SERVICE_NAME` (bare) | ❌ **ignored** (this is a cloud-tag-only key — AWS EC2 / Azure VM — and does not resolve via runtime discovery on a bare host) |
+
+> Note: `cx_svc` is not a documented Coralogix key, but under the `tags.` / `cx.infra.labels.`
+> prefixes it still resolved in testing, so it is kept for coverage.
+
+## Value format
+
+- The machine environment variable **`CX_IIS_SERVICES`** holds the distinct IIS service
+  name(s), **comma-joined** — e.g. `Default Web Site,SimpleWebApp`. It is produced by
+  `Get-IISServiceLabelValue -Map $svcMap` in `deploy/Resolve-IISServiceNames.ps1` and set by
+  the deploy scripts (`deploy/Instrument-IIS.ps1`, `scripts/deploy-app.ps1`). The `$svcMap`
+  passed in is the exact `Get-IISServiceMap` result whose `.ServiceName` is also assigned as
+  each app's `OTEL_SERVICE_NAME` — see **Alignment** below.
+- In the collector each key is set to an **OpenTelemetry array**, by splitting that env
+  value on the comma:
+
+  ```
+  set(resource.attributes["service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+  ```
+
+- Resulting attribute value (OTLP array of strings):
+
+  ```json
+  ["Default Web Site", "SimpleWebApp"]
+  ```
+
+  A single-app host yields a one-element array `["SimpleWebApp"]`.
+
+**Why an array, not a comma-string:** a single comma-joined string
+(`"Default Web Site,SimpleWebApp"`) resolves to **one** Service value that matches no
+individual service, so APM/service correlation cannot select a single service. An array
+resolves to **multiple discrete** Service values (one per app). Verified: array values split
+into separate items in ownership.
+
+**Per-signal rendering (informational):**
+- **Logs / host entity** (where ownership is resolved): the value stays a genuine array in
+  `$d.resource.attributes` — `["Default Web Site","SimpleWebApp"]`.
+- **Metrics** (not used here): a resource-attribute array collapses to a single comma-string
+  label because Prometheus label values are single strings. This does not affect ownership,
+  which is resolved from the entity, not metric labels.
+
+## Alignment with APM service names
+
+Each host's **Service ownership** items are **exactly the per-app `OTEL_SERVICE_NAME`**
+(the APM service names). This is guaranteed by a single source, not by coincidence:
+
+- `deploy/Instrument-IIS.ps1` (and `scripts/deploy-app.ps1 -InstrumentAllApps`) build the app
+  list **once** with `Get-IISServiceMap`. Each record's `.ServiceName` is assigned as that
+  app's `OTEL_SERVICE_NAME` (pool env or `web.config`).
+- The **same** map is passed to `Get-IISServiceLabelValue -Map $svcMap`, which produces
+  `CX_IIS_SERVICES` (distinct `.ServiceName`, comma-joined). The collector splits it into the
+  ownership array.
+- Therefore `set(CX_IIS_SERVICES) == set(OTEL_SERVICE_NAME across apps)`. In the single-app
+  `deploy-app.ps1` path, `CX_IIS_SERVICES = $ServiceName`, which is exactly that pool's
+  `OTEL_SERVICE_NAME`.
+
+Result: an APM service (e.g. `SimpleWebApp`) always matches one of its host's Service-ownership
+items, so APM ↔ infrastructure resource correlation can select a single service.
+
+## Config management (remote)
+
+- The `transform/iis_service_labels` processor is delivered via the **Coralogix Fleet
+  Management remote config** (OpAMP), which the supervisor merges on top of the local base.
+- The repo collector YAMLs (`deploy/config.supervisor.yaml`,
+  `SimpleWebApp/coralogix/config.yaml`) and `iis-service-ownership.collector.yaml` are the
+  **reference source** to copy the processor + pipeline wiring into the remote config. The
+  automation does **not** push or manage that config; the supervisor's base-stage →
+  pull-remote → merge flow is left unchanged.
+- The **deploy scripts set only the `CX_IIS_SERVICES` env var**. Because a remote config that
+  redefines the `logs`/`logs/resource_catalog` pipelines replaces the base's processor list,
+  the processor must be present in the **remote** config to take effect in production. (The
+  base's copy is used for deterministic *hybrid-mode* tests, where no remote config is
+  assigned to the test agent.)
+
+## Scope (pipelines)
+
+Wired into the **logs-related pipelines only**:
+
+- `logs` — Windows Event Log + IIS access logs (host/app logs).
+- `logs/resource_catalog` — the Infrastructure-Explorer host **entity** (the pipeline that
+  drives ownership).
+
+It is **not** in `traces` or `metrics`. Because both target pipelines carry the *logs*
+signal, the processor defines only `log_statements`. It is guarded so a host with no IIS
+services (`CX_IIS_SERVICES` empty) is left untouched.
+
+## Processor (as deployed)
+
+From `deploy/config.supervisor.yaml` and `SimpleWebApp/coralogix/config.yaml` (identical):
+
+```yaml
+  transform/iis_service_labels:
+    error_mode: silent
+    log_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_IIS_SERVICES:-}" != ""'
+      statements:
+      - set(resource.attributes["service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.cx_svc"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.CX_SERVICE_NAME"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.cx_svc"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.CX_SERVICE_NAME"], Split("${env:CX_IIS_SERVICES:-}", ","))
+```
+
+Wired into the two logs pipelines immediately after `resource/environment`:
+
+```yaml
+    logs:
+      processors: [ ..., resource/environment, transform/iis_service_labels, transform/reduce, transform/iis, batch ]
+    logs/resource_catalog:
+      processors: [ ..., resource/environment, transform/iis_service_labels, resourcedetection/entity, resourcedetection/region, transform/entity-event ]
+```
+
+The full reference collector config is in
+[`iis-service-ownership.collector.yaml`](./iis-service-ownership.collector.yaml).
+
+## How it was verified
+
+A per-key proof-of-concept ran 18 disposable Linux collector containers (Docker), each a
+distinct Coralogix host entity stamping exactly **one** candidate key:
+
+- 9 `own-<key>` hosts — single unique value per key → which key drives Service ownership.
+- 9 `multi-<key>` hosts — a 3-element array per key → whether the array splits into multiple
+  Service items.
+
+Result: the 7 keys above populated ownership and split arrays into 3 items; bare `cx_service`
+and `CX_SERVICE_NAME` produced no ownership. Data landing was confirmed by DataPrime / PromQL
+query against the ingested telemetry; ownership resolution was read from Infrastructure
+Explorer.
+
+## Operational notes
+
+- Set `CX_IIS_SERVICES` (machine scope) before the collector starts; a Windows service reads
+  the machine environment at start, so restart the collector after changing it.
+- On IIS, point the app's `OTEL_EXPORTER_OTLP_ENDPOINT` at `http://127.0.0.1:4318` (not
+  `localhost`, which resolves to `::1` first and can silently drop OTLP export).
+- A transform processor applies **per-signal** statement blocks — this one covers only the
+  logs signal, so it defines only `log_statements`. (If the label is ever needed on spans or
+  metrics, add `trace_statements` / `metric_statements` with the same body and wire the
+  processor into those pipelines.)
