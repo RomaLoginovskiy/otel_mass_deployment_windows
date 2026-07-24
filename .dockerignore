@@ -1,0 +1,6 @@
+# Windows E2E image (test/docker-win/Dockerfile) needs only the deploy automation + the test
+# entrypoint. Exclude everything else so the build context stays tiny (the repo root otherwise
+# sends multi-GB of published output / VM artifacts / .git to the daemon).
+*
+!deploy
+!test

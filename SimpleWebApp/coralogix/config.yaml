@@ -281,6 +281,43 @@ processors:
     - action: upsert
       key: deployment.environment.name
       value: ${env:CX_ENVIRONMENT:-unspecified}
+  # ---- IIS service labels on INFRASTRUCTURE data only (metrics + logs/resource_catalog) ----
+  # Stamps the service(s) running on IIS onto host telemetry, so Coralogix Infrastructure
+  # Explorer -> Ownership -> Service can populate on a bare Windows/IIS host (no EC2/Azure
+  # cloud tags, no k8s labels -> only the runtime-discovery ownership path applies, which
+  # reads resource attributes off host/entity telemetry). The value is the machine env var
+  # CX_IIS_SERVICES (comma-joined distinct IIS service names, set by the deploy scripts via
+  # Get-IISServiceLabelValue in Resolve-IISServiceNames.ps1).
+  #
+  # Each key is stamped as an OTel ARRAY (Split on the comma-joined CX_IIS_SERVICES) so
+  # Coralogix Service ownership gets MULTIPLE discrete values (one per IIS app) instead of a
+  # single comma-joined string - APM resource correlation matches a SINGLE service value
+  # (e.g. SimpleWebApp) to the host, so it needs discrete array items, not "a,b,c". Arrays
+  # are preserved on spans + the host entity; on metrics a resource-attr array collapses to a
+  # comma-string label (Prometheus labels are single strings) - fine, since Service ownership
+  # is resolved from the entity/spans, not metric labels.
+  #   - VERIFIED (Docker per-key POC 2026-07-23): `service`, `tags.{service,cx_svc,CX_SERVICE_NAME}`,
+  #     and `cx.infra.labels.{service,cx_svc,CX_SERVICE_NAME}` all resolve to Coralogix Service
+  #     ownership AND split array values into multiple items (multi-app). Bare `cx_service` and
+  #     `CX_SERVICE_NAME` were IGNORED by ownership -> dropped from the set.
+  # Wired into the LOGS-related pipelines only: `logs` (host/app logs) and
+  # `logs/resource_catalog` (the Infra-Explorer host entity, which drives Service ownership).
+  # NOT in `traces`/`metrics` -> only log_statements is defined. Guarded on a non-empty
+  # CX_IIS_SERVICES so non-IIS hosts are left untouched.
+  transform/iis_service_labels:
+    error_mode: silent
+    log_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_IIS_SERVICES:-}" != ""'
+      statements:
+      - set(resource.attributes["service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.cx_svc"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.CX_SERVICE_NAME"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.cx_svc"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.CX_SERVICE_NAME"], Split("${env:CX_IIS_SERVICES:-}", ","))
   resourcedetection/entity:
     detectors:
     - system
@@ -681,6 +718,7 @@ service:
       - resource/metadata
       - resource/service
       - resource/environment
+      - transform/iis_service_labels
       - transform/reduce
       - transform/iis
       - batch
@@ -698,6 +736,7 @@ service:
       - resource/metadata
       - resource/service
       - resource/environment
+      - transform/iis_service_labels
       - resourcedetection/entity
       - resourcedetection/region
       - transform/entity-event

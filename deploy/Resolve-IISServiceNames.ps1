@@ -101,6 +101,45 @@ function Get-IISServiceMap {
     return $records
 }
 
+function Get-IISServiceLabelValue {
+    <#
+    .SYNOPSIS
+      Comma-joined distinct IIS service name(s) for the CX_IIS_SERVICES machine env var.
+
+    .DESCRIPTION
+      Feeds the machine env var CX_IIS_SERVICES, which the collector's
+      transform/iis_service_labels processor (delivered via the remote Fleet config; the repo
+      collector YAMLs are the reference template) splits back into an array and stamps onto
+      INFRASTRUCTURE telemetry so Coralogix resolves the host's Service ownership.
+
+      ALIGNMENT GUARANTEE: pass the SAME $Map that the caller used to assign each app's
+      OTEL_SERVICE_NAME (each record's .ServiceName). Because this formats that identical set,
+      every Service-ownership item equals a per-app OTEL_SERVICE_NAME (the APM service name),
+      so APM resource correlation can match a single service to the host. When -Map is omitted
+      it re-enumerates via Get-IISServiceMap (standalone use), but callers in the deploy path
+      MUST pass their pre-built map to keep the guarantee.
+
+      Names are distinct (first-seen order kept) and joined with ','. The collector splits on
+      the same comma, so a service name that itself contains a comma (or a double-quote, which
+      would also break the OTTL string literal) is NOT supported and would mis-split into
+      multiple ownership items - avoid commas/quotes in IIS site names, app paths, and override
+      values. Returns '' when no IIS apps are found (the collector's guard then leaves the
+      attributes unset).
+    #>
+    [CmdletBinding()]
+    param(
+        [object[]]  $Map,
+        [hashtable] $Overrides = @{}
+    )
+
+    # Re-enumerate only when -Map was NOT supplied at all. An explicitly-passed empty array is
+    # honored (returns '') so the caller's map stays authoritative - `-not @()` is $true in
+    # PowerShell, which would otherwise silently re-scan and break the alignment guarantee.
+    if (-not $PSBoundParameters.ContainsKey('Map')) { $Map = Get-IISServiceMap -Overrides $Overrides }
+    $names = @($Map | ForEach-Object { $_.ServiceName } | Where-Object { $_ } | Select-Object -Unique)
+    return ($names -join ',')
+}
+
 function Set-WebConfigServiceName {
     [CmdletBinding()]
     param(

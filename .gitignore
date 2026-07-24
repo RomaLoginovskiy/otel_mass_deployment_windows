@@ -49,3 +49,6 @@ Desktop.ini
 
 # === Local scratch (untracked, not part of the repo) ===
 misc/
+
+# baked collector binary for the Windows E2E image (do not commit)
+test/docker-win/otelcol-contrib.exe
