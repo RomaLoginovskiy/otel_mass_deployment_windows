@@ -204,6 +204,22 @@ The apps need a few environment variables. The most important are the OTLP endpo
 > signals from `${env:CX_ENVIRONMENT:-unspecified}`. Restart the collector after
 > setting the machine var so host signals pick it up.
 
+> **Service label on infrastructure data.** The deploy scripts set the machine var
+> `CX_IIS_SERVICES` to the comma-joined service name(s) the host runs on IIS, via
+> `Get-IISServiceLabelValue -Map $svcMap` — the **same** map whose `.ServiceName` becomes each
+> app's `OTEL_SERVICE_NAME` (`deploy-app.ps1` single app or `-InstrumentAllApps`; fleet
+> `Instrument-IIS.ps1` the full set). So every host Service-ownership item equals a per-app
+> `OTEL_SERVICE_NAME` — aligned. The `transform/iis_service_labels` processor (in the **remote
+> Fleet config**; the repo collector YAMLs are the reference template) splits it into an
+> **array** and stamps **7 keys** — `service`, `tags.{service,cx_svc,CX_SERVICE_NAME}`,
+> `cx.infra.labels.{service,cx_svc,CX_SERVICE_NAME}` — onto the **logs-related pipelines only**
+> (`logs` + `logs/resource_catalog`, the host entity that drives ownership). The array yields
+> multiple discrete Service values (one per app), which APM resource correlation needs to match
+> a single service to the host. Bare `cx_service` / `CX_SERVICE_NAME` were ignored by ownership
+> and dropped. Automation sets only the env var (no config push); set it at machine scope and
+> restart the supervisor so the collector picks it up. Full detail:
+> [`iis-service-ownership.md`](./iis-service-ownership.md).
+
 There are three places to set these, in increasing order of scope.
 
 **Per app, ASP.NET Core.** Add an `<environmentVariables>` block inside `<aspNetCore>` in that app's `web.config`.

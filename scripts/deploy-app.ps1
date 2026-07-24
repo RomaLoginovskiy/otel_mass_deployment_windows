@@ -154,6 +154,32 @@ if ($InstrumentAllApps) {
     }
 }
 
+Write-Host "== Step 6c: CX_IIS_SERVICES (infra service label) ==" -ForegroundColor Cyan
+# Machine env var read (from the remote Fleet config) by the collector's
+# transform/iis_service_labels processor to stamp the IIS service name(s) onto INFRASTRUCTURE
+# telemetry so Coralogix resolves the host's Service ownership. Built from the SAME names
+# assigned as each app's OTEL_SERVICE_NAME, so ownership items == per-app service names:
+#   -InstrumentAllApps -> the distinct set from $svcMap (via Get-IISServiceLabelValue);
+#   otherwise the single $ServiceName (which is exactly this pool's OTEL_SERVICE_NAME).
+if ($InstrumentAllApps -and $svcMap) {
+    $iisServices = Get-IISServiceLabelValue -Map $svcMap
+} else {
+    $iisServices = $ServiceName
+}
+[Environment]::SetEnvironmentVariable('CX_IIS_SERVICES', $iisServices, 'Machine')
+$env:CX_IIS_SERVICES = $iisServices
+Write-Host "  set machine CX_IIS_SERVICES=$iisServices" -ForegroundColor Green
+# The collector reads ${env:CX_IIS_SERVICES} only at process start, and iisreset below only
+# restarts IIS (not the collector). Restart the collector so THIS single-host run actually
+# stamps the label. (The fleet path restarts the supervisor in Install-Agent.ps1.) Best-effort
+# across supervisor / local-mode service names.
+foreach ($svc in 'opampsupervisor','otelcol-contrib') {
+    if (Get-Service $svc -ErrorAction SilentlyContinue) {
+        try { Restart-Service $svc -Force -ErrorAction Stop; Write-Host "  restarted $svc (picks up CX_IIS_SERVICES)" -ForegroundColor Green }
+        catch { Write-Warning "  could not restart ${svc}: $_" }
+    }
+}
+
 Write-Host "== Step 7: iisreset + start ==" -ForegroundColor Cyan
 iisreset | Out-Null
 Start-Website -Name $SiteName

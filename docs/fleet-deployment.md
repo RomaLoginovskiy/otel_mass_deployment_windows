@@ -150,6 +150,45 @@ Explorer and APM.
 
 ---
 
+## Service labeling on infrastructure data (IIS)
+
+> Full detail, key verdicts and value format live in
+> [`iis-service-ownership.md`](./iis-service-ownership.md). This is the fleet summary.
+
+Populates the Coralogix Infrastructure-Explorer **Service** ownership for a Windows/IIS host
+with the service(s) it runs. Split across automation and (remote) config:
+
+- **Automation (deploy scripts) — env var only.** `Instrument-IIS.ps1` sets the machine env var
+  **`CX_IIS_SERVICES`** to the comma-joined distinct service name(s) the host runs on IIS, via
+  `Get-IISServiceLabelValue -Map $svcMap` — the **same** `$svcMap` whose `.ServiceName` is
+  assigned as each app's `OTEL_SERVICE_NAME`. So each host Service-ownership item equals a
+  per-app `OTEL_SERVICE_NAME` (the APM service name) — **aligned by construction**.
+- **Config — remote.** The `transform/iis_service_labels` processor lives in the **remote Fleet
+  Management config**. It splits `${env:CX_IIS_SERVICES}` into an array and stamps **7 keys**
+  onto the **logs-related pipelines only** (`logs` + `logs/resource_catalog`, the host entity
+  that drives ownership). The repo collector YAMLs +
+  [`iis-service-ownership.collector.yaml`](./iis-service-ownership.collector.yaml) are the
+  **reference source** to copy into the remote config — the automation does **not** push config,
+  and the supervisor's base-stage → pull-remote → merge flow is unchanged.
+
+Keys (all resolve to Service ownership and split arrays into discrete items, verified via the
+per-key Docker POC): `service`, `tags.{service,cx_svc,CX_SERVICE_NAME}`,
+`cx.infra.labels.{service,cx_svc,CX_SERVICE_NAME}`. Bare `cx_service` and `CX_SERVICE_NAME` were
+**ignored** by ownership and dropped.
+
+Value format: an **OTel array**, e.g. `["Default Web Site","SimpleWebApp"]` (single app → a
+one-element array). Multiple items = one per IIS app, which is what APM resource correlation
+needs to match a single service to the host. Arrays stay arrays on the logs/entity path; on
+metrics they collapse to a comma-string label (ownership is resolved from the entity, not
+metric labels). Unset `CX_IIS_SERVICES` (non-IIS host) → the processor's guard leaves all keys
+unset.
+
+Verify with `scripts/Verify-CoralogixInfraLabels.ps1` (DataPrime/PromQL). Note: the supervised
+collector only sees `${env:CX_IIS_SERVICES}` if the machine env var is set before it starts —
+set it at machine scope and restart the supervisor.
+
+---
+
 ## Workload detection & attribute schema
 
 `Detect-Workloads.ps1` uses several independent signals per workload (Windows
