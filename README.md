@@ -51,7 +51,8 @@ Follow [`docs/iis-instrumentation.md`](docs/iis-instrumentation.md). In short:
 Follow [`docs/fleet-deployment.md`](docs/fleet-deployment.md).
 
 ```powershell
-# 1. Build the package (from repo root)
+# 1. Build the package (from repo root). -KeyFile bakes the key in; -OutFile
+#    overrides the output path.
 .\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx-send-your-data.key
 #    -> coralogix-agent-deploy.zip
 
@@ -62,6 +63,10 @@ Follow [`docs/fleet-deployment.md`](docs/fleet-deployment.md).
 # 3. Assign remote config in Coralogix Fleet Management, targeting agents by
 #    the cx.host.role / workload.* selector attributes detection published.
 ```
+
+Every fleet script's flags, defaults, and the `deploy.bat` / `uninstall.bat`
+env-var → flag mappings are cataloged in
+[`docs/fleet-deployment.md` → Command & flag reference](docs/fleet-deployment.md#command--flag-reference).
 
 **Config backup.** Every install run snapshots each config it is about to change
 into `C:\ProgramData\CoralogixDeploy\backups\<timestamp>\` (a `manifest.json` plus
