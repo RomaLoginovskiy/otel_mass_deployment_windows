@@ -23,6 +23,7 @@ flowchart LR
 | --- | --- |
 | `docs/iis-instrumentation.md` | **Start here.** Single-host runbook: install the collector, zero-code .NET/IIS instrumentation, shared app-pool config, troubleshooting, full reference `config.yaml`. |
 | `docs/fleet-deployment.md` | Fleet-scale runbook: build a package, push with BatchPatch, Supervisor mode, workload detection → selector attributes, Fleet Management. |
+| `docs/agent-diagnostics.md` | **When something is wrong on a host.** Read-only diagnostics (`doctor.bat` / `Test-Agent.ps1` / the two instrumentation validators), graded exit codes, and what each finding means. |
 | `deploy/` | The deployment package payload (see below). |
 | `Build-DeploymentPackage.ps1` | Zips `deploy/` into `coralogix-agent-deploy.zip`. |
 | `poc/` | VirtualBox harness to validate the package on a throwaway Windows Server 2025 VM before fleet rollout. |
@@ -122,6 +123,11 @@ that folder's README.
 | `Instrument-IIS.ps1` | Zero-code .NET auto-instrumentation, IIS hosts only. |
 | `Resolve-IISServiceNames.ps1` | Per-app `OTEL_SERVICE_NAME` mapping + `web.config` read/write helpers (dot-sourced by the install + uninstall scripts). |
 | `Backup-Config.ps1` | Backup + manifest helper; snapshots every config the install mutates before it changes it. |
+| `doctor.bat` | BatchPatch entry point for the read-only host diagnostic; propagates the graded exit code (`0` pass / `1` hard fail / `2` degraded). |
+| `Test-Agent.ps1` | Host doctor: env vars, per-app `OTEL_SERVICE_NAME` readback, services, health, export counters, OTLP ports, effective-config processor, plus the two instrumentation validators. `-Only` runs a subset. See [`docs/agent-diagnostics.md`](docs/agent-diagnostics.md). |
+| `Test-IISInstrumentation.ps1` | Validates the IIS instrumentation actually landed (CLR profiler, profiler DLL, pool OTLP env, "No Managed Code"). Runs standalone or dot-sourced by `Test-Agent.ps1`. |
+| `Test-NodeInstrumentation.ps1` | Same for Node/PM2 (`NODE_OPTIONS`, register bootstrap, per-app service names). Runs standalone or dot-sourced. |
+| `Write-DeployLog.ps1` | Shared finding model + console formatters used by the diagnostics. |
 | `config.supervisor.yaml` | Base config = reference `config.yaml` **minus the `opamp` extension** (the Supervisor owns that connection). |
 | `SendDataKey.txt` | Send-Your-Data key (baked in via `-KeyFile`, or supplied at deploy time). |
 

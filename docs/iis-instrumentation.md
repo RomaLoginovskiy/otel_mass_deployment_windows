@@ -453,9 +453,10 @@ The goal from the session was a small set of repeatable templates keyed to what 
 | Windows, standalone .NET service (EXE), no SDK | Collector + `Register-OpenTelemetryForWindowsService -WindowsServiceName <svc> -OTelServiceName <name>` |
 | App already has the OpenTelemetry SDK in code | Collector only; point the app at `localhost:4317` or `4318` |
 | Linux box (for example with Redis) | Separate Linux collector config with the matching receivers; not covered here |
+| Windows box running RabbitMQ | Collector base + the RabbitMQ fragment `deploy/templates/rabbitmq.yaml` (adds the `rabbitmq` receiver + `filelog/rabbitmq`); see `deploy/templates/README.md` |
 | Node.js front end | Node.js auto-instrumentation; a separate template, to be validated |
 
-Redis and similar components are optional add-ons rather than a baseline, so keep them as separate template fragments layered on the vanilla config only where that component actually runs.
+Redis, RabbitMQ and similar components are optional add-ons rather than a baseline, so keep them as separate template fragments layered on the vanilla config only where that component actually runs. The Windows per-workload fragments live in `deploy/templates/` (mirroring `deploy-linux/templates/`).
 
 ---
 

@@ -68,6 +68,7 @@ $status = [ordered]@{
     workloads     = @()
     supervisor    = $false
     iisInstrumented = $false
+    pm2Instrumented = $false
     healthOk      = $false
     backupDir     = $null
     result        = 'unknown'
@@ -96,12 +97,13 @@ try {
     if ($Environment) { $extra['deployment.environment.name'] = $Environment }
     $roles = & (Join-Path $here 'Detect-Workloads.ps1') -SetEnv $true -ExtraAttributes $extra -Session $session
     $status.primaryRole = $roles.PrimaryRole
-    $status.workloads = @('iis','dotnet','nodejs','rabbitmq','redis','valkey','sqlserver','db2','elasticsearch' |
+    $status.workloads = @('iis','dotnet','nodejs','pm2','rabbitmq','redis','valkey','sqlserver','db2','elasticsearch' |
         Where-Object {
             switch ($_) {
                 'iis'           { $roles.IIS }
                 'dotnet'        { $roles.DotNet }
                 'nodejs'        { $roles.NodeJs }
+                'pm2'           { $roles.PM2 }
                 'rabbitmq'      { $roles.RabbitMQ }
                 'redis'         { $roles.Redis }
                 'valkey'        { $roles.Valkey }
@@ -134,6 +136,17 @@ try {
         Write-Host "[agent] IIS not detected; skipping zero-code instrumentation"
     }
 
+    # -- 3b. Conditional Node.js / PM2 zero-code instrumentation ----------------
+    if ($roles.PM2 -and -not $SkipInstrument) {
+        Write-Host "[agent] PM2 detected -> configuring zero-code Node.js instrumentation"
+        & (Join-Path $here 'Instrument-NodePM2.ps1') -Session $session
+        $status.pm2Instrumented = $true
+    } elseif ($roles.PM2) {
+        Write-Host "[agent] PM2 detected but -SkipInstrument set; skipping instrumentation"
+    } else {
+        Write-Host "[agent] PM2 not detected; skipping Node.js zero-code instrumentation"
+    }
+
     # -- 4. Restart collector to pick up OTEL_RESOURCE_ATTRIBUTES ----------------
     # In Supervisor mode there is NO 'otelcol-contrib' service - the collector runs
     # as a CHILD process of 'opampsupervisor'. Restart the supervisor (which
@@ -162,7 +175,7 @@ try {
     }
 
     $status.result = if ($status.supervisor) { 'success' } else { 'partial' }
-    Write-Host "=== done: role=$($status.primaryRole) workloads=[$($status.workloads -join ',')] iisInstrumented=$($status.iisInstrumented) health=$($status.healthOk) ==="
+    Write-Host "=== done: role=$($status.primaryRole) workloads=[$($status.workloads -join ',')] iisInstrumented=$($status.iisInstrumented) pm2Instrumented=$($status.pm2Instrumented) health=$($status.healthOk) ==="
 }
 catch {
     $status.result = 'error'

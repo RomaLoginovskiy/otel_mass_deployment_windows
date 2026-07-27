@@ -70,6 +70,7 @@ try { Start-Transcript -Path $transcript -Append | Out-Null } catch {}
 
 . (Join-Path $here 'Backup-Config.ps1')
 . (Join-Path $here 'Resolve-IISServiceNames.ps1')
+if (Test-Path (Join-Path $here 'Resolve-NodeServiceNames.ps1')) { . (Join-Path $here 'Resolve-NodeServiceNames.ps1') }
 
 $appcmd        = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
 $appHostConfig = Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'
@@ -80,6 +81,7 @@ $status = [ordered]@{
     started           = (Get-Date).ToString('s')
     manifestFound     = $false
     iisDeinstrumented = $false
+    nodeDeinstrumented = $false
     servicesRemoved   = @()
     envVarsCleared    = @()
     restored          = $false
@@ -253,6 +255,18 @@ try {
         }
     }
 
+    # -- 1b. Node.js / PM2 de-instrumentation ----------------------------------
+    # Clear NODE_OPTIONS/OTEL_* off each PM2 app so its workers restart uninstrumented.
+    # Guard: manifest flag when available, else best-effort if pm2 is on PATH.
+    $nodeWasInstrumented = if ($manifest) { [bool]$manifest.nodeInstrumented } else { [bool](Get-Command pm2 -ErrorAction SilentlyContinue) }
+    if ($nodeWasInstrumented -and (Get-Command Remove-NodeInstrumentation -ErrorAction SilentlyContinue)) {
+        try {
+            Write-Host "[uninstall] reverting Node.js/PM2 instrumentation ..."
+            Remove-NodeInstrumentation
+            $status.nodeDeinstrumented = $true
+        } catch { Write-Warning "[uninstall] Node/PM2 de-instrumentation failed: $_" }
+    }
+
     # -- 2. Collector / supervisor removal -------------------------------------
     try {
         $u = 'https://github.com/coralogix/telemetry-shippers/releases/latest/download/coralogix-otel-collector.ps1'
@@ -271,7 +285,7 @@ try {
     }
 
     # -- 3. Machine env vars ----------------------------------------------------
-    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_IIS_SERVICES')
+    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_IIS_SERVICES','CX_NODE_SERVICES')
     if ($manifest -and $manifest.envVars) {
         foreach ($e in @($manifest.envVars)) {
             if (-not $e) { continue }
@@ -323,7 +337,7 @@ try {
     }
 
     $status.result = 'success'
-    Write-Host "=== uninstall done: iisDeinstrumented=$($status.iisDeinstrumented) services=[$($status.servicesRemoved -join ',')] purged=$($status.purged) restored=$($status.restored) ==="
+    Write-Host "=== uninstall done: iisDeinstrumented=$($status.iisDeinstrumented) nodeDeinstrumented=$($status.nodeDeinstrumented) services=[$($status.servicesRemoved -join ',')] purged=$($status.purged) restored=$($status.restored) ==="
 }
 catch {
     $status.result = 'error'
