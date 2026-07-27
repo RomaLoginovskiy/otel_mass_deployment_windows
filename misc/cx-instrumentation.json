@@ -1,0 +1,453 @@
+﻿{
+    "host":  "DESKTOP-B137S7F",
+    "timestamp":  "2026-07-27T14:17:51",
+    "exitCode":  1,
+    "checks":  [
+                   "collector",
+                   "config",
+                   "receiverWiring",
+                   "receiverFlow",
+                   "endpoints",
+                   "exporterFlow",
+                   "iis",
+                   "node"
+               ],
+    "counts":  {
+                   "pass":  24,
+                   "warn":  2,
+                   "fail":  1,
+                   "info":  4,
+                   "skip":  1,
+                   "unknown":  11
+               },
+    "findings":  [
+                     {
+                         "check":  "config",
+                         "severity":  "info",
+                         "code":  "COLLECTOR_CONFIG_SOURCE",
+                         "target":  "legacy",
+                         "message":  "using C:\\otel\\config.yaml (modified 2026-07-03T12:22:10)",
+                         "data":  {
+                                      "path":  "C:\\otel\\config.yaml",
+                                      "source":  "legacy"
+                                  }
+                     },
+                     {
+                         "check":  "config",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "",
+                         "message":  "parsed 8 receiver(s), 1 connector(s), 3 exporter(s), 4 pipeline(s)",
+                         "data":  {
+                                      "pipelines":  [
+                                                        "logs",
+                                                        "logs/resource_catalog",
+                                                        "metrics",
+                                                        "traces"
+                                                    ],
+                                      "receivers":  [
+                                                        "otlp",
+                                                        "hostmetrics",
+                                                        "iis",
+                                                        "prometheus",
+                                                        "windowseventlog/application",
+                                                        "windowseventlog/security",
+                                                        "windowseventlog/system",
+                                                        "filelog/iis"
+                                                    ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "otlp",
+                         "message":  "wired into: logs, metrics, traces",
+                         "data":  {
+                                      "signals":  [
+                                                      "logs",
+                                                      "metrics",
+                                                      "traces"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "hostmetrics",
+                         "message":  "wired into: logs/resource_catalog, metrics",
+                         "data":  {
+                                      "signals":  [
+                                                      "logs",
+                                                      "metrics"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "iis",
+                         "message":  "wired into: metrics",
+                         "data":  {
+                                      "signals":  [
+                                                      "metrics"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "prometheus",
+                         "message":  "wired into: metrics",
+                         "data":  {
+                                      "signals":  [
+                                                      "metrics"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "windowseventlog/application",
+                         "message":  "wired into: logs",
+                         "data":  {
+                                      "signals":  [
+                                                      "logs"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "windowseventlog/security",
+                         "message":  "wired into: logs",
+                         "data":  {
+                                      "signals":  [
+                                                      "logs"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "windowseventlog/system",
+                         "message":  "wired into: logs",
+                         "data":  {
+                                      "signals":  [
+                                                      "logs"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "filelog/iis",
+                         "message":  "wired into: logs",
+                         "data":  {
+                                      "signals":  [
+                                                      "logs"
+                                                  ]
+                                  }
+                     },
+                     {
+                         "check":  "receiverWiring",
+                         "severity":  "info",
+                         "code":  "CONNECTOR_AS_RECEIVER",
+                         "target":  "spanmetrics",
+                         "message":  "a connector used as a pipeline receiver - expected; excluded from the data-flow check because connectors report no receiver counters",
+                         "data":  null
+                     },
+                     {
+                         "check":  "collector",
+                         "severity":  "fail",
+                         "code":  "COLLECTOR_SERVICE_MISSING",
+                         "target":  "",
+                         "message":  "no collector service and no collector process on this host - nothing is collecting telemetry",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "otlp",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "hostmetrics",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "iis",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "prometheus",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "windowseventlog/application",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "windowseventlog/security",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "windowseventlog/system",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "receiverFlow",
+                         "severity":  "unknown",
+                         "code":  "RECEIVER_CHECK_UNAVAILABLE",
+                         "target":  "filelog/iis",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so data flow is unknown (see the telemetry finding above)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "exporterFlow",
+                         "severity":  "unknown",
+                         "code":  "EXPORTER_NO_COUNTERS",
+                         "target":  "",
+                         "message":  "the collector internal telemetry endpoint could not be scraped, so export status is unknown",
+                         "data":  null
+                     },
+                     {
+                         "check":  "endpoints",
+                         "severity":  "skip",
+                         "code":  "NOT_SELECTED",
+                         "target":  "",
+                         "message":  "endpoint probing is opt-in - pass -ProbeEndpoints to reach out to what each receiver points at",
+                         "data":  null
+                     },
+                     {
+                         "check":  "profilerReg",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "W3SVC",
+                         "message":  "W3SVC Environment is well-formed (11 entries)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "profiler",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "W3SVC",
+                         "message":  "profiler registered (coreclr=True framework=True, enabled)",
+                         "data":  {
+                                      "corProfiler":  "{918728DD-259F-4A6A-AC2B-B85E1B658318}",
+                                      "coreclrProfiler":  "{918728DD-259F-4A6A-AC2B-B85E1B658318}"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "W3SVC/CORECLR_PROFILER_PATH_64",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x64\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "W3SVC/CORECLR_PROFILER_PATH_32",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x86\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "W3SVC/COR_PROFILER_PATH_64",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x64\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "W3SVC/COR_PROFILER_PATH_32",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x86\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "profilerReg",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "WAS",
+                         "message":  "WAS Environment is well-formed (11 entries)",
+                         "data":  null
+                     },
+                     {
+                         "check":  "profiler",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "WAS",
+                         "message":  "profiler registered (coreclr=True framework=True, enabled)",
+                         "data":  {
+                                      "corProfiler":  "{918728DD-259F-4A6A-AC2B-B85E1B658318}",
+                                      "coreclrProfiler":  "{918728DD-259F-4A6A-AC2B-B85E1B658318}"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "WAS/CORECLR_PROFILER_PATH_64",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x64\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "WAS/CORECLR_PROFILER_PATH_32",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x86\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "WAS/COR_PROFILER_PATH_64",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x64\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "profilerPath",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "WAS/COR_PROFILER_PATH_32",
+                         "message":  "profiler DLL present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation\\win-x86\\OpenTelemetry.AutoInstrumentation.Native.dll"
+                                  }
+                     },
+                     {
+                         "check":  "autoHome",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "",
+                         "message":  "auto-instrumentation home present",
+                         "data":  {
+                                      "path":  "C:\\Program Files\\OpenTelemetry .NET AutoInstrumentation"
+                                  }
+                     },
+                     {
+                         "check":  "autoHome",
+                         "severity":  "info",
+                         "code":  "INSTRUMENTATION_VERSION_UNKNOWN",
+                         "target":  "",
+                         "message":  "no deploy manifest found, so the installed instrumentation version cannot be confirmed",
+                         "data":  null
+                     },
+                     {
+                         "check":  "poolOtlp",
+                         "severity":  "warn",
+                         "code":  "IIS_OTLP_DEFAULTS_MISSING",
+                         "target":  "applicationPoolDefaults",
+                         "message":  "OTEL_EXPORTER_OTLP_ENDPOINT is not set on applicationPoolDefaults - pools that do not set it themselves have no exporter target",
+                         "data":  null
+                     },
+                     {
+                         "check":  "poolOtlp",
+                         "severity":  "warn",
+                         "code":  "IIS_OTLP_DEFAULTS_MISSING",
+                         "target":  "DefaultAppPool",
+                         "message":  "no effective OTEL_EXPORTER_OTLP_ENDPOINT for this pool",
+                         "data":  null
+                     },
+                     {
+                         "check":  "poolOtlp",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "SimpleWebAppPool",
+                         "message":  "endpoint http://127.0.0.1:4318",
+                         "data":  {
+                                      "inherited":  false,
+                                      "endpoint":  "http://127.0.0.1:4318"
+                                  }
+                     },
+                     {
+                         "check":  "poolOtlp",
+                         "severity":  "info",
+                         "code":  "",
+                         "target":  "SimpleWebAppPool",
+                         "message":  "OTEL_EXPORTER_OTLP_PROTOCOL is not set; the SDK default applies",
+                         "data":  null
+                     },
+                     {
+                         "check":  "poolRuntime",
+                         "severity":  "unknown",
+                         "code":  "WEBCONFIG_UNREADABLE",
+                         "target":  "Default Web Site/",
+                         "message":  "cannot read web.config, so it is unknown whether this is an ASP.NET Core app needing \u0027No Managed Code\u0027",
+                         "data":  {
+                                      "physicalPath":  "C:\\inetpub\\wwwroot"
+                                  }
+                     },
+                     {
+                         "check":  "poolRuntime",
+                         "severity":  "pass",
+                         "code":  "",
+                         "target":  "SimpleWebApp/",
+                         "message":  "ASP.NET Core app on pool \u0027SimpleWebAppPool\u0027 is No Managed Code",
+                         "data":  null
+                     },
+                     {
+                         "check":  "node",
+                         "severity":  "unknown",
+                         "code":  "NODE_PM2_NOT_ON_PATH",
+                         "target":  "",
+                         "message":  "node processes are running but pm2 is not on this account PATH - cannot determine whether they are instrumented",
+                         "data":  null
+                     }
+                 ]
+}
