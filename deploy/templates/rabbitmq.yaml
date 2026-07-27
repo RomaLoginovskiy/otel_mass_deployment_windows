@@ -1,0 +1,942 @@
+# Coralogix Windows collector - SUPERVISOR BASE + RabbitMQ MONITORING FRAGMENT.
+#
+# Derived from deploy/config.supervisor.yaml. The supervisor base is left INTACT
+# (host + IIS + Windows signals) and a RabbitMQ fragment is layered on top, per the
+# per-workload template convention (see docs/iis-instrumentation.md and the
+# deploy-linux/templates/* DB configs). The RabbitMQ additions are:
+#   - receiver `rabbitmq`         : node/queue/message metrics via the RabbitMQ
+#                                   Management plugin HTTP API (default :15672).
+#   - receiver `filelog/rabbitmq` : tails the RabbitMQ log dir (plain-text lines),
+#                                   tagging records messaging.system=rabbitmq.
+#   - processor `resource/rabbitmq`: stamps messaging.system=rabbitmq on metrics.
+#   - pipeline  `metrics/rabbitmq`: rabbitmq receiver -> coralogix (shared processors).
+#   - filelog/rabbitmq wired into the existing `logs` pipeline.
+# Env vars consumed by the fragment (all optional, sensible defaults for a co-located
+# RabbitMQ on the same host):
+#   RABBITMQ_ENDPOINT  (default http://localhost:15672)
+#   RABBITMQ_USERNAME  (default guest)   RABBITMQ_PASSWORD (default guest)
+#   RABBITMQ_LOG_GLOB  (default C:\rabbitmq\log\*.log)
+# NOTE: the default guest/guest user only authenticates over loopback. A host that
+# scrapes a REMOTE RabbitMQ must supply a real monitoring-level user via the env vars.
+#
+# ---- everything below is the unmodified SUPERVISOR BASE ----
+# Derived from SimpleWebApp/coralogix/config.yaml with THREE differences for
+# Fleet Management (OpAMP Supervisor) mode:
+#   1. The `opamp` extension is REMOVED (and dropped from service.extensions).
+#      In Supervisor mode the OpAMP Supervisor process owns the OpAMP connection;
+#      an opamp extension in the collector config conflicts with it and the
+#      service fails to start. See docs/iis-instrumentation.md Part 5.
+#   2. The app-specific `service.name: SimpleWebApp` insert is REMOVED from
+#      resource/service. This is a FLEET base config shared by every host, so it
+#      must not stamp all hosts with one app's service name. Per-app service.name
+#      still arrives from OTLP spans (OTEL_SERVICE_NAME / auto-instrumentation);
+#      service.namespace is kept so signals group under one Coralogix application.
+#   3. (unchanged otherwise) All receivers/processors/exporters/pipelines remain
+#      so a freshly-registered agent collects host + IIS + Windows signals
+#      immediately, before Fleet Management merges a remote overlay on top.
+#
+# Passed to the installer via:
+#   & coralogix-otel-collector.ps1 -Supervisor -SupervisorCollectorBaseConfig <this file>
+# with CORALOGIX_DOMAIN and CORALOGIX_PRIVATE_KEY set in the environment.
+#
+# NOTE: this config uses the file_storage extension, so the installer must be
+# run with -EnableDynamicIISParsing (otherwise the service fails to start).
+
+connectors:
+  forward/compact: {}
+  forward/db: {}
+  forward/db_compact: {}
+  spanmetrics:
+    add_resource_attributes: true
+    aggregation_cardinality_limit: 100000
+    dimensions:
+    - name: http.method
+    - name: cgx.transaction
+    - name: cgx.transaction.root
+    - name: status_code
+    - name: db.namespace
+    - name: db.operation.name
+    - name: db.collection.name
+    - name: db.system
+    - name: http.response.status_code
+    - name: rpc.grpc.status_code
+    - name: service.version
+    exclude_dimensions:
+    - collector.instance.id
+    histogram:
+      explicit:
+        buckets:
+        - 1ms
+        - 4ms
+        - 10ms
+        - 20ms
+        - 50ms
+        - 100ms
+        - 200ms
+        - 500ms
+        - 1s
+        - 2s
+        - 5s
+      unit: ms
+    metrics_expiration: 5m
+    metrics_flush_interval: '30s'
+    namespace: ""
+  spanmetrics/compact:
+    add_resource_attributes: true
+    aggregation_cardinality_limit: 100000
+    exclude_dimensions:
+    - collector.instance.id
+    - span.name
+    histogram:
+      explicit:
+        buckets:
+        - 1ms
+        - 4ms
+        - 10ms
+        - 20ms
+        - 50ms
+        - 100ms
+        - 200ms
+        - 500ms
+        - 1s
+        - 2s
+        - 5s
+      unit: ms
+    metrics_expiration: 5m
+    metrics_flush_interval: '30s'
+    namespace: compact
+  spanmetrics/db:
+    add_resource_attributes: true
+    aggregation_cardinality_limit: 100000
+    dimensions:
+    - name: db.namespace
+    - name: db.operation.name
+    - name: db.collection.name
+    - name: db.system
+    - name: service.version
+    exclude_dimensions:
+    - collector.instance.id
+    histogram:
+      explicit:
+        buckets:
+        - 1ms
+        - 4ms
+        - 10ms
+        - 20ms
+        - 50ms
+        - 100ms
+        - 200ms
+        - 500ms
+        - 1s
+        - 2s
+        - 5s
+      unit: ms
+    metrics_expiration: 5m
+    metrics_flush_interval: '30s'
+    namespace: db
+  spanmetrics/db_compact:
+    add_resource_attributes: true
+    aggregation_cardinality_limit: 100000
+    dimensions:
+    - name: db.namespace
+    - name: db.system
+    exclude_dimensions:
+    - collector.instance.id
+    - span.name
+    - span.kind
+    histogram:
+      explicit:
+        buckets:
+        - 1ms
+        - 4ms
+        - 10ms
+        - 20ms
+        - 50ms
+        - 100ms
+        - 200ms
+        - 500ms
+        - 1s
+        - 2s
+        - 5s
+      unit: ms
+    metrics_expiration: 5m
+    metrics_flush_interval: '30s'
+    namespace: db_compact
+
+exporters:
+  coralogix:
+    application_name: otel
+    application_name_attributes:
+    - cx.application.name
+    - service.namespace
+    domain: eu1.coralogix.com
+    domain_settings:
+      keepalive:
+        enabled: true
+        permit_without_stream: false
+        time: 30s
+        timeout: 10s
+    logs:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.42
+    metrics:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.42
+    private_key: ${env:CORALOGIX_PRIVATE_KEY}
+    profiles:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.42
+        x-coralogix-ingress: otlp/v1.10.0
+    sending_queue:
+      batch:
+        flush_timeout: 250ms
+        max_size: 2097152
+        min_size: 1048576
+        sizer: bytes
+      enabled: true
+      num_consumers: 20
+      queue_size: 209715200
+      sizer: bytes
+    subsystem_name: windows
+    subsystem_name_attributes:
+    - cx.subsystem.name
+    - service.name
+    timeout: 30s
+    traces:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.42
+  coralogix/resource_catalog:
+    application_name: resource
+    domain: eu1.coralogix.com
+    logs:
+      headers:
+        X-Coralogix-Distribution: helm-otel-standalone/0.0.42
+        x-coralogix-ingress: metadata-as-otlp-logs/v1
+    private_key: ${env:CORALOGIX_PRIVATE_KEY}
+    sending_queue:
+      batch:
+        flush_timeout: 250ms
+        max_size: 2097152
+        min_size: 1048576
+        sizer: bytes
+      enabled: true
+      num_consumers: 20
+      queue_size: 209715200
+      sizer: bytes
+    subsystem_name: catalog
+    timeout: 30s
+  debug: {}
+
+extensions:
+  file_storage:
+    create_directory: true
+    directory: C:\ProgramData\OpenTelemetry\Collector\storage
+  health_check:
+    endpoint: ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}:13133
+  # NOTE: the `opamp` extension is intentionally ABSENT. In Fleet Management /
+  # Supervisor mode the OpAMP Supervisor owns the OpAMP connection. Do not add it.
+  pprof:
+    endpoint: localhost:1777
+  zpages:
+    endpoint: localhost:55679
+
+processors:
+  batch:
+    send_batch_max_size: 2048
+    send_batch_size: 1024
+    timeout: 1s
+  coralogix:
+    transactions:
+      enabled: true
+  filter/db_compact_spanmetrics:
+    traces:
+      span:
+      - span.kind != SPAN_KIND_CLIENT or span.attributes["db.namespace"] == nil or span.attributes["db.system"] == nil
+  filter/db_spanmetrics:
+    traces:
+      span:
+      - span.attributes["db.system"] == nil
+  groupbytrace/transactions:
+    wait_duration: 30s
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: ${env:OTEL_MEMORY_LIMIT_MIB:-1024}
+  redaction/spanname:
+    allow_all_keys: true
+    db_sanitizer: null
+    url_sanitizer:
+      enabled: true
+  resource/metadata:
+    attributes:
+    - action: upsert
+      key: cx.otel_integration.name
+      value: coralogix-windows-standalone
+    # Non-k8s host has no k8s.cluster.name source; set it so the compact/db_compact
+    # span-metrics keep_keys (and base/db) carry it. Static for now.
+    - action: upsert
+      key: k8s.cluster.name
+      value: windows-iis
+  # FLEET base: only service.namespace is inserted (unifies all signals of a host
+  # under one Coralogix application). The app-specific service.name insert was
+  # removed - per-app service.name arrives from OTLP spans (OTEL_SERVICE_NAME /
+  # auto-instrumentation). A remote Fleet config may override this per group.
+  resource/service:
+    attributes:
+    - action: insert
+      key: service.namespace
+      value: iis-instrumentation-test
+  # Per-host environment label (production/staging/dev/...). The deploy scripts set
+  # the machine env var CX_ENVIRONMENT; this stamps it under both the Coralogix
+  # visible-tag keys (cx_environment/cx_env) and the OTel semconv key so it drives
+  # Infra Explorer labels AND the native environment facet. upsert so the host value
+  # wins over any app-supplied value. Default "unspecified" makes a host that forgot
+  # to set it obvious rather than silently mislabeled "production".
+  resource/environment:
+    attributes:
+    - action: upsert
+      key: tags.cx_environment
+      value: ${env:CX_ENVIRONMENT:-unspecified}
+    - action: upsert
+      key: tags.cx_env
+      value: ${env:CX_ENVIRONMENT:-unspecified}
+    - action: upsert
+      key: deployment.environment.name
+      value: ${env:CX_ENVIRONMENT:-unspecified}
+  # RabbitMQ identity stamp on the rabbitmq metrics pipeline (semconv messaging.system).
+  # Mirrors the resource/valkey pattern in deploy-linux/templates/redis_valkey.yaml.
+  resource/rabbitmq:
+    attributes:
+    - action: upsert
+      key: messaging.system
+      value: rabbitmq
+  # ---- IIS service labels on INFRASTRUCTURE data only (metrics + logs/resource_catalog) ----
+  # Stamps the service(s) running on IIS onto host telemetry, so Coralogix Infrastructure
+  # Explorer -> Ownership -> Service can populate on a bare Windows/IIS host (no EC2/Azure
+  # cloud tags, no k8s labels -> only the runtime-discovery ownership path applies, which
+  # reads resource attributes off host/entity telemetry). The value is the machine env var
+  # CX_IIS_SERVICES (comma-joined distinct IIS service names, set by the deploy scripts via
+  # Get-IISServiceLabelValue in Resolve-IISServiceNames.ps1).
+  #
+  # Each key is stamped as an OTel ARRAY (Split on the comma-joined CX_IIS_SERVICES) so
+  # Coralogix Service ownership gets MULTIPLE discrete values (one per IIS app) instead of a
+  # single comma-joined string - APM resource correlation matches a SINGLE service value
+  # (e.g. SimpleWebApp) to the host, so it needs discrete array items, not "a,b,c". Arrays
+  # are preserved on spans + the host entity; on metrics a resource-attr array collapses to a
+  # comma-string label (Prometheus labels are single strings) - fine, since Service ownership
+  # is resolved from the entity/spans, not metric labels.
+  #   - VERIFIED (Docker per-key POC 2026-07-23): `service`, `tags.{service,cx_svc,CX_SERVICE_NAME}`,
+  #     and `cx.infra.labels.{service,cx_svc,CX_SERVICE_NAME}` all resolve to Coralogix Service
+  #     ownership AND split array values into multiple items (multi-app). Bare `cx_service` and
+  #     `CX_SERVICE_NAME` were IGNORED by ownership -> dropped from the set.
+  # Wired into the LOGS-related pipelines only: `logs` (host/app logs) and
+  # `logs/resource_catalog` (the Infra-Explorer host entity, which drives Service ownership).
+  # NOT in `traces`/`metrics` -> only log_statements is defined. Guarded on a non-empty
+  # CX_IIS_SERVICES so non-IIS hosts are left untouched.
+  transform/iis_service_labels:
+    error_mode: silent
+    log_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_IIS_SERVICES:-}" != ""'
+      statements:
+      - set(resource.attributes["service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.cx_svc"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["tags.CX_SERVICE_NAME"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.service"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.cx_svc"], Split("${env:CX_IIS_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.CX_SERVICE_NAME"], Split("${env:CX_IIS_SERVICES:-}", ","))
+  resourcedetection/entity:
+    detectors:
+    - system
+    - env
+    override: false
+    system:
+      resource_attributes:
+        # host.cpu.* require SMBIOS Type 4 (processor info). Some VMs (VirtualBox)
+        # and cloud hosts do not expose it, and the system detector then FAILS to
+        # start ("failed getting host cpuinfo: SMBIOS processor information not
+        # found"), crash-looping the whole collector. These attributes are
+        # DISABLED BY DEFAULT, so we simply do NOT list them here: in collector
+        # v0.155.0 the mere PRESENCE of a host.cpu.* key (even `enabled: false`)
+        # initializes the SMBIOS CPU reader and triggers the fatal read. The sister
+        # detector resourcedetection/env lists no host.cpu.* keys and never crashes.
+        # host.id/ip/mac/os.description do NOT use SMBIOS and are enough for entity
+        # correlation. Real hardware exposes SMBIOS; this keeps the config portable.
+        host.id:
+          enabled: true
+        host.ip:
+          enabled: true
+        host.mac:
+          enabled: true
+        os.description:
+          enabled: true
+    timeout: 2s
+  # resourcedetection/env promotes OTEL_RESOURCE_ATTRIBUTES (set by
+  # Detect-Workloads.ps1 with cx.host.role / workload.* attributes) into resource
+  # attributes. With add_resource_attributes on the spanmetrics connectors and the
+  # Supervisor reporting the collector resource in its OpAMP AgentDescription, these
+  # become the agent-selector attributes in Coralogix Fleet Management.
+  resourcedetection/env:
+    detectors:
+    - system
+    - env
+    override: false
+    system:
+      resource_attributes:
+        host.id:
+          enabled: true
+    timeout: 2s
+  resourcedetection/region:
+    detectors:
+    - gcp
+    - ec2
+    - azure
+    override: true
+    timeout: 2s
+  transform/compact:
+    trace_statements:
+    - context: resource
+      statements:
+      - keep_keys(resource.attributes, ["service.name", "k8s.cluster.name", "host.name", "deployment.environment.name", "tags.cx_environment", "tags.cx_env"])
+  transform/db_compact:
+    trace_statements:
+    - context: resource
+      statements:
+      - keep_keys(resource.attributes, ["service.name", "k8s.cluster.name", "host.name", "deployment.environment.name", "tags.cx_environment", "tags.cx_env"])
+    - context: span
+      statements:
+      - keep_keys(span.attributes, ["db.namespace", "db.system"])
+  # Bridge new DB semconv -> the attribute names the db/db_compact filters and
+  # spanmetrics dimensions key on. .NET auto-instrumentation emits db.system.name
+  # (new semconv); filter/db_spanmetrics keys on db.system, so without this the db
+  # span metrics get 0 spans. Runs in the main traces pipeline before forward/db.
+  transform/db_semconv:
+    error_mode: ignore
+    trace_statements:
+    - context: span
+      statements:
+      - set(span.attributes["db.system"], span.attributes["db.system.name"]) where span.attributes["db.system"] == nil and span.attributes["db.system.name"] != nil
+      - set(span.attributes["db.namespace"], span.attributes["db.name"]) where span.attributes["db.namespace"] == nil and span.attributes["db.name"] != nil
+      - set(span.attributes["db.operation.name"], span.attributes["db.operation"]) where span.attributes["db.operation.name"] == nil and span.attributes["db.operation"] != nil
+      - set(span.attributes["db.collection.name"], span.attributes["db.sql.table"]) where span.attributes["db.collection.name"] == nil and span.attributes["db.sql.table"] != nil
+  transform/entity-event:
+    error_mode: silent
+    log_statements:
+    - context: log
+      statements:
+      - set(log.attributes["otel.entity.id"]["host.id"], resource.attributes["host.id"])
+      - merge_maps(log.attributes, resource.attributes, "insert")
+    - context: resource
+      statements:
+      - keep_keys(resource.attributes, [""])
+  transform/iis:
+    error_mode: ignore
+    log_statements:
+    - context: log
+      statements:
+      - set(log.attributes["client.address"], log.attributes["c-ip"]) where log.attributes["c-ip"] != nil
+      - set(log.attributes["http.request.method"], log.attributes["cs-method"]) where log.attributes["cs-method"] != nil
+      - set(log.attributes["http.response.status_code"], log.attributes["sc-status"]) where log.attributes["sc-status"] != nil
+      - set(log.attributes["user_agent.original"], log.attributes["cs(User-Agent)"]) where log.attributes["cs(User-Agent)"] != nil
+      - set(log.attributes["url.path"], log.attributes["cs-uri-stem"]) where log.attributes["cs-uri-stem"] != nil
+      - set(log.attributes["url.query"], log.attributes["cs-uri-query"]) where log.attributes["cs-uri-query"] != nil
+      - set(log.attributes["http.request.header.referer"], [log.attributes["cs(Referer)"]]) where log.attributes["cs(Referer)"] != nil
+      - set(log.attributes["http.server.request.duration_ms"], Int(log.attributes["time-taken"])) where log.attributes["time-taken"] != nil
+      - delete_key(log.attributes, "c-ip")
+      - delete_key(log.attributes, "cs-method")
+      - delete_key(log.attributes, "sc-status")
+      - delete_key(log.attributes, "cs(User-Agent)")
+      - delete_key(log.attributes, "cs-uri-stem")
+      - delete_key(log.attributes, "cs-uri-query")
+      - delete_key(log.attributes, "cs(Referer)")
+      - delete_key(log.attributes, "time-taken")
+      - delete_key(log.attributes, "sc-win32-status")
+      - delete_key(log.attributes, "s-port")
+  transform/prometheus:
+    error_mode: ignore
+    metric_statements:
+    - context: metric
+      statements:
+      - replace_pattern(metric.name, "_total$", "") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_cpu_seconds_seconds$", "otelcol_process_cpu_seconds") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_runtime_heap_alloc_bytes_bytes$", "otelcol_process_runtime_heap_alloc_bytes") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_runtime_total_alloc_bytes_bytes$", "otelcol_process_runtime_total_alloc_bytes") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_process_runtime_total_sys_memory_bytes_bytes$", "otelcol_process_runtime_total_sys_memory_bytes") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_fileconsumer_open_files$", "otelcol_fileconsumer_open_files_ratio") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_fileconsumer_reading_files$", "otelcol_fileconsumer_reading_files_ratio") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_ip_lookup_miss$", "otelcol_otelsvc_k8s_ip_lookup_miss_ratio") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_pod_added$", "otelcol_otelsvc_k8s_pod_added_ratio") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_pod_updated$", "otelcol_otelsvc_k8s_pod_updated_ratio") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_otelsvc_k8s_pod_deleted$", "otelcol_otelsvc_k8s_pod_deleted_ratio") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - replace_pattern(metric.name, "^otelcol_processor_filter_spans\\.filtered$", "otelcol_processor_filter_spans.filtered_ratio") where resource.attributes["service.name"] == "opentelemetry-collector"
+    - context: resource
+      statements:
+      - set(resource.attributes["k8s.pod.ip"], resource.attributes["net.host.name"]) where resource.attributes["service.name"] == "opentelemetry-collector"
+      - delete_key(resource.attributes, "service_name") where resource.attributes["service.name"] == "opentelemetry-collector"
+    - context: datapoint
+      statements:
+      - delete_key(datapoint.attributes, "service_name") where resource.attributes["service.name"] == "opentelemetry-collector"
+      - delete_key(datapoint.attributes, "otel_scope_name") where datapoint.attributes["service.name"] == "opentelemetry-collector"
+  transform/reduce:
+    error_mode: silent
+    log_statements:
+    - context: log
+      statements:
+      - delete_key(resource.attributes, "azure.resourcegroup.name")
+      - delete_key(resource.attributes, "azure.vm.name")
+      - delete_key(resource.attributes, "azure.vm.scaleset.name")
+      - delete_key(resource.attributes, "azure.vm.size")
+      - delete_key(resource.attributes, "cloud.account.id")
+      - delete_key(resource.attributes, "cloud.availability_zone")
+      - delete_key(resource.attributes, "cloud.platform")
+      - delete_key(resource.attributes, "cloud.provider")
+      - delete_key(resource.attributes, "cloud.region")
+      - delete_key(resource.attributes, "container.id")
+      - delete_key(resource.attributes, "cx.otel_integration.name")
+      - delete_key(resource.attributes, "faas.id")
+      - delete_key(resource.attributes, "faas.instance")
+      - delete_key(resource.attributes, "faas.name")
+      - delete_key(resource.attributes, "faas.version")
+      - delete_key(resource.attributes, "gcp.cloud_run.job.execution")
+      - delete_key(resource.attributes, "gcp.cloud_run.job.task_index")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.name")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.region")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.zone")
+      - delete_key(resource.attributes, "host.image.id")
+      - delete_key(resource.attributes, "host.type")
+      - delete_key(resource.attributes, "k8s.cronjob.uid")
+      - delete_key(resource.attributes, "k8s.container.restart_count")
+      - delete_key(resource.attributes, "k8s.daemonset.uid")
+      - delete_key(resource.attributes, "k8s.deployment.uid")
+      - delete_key(resource.attributes, "k8s.hpa.uid")
+      - delete_key(resource.attributes, "k8s.job.uid")
+      - delete_key(resource.attributes, "k8s.namespace.uid")
+      - delete_key(resource.attributes, "k8s.node.uid")
+      - delete_key(resource.attributes, "k8s.pod.start_time")
+      - delete_key(resource.attributes, "k8s.pod.uid")
+      - delete_key(resource.attributes, "k8s.replicaset.uid")
+      - delete_key(resource.attributes, "k8s.statefulset.uid")
+      - delete_key(resource.attributes, "os.type")
+      - delete_key(resource.attributes, "os.version")
+      - delete_key(resource.attributes, "process.command")
+      - delete_key(resource.attributes, "process.command_line")
+      - delete_key(resource.attributes, "process.command_args")
+      - delete_key(resource.attributes, "process.executable.name")
+      - delete_key(resource.attributes, "process.executable.path")
+      - delete_key(resource.attributes, "process.owner")
+      - delete_key(resource.attributes, "process.pid")
+      - delete_key(resource.attributes, "process.parent_pid")
+      - delete_key(resource.attributes, "process.runtime.description")
+      - delete_key(resource.attributes, "process.runtime.name")
+      - delete_key(resource.attributes, "process.runtime.version")
+      - delete_key(resource.attributes, "telemetry.distro.name")
+      - delete_key(resource.attributes, "telemetry.distro.version")
+      - delete_key(resource.attributes, "telemetry.sdk.language")
+      - delete_key(resource.attributes, "telemetry.sdk.name")
+      - delete_key(resource.attributes, "telemetry.sdk.version")
+    metric_statements:
+    - context: metric
+      statements:
+      - delete_key(resource.attributes, "azure.resourcegroup.name")
+      - delete_key(resource.attributes, "azure.vm.name")
+      - delete_key(resource.attributes, "azure.vm.scaleset.name")
+      - delete_key(resource.attributes, "azure.vm.size")
+      - delete_key(resource.attributes, "cloud.account.id")
+      - delete_key(resource.attributes, "cloud.availability_zone")
+      - delete_key(resource.attributes, "cloud.platform")
+      - delete_key(resource.attributes, "cloud.provider")
+      - delete_key(resource.attributes, "cloud.region")
+      - delete_key(resource.attributes, "container.id")
+      - delete_key(resource.attributes, "cx.otel_integration.name")
+      - delete_key(resource.attributes, "faas.id")
+      - delete_key(resource.attributes, "faas.instance")
+      - delete_key(resource.attributes, "faas.name")
+      - delete_key(resource.attributes, "faas.version")
+      - delete_key(resource.attributes, "gcp.cloud_run.job.execution")
+      - delete_key(resource.attributes, "gcp.cloud_run.job.task_index")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.name")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.region")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.zone")
+      - delete_key(resource.attributes, "host.image.id")
+      - delete_key(resource.attributes, "host.type")
+      - delete_key(resource.attributes, "k8s.cronjob.uid")
+      - delete_key(resource.attributes, "k8s.container.restart_count")
+      - delete_key(resource.attributes, "k8s.daemonset.uid")
+      - delete_key(resource.attributes, "k8s.deployment.uid")
+      - delete_key(resource.attributes, "k8s.hpa.uid")
+      - delete_key(resource.attributes, "k8s.job.uid")
+      - delete_key(resource.attributes, "k8s.namespace.uid")
+      - delete_key(resource.attributes, "k8s.node.uid")
+      - delete_key(resource.attributes, "k8s.pod.start_time")
+      - delete_key(resource.attributes, "k8s.pod.uid")
+      - delete_key(resource.attributes, "k8s.replicaset.uid")
+      - delete_key(resource.attributes, "k8s.statefulset.uid")
+      - delete_key(resource.attributes, "os.type")
+      - delete_key(resource.attributes, "os.version")
+      - delete_key(resource.attributes, "process.command") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.command_line") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.command_args") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.executable.name") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.executable.path") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.owner") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.pid") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.parent_pid") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.runtime.description") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.runtime.name") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "process.runtime.version") where not IsMatch(metric.name, "^process\\.")
+      - delete_key(resource.attributes, "net.host.name")
+      - delete_key(resource.attributes, "net.host.port")
+      - delete_key(resource.attributes, "telemetry.distro.name")
+      - delete_key(resource.attributes, "telemetry.distro.version")
+      - delete_key(resource.attributes, "telemetry.sdk.language")
+      - delete_key(resource.attributes, "telemetry.sdk.name")
+      - delete_key(resource.attributes, "telemetry.sdk.version")
+    trace_statements:
+    - context: span
+      statements:
+      - delete_key(resource.attributes, "azure.resourcegroup.name")
+      - delete_key(resource.attributes, "azure.vm.name")
+      - delete_key(resource.attributes, "azure.vm.scaleset.name")
+      - delete_key(resource.attributes, "azure.vm.size")
+      - delete_key(resource.attributes, "cloud.account.id")
+      - delete_key(resource.attributes, "cloud.availability_zone")
+      - delete_key(resource.attributes, "cloud.platform")
+      - delete_key(resource.attributes, "cloud.provider")
+      - delete_key(resource.attributes, "cloud.region")
+      - delete_key(resource.attributes, "container.id")
+      - delete_key(resource.attributes, "cx.otel_integration.name")
+      - delete_key(resource.attributes, "faas.id")
+      - delete_key(resource.attributes, "faas.instance")
+      - delete_key(resource.attributes, "faas.name")
+      - delete_key(resource.attributes, "faas.version")
+      - delete_key(resource.attributes, "gcp.cloud_run.job.execution")
+      - delete_key(resource.attributes, "gcp.cloud_run.job.task_index")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.name")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.region")
+      - delete_key(resource.attributes, "gcp.gce.instance_group_manager.zone")
+      - delete_key(resource.attributes, "host.image.id")
+      - delete_key(resource.attributes, "host.type")
+      - delete_key(resource.attributes, "k8s.cronjob.uid")
+      - delete_key(resource.attributes, "k8s.container.restart_count")
+      - delete_key(resource.attributes, "k8s.daemonset.uid")
+      - delete_key(resource.attributes, "k8s.deployment.uid")
+      - delete_key(resource.attributes, "k8s.hpa.uid")
+      - delete_key(resource.attributes, "k8s.job.uid")
+      - delete_key(resource.attributes, "k8s.namespace.uid")
+      - delete_key(resource.attributes, "k8s.node.uid")
+      - delete_key(resource.attributes, "k8s.pod.start_time")
+      - delete_key(resource.attributes, "k8s.pod.uid")
+      - delete_key(resource.attributes, "k8s.replicaset.uid")
+      - delete_key(resource.attributes, "k8s.statefulset.uid")
+      - delete_key(resource.attributes, "os.type")
+      - delete_key(resource.attributes, "os.version")
+      - delete_key(resource.attributes, "process.command")
+      - delete_key(resource.attributes, "process.command_line")
+      - delete_key(resource.attributes, "process.command_args")
+      - delete_key(resource.attributes, "process.executable.name")
+      - delete_key(resource.attributes, "process.executable.path")
+      - delete_key(resource.attributes, "process.owner")
+      - delete_key(resource.attributes, "process.pid")
+      - delete_key(resource.attributes, "process.parent_pid")
+      - delete_key(resource.attributes, "process.runtime.description")
+      - delete_key(resource.attributes, "process.runtime.name")
+      - delete_key(resource.attributes, "process.runtime.version")
+  transform/semconv:
+    error_mode: ignore
+    trace_statements:
+    - context: span
+      statements:
+      - set(span.attributes["http.method"], span.attributes["http.request.method"]) where span.attributes["http.request.method"] != nil
+  transform/spanmetrics:
+    error_mode: silent
+    metric_statements:
+    - context: datapoint
+      statements:
+      - set(datapoint.attributes["status.code"], "STATUS_CODE_ERROR") where datapoint.attributes["status.code"] == nil and instrumentation_scope.name == "spanmetricsconnector" and datapoint.attributes["otel.status_code"] == "ERROR"
+      - set(datapoint.attributes["status.code"], "STATUS_CODE_OK") where datapoint.attributes["status.code"] == nil and instrumentation_scope.name == "spanmetricsconnector" and datapoint.attributes["otel.status_code"] == "OK"
+      - set(datapoint.attributes["status.code"], "STATUS_CODE_UNSET") where datapoint.attributes["status.code"] == nil and instrumentation_scope.name == "spanmetricsconnector" and (datapoint.attributes["otel.status_code"] == "UNSET" or datapoint.attributes["otel.status_code"] == nil)
+
+receivers:
+  filelog/iis:
+    header:
+      metadata_operators:
+      - if: body matches "^#Fields:"
+        parse_from: body
+        regex: ^#Fields:\s+(?P<csv_header>.+)$
+        type: regex_parser
+      pattern: ^#.*$
+    include:
+    - C:\inetpub\logs\LogFiles\W3SVC*\*.log
+    include_file_name: true
+    include_file_path: false
+    operators:
+    - delimiter: ' '
+      header_attribute: csv_header
+      id: iis_csv_parser
+      if: body != nil and body not matches "^#"
+      trim_space: true
+      type: csv_parser
+    start_at: beginning
+    storage: file_storage
+  hostmetrics:
+    collection_interval: 10s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      disk: null
+      filesystem:
+        exclude_mount_points:
+          match_type: strict
+          mount_points:
+          - ""
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      network: null
+      paging: null
+      process:
+        metrics:
+          process.cpu.utilization:
+            enabled: true
+          process.memory.utilization:
+            enabled: true
+          process.threads:
+            enabled: true
+        mute_process_all_errors: true
+  iis:
+    collection_interval: 30s
+  # ---- RabbitMQ metrics (Management plugin HTTP API) ----
+  # node.* metrics are DISABLED by default in the receiver; enable the node-health set
+  # explicitly. The queue/message-level default metrics (rabbitmq.consumer.count,
+  # rabbitmq.message.*) stay on. guest/guest works over loopback for a co-located broker.
+  rabbitmq:
+    endpoint: ${env:RABBITMQ_ENDPOINT:-http://localhost:15672}
+    username: ${env:RABBITMQ_USERNAME:-guest}
+    password: ${env:RABBITMQ_PASSWORD:-guest}
+    collection_interval: 15s
+    metrics:
+      rabbitmq.node.mem_used:
+        enabled: true
+      rabbitmq.node.mem_limit:
+        enabled: true
+      rabbitmq.node.disk_free:
+        enabled: true
+      rabbitmq.node.disk_free_limit:
+        enabled: true
+      rabbitmq.node.fd_used:
+        enabled: true
+      rabbitmq.node.fd_total:
+        enabled: true
+      rabbitmq.node.sockets_used:
+        enabled: true
+      rabbitmq.node.sockets_total:
+        enabled: true
+      rabbitmq.node.proc_used:
+        enabled: true
+      rabbitmq.node.proc_total:
+        enabled: true
+      rabbitmq.node.uptime:
+        enabled: true
+  # ---- RabbitMQ logs (no upstream receiver -> tail the log dir, like filelog/iis) ----
+  # RabbitMQ writes plain-text lines (NOT CSV), so this uses no csv_parser. The `add`
+  # operator tags only these records with messaging.system=rabbitmq (avoids stamping the
+  # shared logs pipeline). Reuses the file_storage extension already enabled in the base.
+  filelog/rabbitmq:
+    include:
+    - ${env:RABBITMQ_LOG_GLOB:-C:\rabbitmq\log\*.log}
+    include_file_name: true
+    include_file_path: false
+    start_at: beginning
+    storage: file_storage
+    operators:
+    - type: add
+      field: attributes["messaging.system"]
+      value: rabbitmq
+    - type: regex_parser
+      if: 'body matches "^[0-9]{4}-[0-9]{2}-[0-9]{2}"'
+      parse_from: body
+      regex: '^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+).*\[(?P<level>\w+)\]'
+  otlp:
+    protocols:
+      grpc:
+        endpoint: ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}:4317
+        max_recv_msg_size_mib: 20
+      http:
+        endpoint: ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}:4318
+  prometheus:
+    config:
+      scrape_configs:
+      - job_name: opentelemetry-collector
+        scrape_interval: '30s'
+        static_configs:
+        - targets:
+          - ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}:8888
+  windowseventlog/application:
+    channel: Application
+  windowseventlog/security:
+    channel: Security
+  windowseventlog/system:
+    channel: System
+
+service:
+  extensions:
+  - health_check
+  - file_storage
+  - zpages
+  - pprof
+  pipelines:
+    logs:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - resourcedetection/region
+      - resourcedetection/env
+      - resource/metadata
+      - resource/service
+      - resource/environment
+      - transform/iis_service_labels
+      - transform/reduce
+      - transform/iis
+      - batch
+      receivers:
+      - windowseventlog/system
+      - windowseventlog/application
+      - windowseventlog/security
+      - filelog/iis
+      - filelog/rabbitmq
+      - otlp
+    logs/resource_catalog:
+      exporters:
+      - coralogix/resource_catalog
+      processors:
+      - memory_limiter
+      - resource/metadata
+      - resource/service
+      - resource/environment
+      - transform/iis_service_labels
+      - resourcedetection/entity
+      - resourcedetection/region
+      - transform/entity-event
+      receivers:
+      - hostmetrics
+    metrics:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - resourcedetection/region
+      - resourcedetection/env
+      - resource/metadata
+      - resource/service
+      - resource/environment
+      - transform/spanmetrics
+      - transform/reduce
+      - transform/prometheus
+      - batch
+      receivers:
+      - hostmetrics
+      - spanmetrics
+      - spanmetrics/db
+      - prometheus
+      - iis
+      - otlp
+    # RabbitMQ metrics on their own pipeline (mirrors deploy-linux metrics/databases):
+    # rabbitmq receiver -> shared resource/env processors + resource/rabbitmq stamp -> coralogix.
+    metrics/rabbitmq:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - resource/metadata
+      - resource/service
+      - resource/environment
+      - resource/rabbitmq
+      - transform/reduce
+      - batch
+      receivers:
+      - rabbitmq
+    metrics/compact:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - transform/spanmetrics
+      - batch
+      receivers:
+      - spanmetrics/compact
+    metrics/db_compact:
+      exporters:
+      - coralogix
+      processors:
+      - memory_limiter
+      - transform/spanmetrics
+      - batch
+      receivers:
+      - spanmetrics/db_compact
+    traces:
+      exporters:
+      - spanmetrics
+      - forward/db
+      - forward/compact
+      - forward/db_compact
+      - coralogix
+      processors:
+      - memory_limiter
+      - resourcedetection/region
+      - resourcedetection/env
+      - resource/metadata
+      - resource/service
+      - resource/environment
+      - transform/spanmetrics
+      - redaction/spanname
+      - transform/reduce
+      - transform/semconv
+      - transform/db_semconv
+      - groupbytrace/transactions
+      - coralogix
+      - batch
+      receivers:
+      - otlp
+    traces/compact:
+      exporters:
+      - spanmetrics/compact
+      processors:
+      - transform/compact
+      - batch
+      receivers:
+      - forward/compact
+    traces/db:
+      exporters:
+      - spanmetrics/db
+      processors:
+      - filter/db_spanmetrics
+      - batch
+      receivers:
+      - forward/db
+    traces/db_compact:
+      exporters:
+      - spanmetrics/db_compact
+      processors:
+      - filter/db_compact_spanmetrics
+      - transform/db_compact
+      - batch
+      receivers:
+      - forward/db_compact
+  telemetry:
+    logs:
+      encoding: json
+    metrics:
+      readers:
+      - pull:
+          exporter:
+            prometheus:
+              host: ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}
+              port: 8888
+              without_scope_info: false
+              without_type_suffix: false
+              without_units: false
