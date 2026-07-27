@@ -16,7 +16,10 @@
     5. exportCounters     collector internal metrics 8888 - is anything leaving?
     6. ports              OTLP receivers 4318 / 4317 listening
     7. effectiveConfig    transform/iis_service_labels present AND wired into the
-                          logs + logs/resource_catalog pipelines
+                          logs + logs/resource_catalog pipelines. Reads whichever
+                          collector config this host actually has: the supervisor's
+                          merged effective.yaml, else its base collector.yaml, else
+                          the plain service's ProgramData config.yaml.
     8. iisInstrumentation  (delegated to Test-IISInstrumentation.ps1)
     9. nodeInstrumentation (delegated to Test-NodeInstrumentation.ps1)
 
@@ -80,6 +83,9 @@ param(
     [int]      $OtlpGrpcPort        = 4317,
     [string]   $EffectiveConfig     = 'C:\ProgramData\opampsupervisor\state\effective.yaml',
     [string]   $BaseCollectorConfig = 'C:\Program Files\OpenTelemetry OpAMP Supervisor\collector.yaml',
+    # Where the plain collector service keeps its config when it was installed
+    # WITHOUT the supervisor. Searched last, so a supervisor host is unaffected.
+    [string]   $LocalCollectorConfig = 'C:\ProgramData\OpenTelemetry\Collector\config.yaml',
     [string[]] $RequiredProcessors  = @('transform/iis_service_labels'),
     [string[]] $RequiredPipelines   = @('logs','logs/resource_catalog'),
     [string]   $ExpectedOtlpEndpoint = 'http://127.0.0.1:4318',
@@ -143,6 +149,22 @@ else { $script:CxMissingDeps += 'Test-NodeInstrumentation.ps1' }
 # file existing - that is what the bug above taught.
 $hasIisInstr  = [bool](Get-Command Test-IISInstrumentation  -ErrorAction SilentlyContinue)
 $hasNodeInstr = [bool](Get-Command Test-NodeInstrumentation -ErrorAction SilentlyContinue)
+
+# Canonical implementation lives in Test-IISInstrumentation.ps1. This fallback
+# only fires when that file is missing, so the doctor still resolves the inetsrv
+# path correctly under WOW64 while degraded. See Get-CxInetsrvDir there for why
+# hardcoding System32 breaks a 32-bit run.
+if (-not (Get-Command Get-CxInetsrvDir -ErrorAction SilentlyContinue)) {
+    function Get-CxInetsrvDir {
+        if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+            return (Join-Path $env:windir 'Sysnative\inetsrv')
+        }
+        return (Join-Path $env:windir 'System32\inetsrv')
+    }
+}
+if (-not (Get-Command Get-CxAppHostConfigPath -ErrorAction SilentlyContinue)) {
+    function Get-CxAppHostConfigPath { Join-Path (Get-CxInetsrvDir) 'config\applicationHost.config' }
+}
 
 if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) {
     function New-Finding {
@@ -237,7 +259,7 @@ if (-not (Test-CxAdmin)) {
     exit 1
 }
 
-$iisPresent = (Test-Path -LiteralPath (Join-Path $env:windir 'System32\inetsrv\appcmd.exe') -ErrorAction SilentlyContinue) -or
+$iisPresent = (Test-Path -LiteralPath (Join-Path (Get-CxInetsrvDir) 'appcmd.exe') -ErrorAction SilentlyContinue) -or
               [bool](Get-Service -Name 'W3SVC' -ErrorAction SilentlyContinue)
 
 # ---------------------------------------------------------------------------
@@ -348,7 +370,7 @@ if (Use-Check 'iisServiceName') {
         Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'HELPER_MISSING' `
             -Message 'Test-IISInstrumentation.ps1 is not present, so applicationHost.config cannot be parsed')
     } else {
-        $model = Get-CxAppHostModel -Path (Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config')
+        $model = Get-CxAppHostModel -Path (Get-CxAppHostConfigPath)
 
         if (-not $model.Ok) {
             $code = if ($model.Denied) { 'APPHOST_ACCESS_DENIED' } else { 'APPHOST_UNREADABLE' }
@@ -639,14 +661,23 @@ if (Use-Check 'effectiveConfig') {
     # ownership is still blank": a remote Fleet config that redefines the logs
     # pipelines REPLACES the base's processor list, so the processor has to be
     # present in the REMOTE config, not just the local base.
+    # Search order is most-authoritative first:
+    #   1. the supervisor's MERGED effective config (base + Fleet remote)
+    #   2. the supervisor's base collector config
+    #   3. the plain collector service's own config
+    # (3) is what exists when the collector was installed WITHOUT the supervisor
+    # (deploy.bat CX_NO_SUPERVISOR=1 -> the vendor installer's -Config mode, which
+    # copies the config into %ProgramData%\OpenTelemetry\Collector). Nothing here
+    # keys off an install flag - the doctor reports whatever is on the host.
     $cfgPath = $null
-    foreach ($p in @($EffectiveConfig, $BaseCollectorConfig)) {
-        if ($p -and (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue)) { $cfgPath = $p; break }
+    $searched = @($EffectiveConfig, $BaseCollectorConfig, $LocalCollectorConfig) | Where-Object { $_ }
+    foreach ($p in $searched) {
+        if (Test-Path -LiteralPath $p -ErrorAction SilentlyContinue) { $cfgPath = $p; break }
     }
 
     if (-not $cfgPath) {
         Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_CONFIG_NOT_FOUND' `
-            -Message "neither the supervisor effective config nor the base collector config was found (looked at: $EffectiveConfig; $BaseCollectorConfig)")
+            -Message "no collector config found (looked at: $($searched -join '; '))")
     } elseif (-not $iisPresent -and -not $cxIisServices) {
         Add-F (New-Finding -Check 'effectiveConfig' -Severity 'skip' -Code 'IIS_ABSENT' `
             -Message 'no IIS on this host, so the IIS service-label processor is not expected')

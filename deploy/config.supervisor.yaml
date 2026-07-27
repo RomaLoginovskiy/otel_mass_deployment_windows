@@ -145,10 +145,28 @@ connectors:
 
 exporters:
   coralogix:
+    # Coralogix APPLICATION name resolution (coralogixexporter v0.155.0
+    # Config.getMetadataFromResource): the exporter walks application_name_attributes
+    # in order and takes the FIRST NON-EMPTY resource attribute; only if none match
+    # does it fall back to the static `application_name` below.
+    #   1. cx.application.name  - explicit per-signal override (set by a sender/Fleet)
+    #   2. service.namespace    - the host's application, from the machine env var
+    #                             CX_APPLICATION (see resource/service). Unset -> empty
+    #                             string -> skipped by the exporter.
+    #   3. host.name            - FALLBACK: the host names its own application, so an
+    #                             un-configured fleet host is identifiable instead of
+    #                             collapsing into the static `otel` bucket. Supplied by
+    #                             the `system` detector in resourcedetection/env.
+    #   4. application_name: otel - now effectively unreachable (host.name always set);
+    #                             kept because the exporter REQUIRES a non-empty value.
+    # NOTE: a bare `cx.application.name` RESOURCE ATTRIBUTE outside this list does
+    # nothing - the exporter only consults it when `application_name` is empty, which
+    # Config.Validate() rejects. The ordered list is the only working mechanism.
     application_name: otel
     application_name_attributes:
     - cx.application.name
     - service.namespace
+    - host.name
     domain: eu1.coralogix.com
     domain_settings:
       keepalive:
@@ -256,15 +274,49 @@ processors:
     - action: upsert
       key: k8s.cluster.name
       value: windows-iis
-  # FLEET base: only service.namespace is inserted (unifies all signals of a host
-  # under one Coralogix application). The app-specific service.name insert was
-  # removed - per-app service.name arrives from OTLP spans (OTEL_SERVICE_NAME /
+  # ---- Coralogix APPLICATION name (service.namespace) --------------------------
+  # FLEET base: only service.namespace is set (it is what the coralogix exporter maps
+  # to the application name). The app-specific service.name insert was removed -
+  # per-app service.name arrives from OTLP spans (OTEL_SERVICE_NAME /
   # auto-instrumentation). A remote Fleet config may override this per group.
-  resource/service:
-    attributes:
-    - action: insert
-      key: service.namespace
-      value: iis-instrumentation-test
+  #
+  # Value = machine env var CX_APPLICATION (Install-Agent.ps1 -Application /
+  # Install-CoralogixSupervisor.ps1 -Application). When CX_APPLICATION is UNSET this
+  # processor does NOTHING, so service.namespace stays absent and the exporter's
+  # application_name_attributes fall through to host.name: every host names its own
+  # Coralogix application instead of sharing one hard-coded bucket.
+  #
+  # WHY A TRANSFORM AND NOT `resource` WITH ${env:CX_APPLICATION:-}: confmap types a
+  # value that is ENTIRELY one ${env:...} reference, so an empty expansion becomes YAML
+  # null and the attributes processor rejects the action at startup with
+  #   error creating AttrProc. Either field "value", "from_attribute", ... must be specified
+  # (quoting does not help - expansion happens after the quotes are parsed away). Inside
+  # an OTTL string the reference is plain text substitution, so empty is harmless. Same
+  # pattern as transform/iis_service_labels below.
+  #
+  # `where ... == nil` keeps the old `action: insert` semantics: a service.namespace that
+  # already arrived on the resource (e.g. from an app SDK) is never overwritten. All three
+  # signal blocks are required - a transform only touches the signals it declares.
+  transform/appname:
+    error_mode: silent
+    log_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_APPLICATION:-}" != ""'
+      statements:
+      - set(resource.attributes["service.namespace"], "${env:CX_APPLICATION:-}") where resource.attributes["service.namespace"] == nil
+    metric_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_APPLICATION:-}" != ""'
+      statements:
+      - set(resource.attributes["service.namespace"], "${env:CX_APPLICATION:-}") where resource.attributes["service.namespace"] == nil
+    trace_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_APPLICATION:-}" != ""'
+      statements:
+      - set(resource.attributes["service.namespace"], "${env:CX_APPLICATION:-}") where resource.attributes["service.namespace"] == nil
   # Per-host environment label (production/staging/dev/...). The deploy scripts set
   # the machine env var CX_ENVIRONMENT; this stamps it under both the Coralogix
   # visible-tag keys (cx_environment/cx_env) and the OTel semconv key so it drives
@@ -639,8 +691,29 @@ receivers:
         regex: ^#Fields:\s+(?P<csv_header>.+)$
         type: regex_parser
       pattern: ^#.*$
+    # The IIS default, plus three slots for sites that log somewhere else.
+    #
+    # Why slots and not a list: `include` IS a list, but ${env:VAR} expands to a
+    # single scalar, so one variable cannot become N entries. Instrument-IIS.ps1
+    # discovers each site's real logFile directory (and the central-W3C directory
+    # when centralLogFileMode is set) and fills CX_IIS_LOG_DIR_1..3 with the ones
+    # the default glob does NOT already cover - publishing a covered directory
+    # would match the same files through two includes and ingest every line twice.
+    # A host needing more than three is reported by the doctor
+    # (IIS_LOGDIR_SLOTS_EXCEEDED), never silently truncated. To raise the ceiling,
+    # add slots here AND raise $CxLogDirSlotCount in deploy/Resolve-IISLogPaths.ps1.
+    # Background and the full log-layout matrix: docs/iis-e2e-matrix.md
+    #
+    # The defaults are non-empty sentinel paths on purpose. confmap resolves a
+    # whole-string `${env:X:-}` with an EMPTY default to nil, which makes the
+    # receiver fail to start; a path that simply matches nothing is inert.
+    # `**` is recursive, so one slot covers both per-site W3SVC<id> subfolders and
+    # central logging, where the files sit directly in the directory.
     include:
     - C:\inetpub\logs\LogFiles\W3SVC*\*.log
+    - ${env:CX_IIS_LOG_DIR_1:-C:\cx-no-such-log-dir-1}\**\*.log
+    - ${env:CX_IIS_LOG_DIR_2:-C:\cx-no-such-log-dir-2}\**\*.log
+    - ${env:CX_IIS_LOG_DIR_3:-C:\cx-no-such-log-dir-3}\**\*.log
     include_file_name: true
     include_file_path: false
     operators:
@@ -719,7 +792,7 @@ service:
       - resourcedetection/region
       - resourcedetection/env
       - resource/metadata
-      - resource/service
+      - transform/appname
       - resource/environment
       - transform/iis_service_labels
       - transform/reduce
@@ -737,7 +810,7 @@ service:
       processors:
       - memory_limiter
       - resource/metadata
-      - resource/service
+      - transform/appname
       - resource/environment
       - transform/iis_service_labels
       - resourcedetection/entity
@@ -753,7 +826,7 @@ service:
       - resourcedetection/region
       - resourcedetection/env
       - resource/metadata
-      - resource/service
+      - transform/appname
       - resource/environment
       - transform/spanmetrics
       - transform/reduce
@@ -796,7 +869,7 @@ service:
       - resourcedetection/region
       - resourcedetection/env
       - resource/metadata
-      - resource/service
+      - transform/appname
       - resource/environment
       - transform/spanmetrics
       - redaction/spanname
