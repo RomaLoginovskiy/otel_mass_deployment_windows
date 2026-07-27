@@ -58,18 +58,48 @@ Desktop.ini
 
 misc/*.log
 
-# baked collector binary for the Windows E2E image (do not commit)
-test/docker-win/otelcol-contrib.exe
+# ---------------------------------------------------------------------------
+# test/ is IGNORE-BY-DEFAULT with a small allowlist.
+#
+# Most of what lives under test/docker-win/ must never be committed: multi-GB
+# baked binaries (otelcol-contrib.exe, node.zip, otel-dotnet.zip), host-installed
+# node_modules (npm-global/, otel-node/, nodeapp/node_modules/) and vendor
+# installers. The telemetry-SHIPPING harnesses are also left out on purpose -
+# they need those binaries plus live Coralogix keys, so committing them would put
+# files in the repo that nobody can run from a clean clone.
+#
+# Allowlisted: the two SELF-CONTAINED ASSERTING harnesses. They have expected
+# results, exit non-zero on failure, and are what CI or a reviewer would actually
+# run. Everything they need is either in the repo already (deploy/) or built by
+# the Dockerfile.
+#
+# Re-including inside an ignored tree has to be done level by level - git will not
+# descend into an excluded DIRECTORY, so negating a file inside one has no effect.
+test/*
+!test/docker-win
+test/docker-win/*
 
-# baked Node.js zip for the Windows E2E image (downloaded on host; do not commit)
-test/docker-win/node.zip
+# Offline diagnostics matrix - no keys, no network (Run-DoctorTest.ps1).
+!test/docker-win/Run-DoctorTest.ps1
+!test/docker-win/Dockerfile.doctor
+!test/docker-win/entrypoint.doctor.ps1
+!test/docker-win/break-state.ps1
 
-# baked node_modules for the Windows E2E image (installed on host, COPY'd into the image;
-# in-container npm is unreliable in the Server Core base). Do not commit.
-test/docker-win/npm-global/
-test/docker-win/otel-node/
-test/docker-win/nodeapp/node_modules/
+# Full deploy loop over the IIS shape matrix (Run-E2ELoop.ps1). Its Coralogix
+# phase needs keys, but every other phase runs offline.
+!test/docker-win/Run-E2ELoop.ps1
+!test/docker-win/Dockerfile.e2e
+!test/docker-win/entrypoint.e2e.ps1
 
-# RabbitMQ test image installers (downloaded on host, baked into image; not committed)
-test/docker-win/vendor/
-test/
+!test/docker-win/README.md
+
+# Artifacts the deploy scripts PRODUCE on the host they run on. The package is an
+# allowlist (Build-DeploymentPackage.ps1 $required), so these are never shipped -
+# they just appear next to the scripts after a run.
+deploy/config.recommended.yaml
+deploy/agent-doctor.*
+deploy/*.jsonl
+deploy/install-agent*.log
+deploy/uninstall-agent*.log
+deploy/install-agent-status.json
+deploy/detect-workloads.json

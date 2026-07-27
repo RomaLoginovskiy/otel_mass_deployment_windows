@@ -1,17 +1,34 @@
 <#
 .SYNOPSIS
-  Install the Coralogix OpenTelemetry Collector in SUPERVISOR mode (Fleet
-  Management / remote-config ready) using a local base config.
+  Install the Coralogix OpenTelemetry Collector - with the OpAMP Supervisor
+  (default) or without it (-NoSupervisor).
 
 .DESCRIPTION
-  Downloads the vendor installer (coralogix-otel-collector.ps1) and runs it with
-  -Supervisor. In this mode the OpAMP Supervisor process owns the OpAMP connection
-  and Coralogix Fleet Management can push remote config that is merged on top of
-  the local base config (which must NOT contain an opamp extension - see
-  config.supervisor.yaml).
+  Downloads the vendor installer (coralogix-otel-collector.ps1) and runs it. The
+  ONLY difference between the two modes is the arguments handed to that installer:
+
+    supervisor     -Supervisor -SupervisorCollectorBaseConfig <cfg> -EnableDynamicIISParsing
+    -NoSupervisor  -Config <cfg> -EnableDynamicIISParsing
+
+  Supervisor mode: the OpAMP Supervisor process owns the OpAMP connection and
+  Coralogix Fleet Management can push remote config that is merged on top of the
+  local base config.
+
+  -NoSupervisor: the collector runs as the plain 'otelcol-contrib' Windows service
+  and the config on disk is authoritative - nothing is merged, nothing is pushed.
+
+  ONE recommended config serves both modes. It is produced into this script's own
+  folder as config.recommended.yaml and handed to whichever installer argument the
+  mode selects. It must not contain an opamp extension: that is mandatory in
+  supervisor mode (the Supervisor owns OpAMP) and is what makes -NoSupervisor
+  deterministic.
+
+  Note the vendor installer OWNS config placement in regular mode - it copies what
+  -Config points at into %ProgramData%\OpenTelemetry\Collector. This script does not
+  write there.
 
   Sets CORALOGIX_DOMAIN and CORALOGIX_PRIVATE_KEY (persisted as machine env vars so
-  the service keeps them across restarts), stages the base config, and installs.
+  the service keeps them across restarts), produces the config, and installs.
 
 .PARAMETER Domain
   Coralogix domain. Default: eu1.coralogix.com
@@ -23,12 +40,19 @@
   File containing the Send-Your-Data key. Default: .\SendDataKey.txt (falls back to
   ..\SimpleWebApp\coralogix\SendDataKey.txt when present).
 
+.PARAMETER NoSupervisor
+  Install WITHOUT the OpAMP Supervisor: the vendor installer's regular mode, which
+  registers the 'otelcol-contrib' service and takes the config via -Config.
+  Affects the installer arguments and nothing else.
+
 .PARAMETER BaseConfig
-  Base collector config passed as -SupervisorCollectorBaseConfig.
-  Default: .\config.supervisor.yaml
+  Source template for the recommended config. Default: .\config.supervisor.yaml
+  (the name is historical - the file is opamp-free and serves both modes).
 
 .PARAMETER StageDir
-  Where the base config is staged on the host. Default: C:\otel
+  Where the recommended config is produced. Default: this script's own folder, so
+  the config sits next to the scripts that used it and is available for either
+  mode. The vendor installer copies it to its own location from there.
 
 .PARAMETER Version
   Optional collector version to pin (passed to the vendor installer -Version).
@@ -38,6 +62,13 @@
   machine env var CX_ENVIRONMENT, which the base config's resource/environment
   processor stamps onto all signals (tags.cx_environment, tags.cx_env,
   deployment.environment.name) so Coralogix can split telemetry by environment.
+
+.PARAMETER Application
+  Optional Coralogix APPLICATION name for this host. Persisted as the machine env var
+  CX_APPLICATION, which the base config's transform/appname processor stamps as
+  service.namespace (the exporter maps it to the application name).
+  OMIT IT to get the default: the application name falls back to the host's own name
+  (host.name). Use it only when several hosts must report under one shared application.
 
 .NOTES
   Run elevated (Administrator). The base config uses file_storage, so this script
@@ -49,12 +80,16 @@ param(
     [string] $Domain     = 'eu1.coralogix.com',
     [string] $PrivateKey = $null,
     [string] $KeyFile    = (Join-Path $PSScriptRoot 'SendDataKey.txt'),
+    [switch] $NoSupervisor,
     [string] $BaseConfig = (Join-Path $PSScriptRoot 'config.supervisor.yaml'),
-    [string] $StageDir   = 'C:\otel',
+    [string] $StageDir   = $PSScriptRoot,
     [string] $Version    = $null,
     # Deployment environment -> machine env var CX_ENVIRONMENT (read by the base
     # config's resource/environment processor).
     [string] $Environment = $null,
+    # Coralogix application name -> machine env var CX_APPLICATION (read by the base
+    # config's transform/appname processor). Unset = fall back to host.name.
+    [string] $Application = $null,
     # Comma-separated key=value selector attributes (cx.host.role, workload.*) to publish
     # in the OpAMP AgentDescription. Defaults to machine OTEL_RESOURCE_ATTRIBUTES (set by
     # Detect-Workloads.ps1) when omitted.
@@ -67,8 +102,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# $PSScriptRoot is EMPTY under `powershell -File <relative-path>`, which would turn
+# every default above into a bare filename resolved against the caller's cwd. Repair
+# the ones that matter rather than trusting the param defaults.
+$here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $StageDir)   { $StageDir   = $here }
+if (-not $BaseConfig) { $BaseConfig = Join-Path $here 'config.supervisor.yaml' }
+if (-not $KeyFile)    { $KeyFile    = Join-Path $here 'SendDataKey.txt' }
+
 # Optional backup/manifest recording (shared session from the orchestrator).
-$backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
+$backupHelper = Join-Path $here 'Backup-Config.ps1'
 if (Test-Path $backupHelper) { . $backupHelper }
 
 function Assert-Admin {
@@ -150,7 +193,7 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 
 # ---- Resolve the private key --------------------------------------------------
 if (-not $PrivateKey) {
-    $candidates = @($KeyFile, (Join-Path $PSScriptRoot '..\SimpleWebApp\coralogix\SendDataKey.txt'))
+    $candidates = @($KeyFile, (Join-Path $here '..\SimpleWebApp\coralogix\SendDataKey.txt'))
     $found = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
     if (-not $found) { throw "No private key: pass -PrivateKey or provide $KeyFile" }
     $PrivateKey = (Get-Content -Path $found -Raw).Trim()
@@ -160,17 +203,30 @@ if ([string]::IsNullOrWhiteSpace($PrivateKey) -or $PrivateKey -like '*<*your*key
     throw "Private key is empty or a placeholder. Set a real Send-Your-Data key."
 }
 
-# ---- Stage the base config ----------------------------------------------------
+# ---- Produce the recommended config -------------------------------------------
+# ONE config for both modes, written into this script's own folder under a
+# mode-neutral name. Supervisor mode passes it as -SupervisorCollectorBaseConfig;
+# -NoSupervisor passes the same file as -Config. The source template keeps its
+# historical 'config.supervisor.yaml' name (it is referenced by
+# Build-DeploymentPackage.ps1 and the docs) - only the produced artifact is renamed.
 if (-not (Test-Path $BaseConfig)) { throw "Base config not found: $BaseConfig" }
 if (-not (Test-Path $StageDir)) { New-Item -ItemType Directory -Path $StageDir -Force | Out-Null }
-$stagedConfig = Join-Path $StageDir 'config.supervisor.yaml'
-Copy-Item -Path $BaseConfig -Destination $stagedConfig -Force
-Write-Host "[supervisor] staged base config -> $stagedConfig"
+$stagedConfig = Join-Path $StageDir 'config.recommended.yaml'
+# Producing next to the template means source and destination can be the same file
+# when -BaseConfig is already the produced one (a re-run). Copy-Item would throw.
+if ((Resolve-Path -LiteralPath $BaseConfig).Path -ne
+    (Join-Path (Resolve-Path -LiteralPath $StageDir).Path 'config.recommended.yaml')) {
+    Copy-Item -Path $BaseConfig -Destination $stagedConfig -Force
+}
+Write-Host "[collector] recommended config -> $stagedConfig"
 
-# Guard: base config must NOT contain an opamp extension in Supervisor mode.
+# Guard: the config must NOT contain an opamp extension. Mandatory in supervisor
+# mode (the Supervisor owns the OpAMP connection); in -NoSupervisor mode an opamp
+# extension would let a remote config silently replace what is on disk, which is
+# exactly the determinism that mode exists to provide.
 $cfgText = Get-Content -Path $stagedConfig -Raw
 if ($cfgText -match '(?m)^\s{2}opamp\s*:') {
-    throw "Base config contains an 'opamp' extension. Remove it - the Supervisor owns OpAMP."
+    throw "Recommended config contains an 'opamp' extension. Remove it - it is invalid in supervisor mode and defeats -NoSupervisor."
 }
 
 # ---- Persist domain + key as machine env vars ---------------------------------
@@ -196,49 +252,94 @@ if ($Environment) {
     Write-Host "[supervisor] CX_ENVIRONMENT=$Environment (machine env set)"
 }
 
+# ---- Persist Coralogix application name (read by transform/appname processor) --
+# Unset on purpose = the exporter's application_name_attributes fall through to
+# host.name, so the host reports under its own name instead of a shared bucket.
+if ($Application) {
+    if ($Session) {
+        Record-EnvChange -Session $Session -Name 'CX_APPLICATION' -PriorValue ([Environment]::GetEnvironmentVariable('CX_APPLICATION', 'Machine'))
+    }
+    [Environment]::SetEnvironmentVariable('CX_APPLICATION', $Application, 'Machine')
+    $env:CX_APPLICATION = $Application
+    Write-Host "[supervisor] CX_APPLICATION=$Application (machine env set)"
+} else {
+    Write-Host "[supervisor] CX_APPLICATION not set - Coralogix application falls back to host.name ($env:COMPUTERNAME)"
+}
+
 # ---- Download vendor installer ------------------------------------------------
 $u = 'https://github.com/coralogix/telemetry-shippers/releases/latest/download/coralogix-otel-collector.ps1'
 $f = Join-Path $env:TEMP 'coralogix-otel-collector.ps1'
 Write-Host "[supervisor] downloading vendor installer..."
 Invoke-WebRequest -Uri $u -OutFile $f -UseBasicParsing
 
-# ---- Install in Supervisor mode -----------------------------------------------
-$installArgs = @{
-    Supervisor                     = $true
-    SupervisorCollectorBaseConfig  = $stagedConfig
-    EnableDynamicIISParsing        = $true   # base config uses file_storage
+# ---- Install ------------------------------------------------------------------
+# THE mode switch. Everything before and after this block is identical in both
+# modes. -EnableDynamicIISParsing is valid in both (the config uses file_storage);
+# -Config and -Supervisor are mutually exclusive per the vendor installer's own
+# help ("-Config: not available with Supervisor mode").
+if ($NoSupervisor) {
+    $installArgs = @{
+        Config                  = $stagedConfig
+        EnableDynamicIISParsing = $true
+    }
+    $shown = "-Config '$stagedConfig' -EnableDynamicIISParsing"
+} else {
+    $installArgs = @{
+        Supervisor                    = $true
+        SupervisorCollectorBaseConfig = $stagedConfig
+        EnableDynamicIISParsing       = $true
+    }
+    $shown = "-Supervisor -SupervisorCollectorBaseConfig '$stagedConfig' -EnableDynamicIISParsing"
 }
 if ($Version) { $installArgs['Version'] = $Version }
 
-Write-Host "[supervisor] running installer: -Supervisor -SupervisorCollectorBaseConfig '$stagedConfig' -EnableDynamicIISParsing"
+Write-Host "[collector] running installer: $shown"
 & $f @installArgs
 if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
     throw "Vendor installer exited with code $LASTEXITCODE"
 }
 
-# ---- Publish selector attributes to the OpAMP AgentDescription ----------------
-# The vendor installer writes only static service.name/cx.agent.type into the supervisor
-# config's agent.description. Inject the detected cx.host.role/workload.* so Coralogix
-# Fleet Management can group / assign config by them, then restart to apply.
-$supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Supervisor\config.yaml'
-if ($Session) { Backup-DeployFile -Session $Session -Path $supervisorConfig | Out-Null }
-Set-SupervisorDescriptionAttributes -ConfigPath $supervisorConfig -Attributes $ResourceAttributes
-try {
-    if (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue) {
-        # The vendor installer registers the service with StartType=Manual. After a reboot the
-        # supervisor stays Stopped -> the agent silently drops off Fleet Management and no
-        # telemetry ships until someone starts it by hand. Force Automatic so it survives reboots.
-        Set-Service -Name 'opampsupervisor' -StartupType Automatic -ErrorAction SilentlyContinue
-        Write-Host "[supervisor] set opampsupervisor StartType=Automatic (survives reboot)"
-        Restart-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
-        Write-Host "[supervisor] restarted opampsupervisor to apply AgentDescription attributes"
+if ($NoSupervisor) {
+    # No AgentDescription to publish - there is no OpAMP connection and no Fleet
+    # Management registration in this mode. The selector attributes still reach the
+    # telemetry DATA through the machine OTEL_RESOURCE_ATTRIBUTES that
+    # Detect-Workloads.ps1 set and the config's resourcedetection/env reads; what is
+    # unavailable is targeting this agent by them in Fleet Management.
+    if ($ResourceAttributes) {
+        Write-Host "[collector] -NoSupervisor: selector attributes stay on the telemetry only (no Fleet Management registration)"
     }
-} catch { Write-Warning "[supervisor] could not configure/restart opampsupervisor: $_" }
+    try {
+        if (Get-Service -Name 'otelcol-contrib' -ErrorAction SilentlyContinue) {
+            # Same reboot-survival reason as the supervisor branch below.
+            Set-Service -Name 'otelcol-contrib' -StartupType Automatic -ErrorAction SilentlyContinue
+            Write-Host "[collector] set otelcol-contrib StartType=Automatic (survives reboot)"
+        }
+    } catch { Write-Warning "[collector] could not configure otelcol-contrib: $_" }
+} else {
+    # ---- Publish selector attributes to the OpAMP AgentDescription ----------------
+    # The vendor installer writes only static service.name/cx.agent.type into the supervisor
+    # config's agent.description. Inject the detected cx.host.role/workload.* so Coralogix
+    # Fleet Management can group / assign config by them, then restart to apply.
+    $supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Supervisor\config.yaml'
+    if ($Session) { Backup-DeployFile -Session $Session -Path $supervisorConfig | Out-Null }
+    Set-SupervisorDescriptionAttributes -ConfigPath $supervisorConfig -Attributes $ResourceAttributes
+    try {
+        if (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue) {
+            # The vendor installer registers the service with StartType=Manual. After a reboot the
+            # supervisor stays Stopped -> the agent silently drops off Fleet Management and no
+            # telemetry ships until someone starts it by hand. Force Automatic so it survives reboots.
+            Set-Service -Name 'opampsupervisor' -StartupType Automatic -ErrorAction SilentlyContinue
+            Write-Host "[supervisor] set opampsupervisor StartType=Automatic (survives reboot)"
+            Restart-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
+            Write-Host "[supervisor] restarted opampsupervisor to apply AgentDescription attributes"
+        }
+    } catch { Write-Warning "[supervisor] could not configure/restart opampsupervisor: $_" }
+}
 
 # ---- Verify -------------------------------------------------------------------
 Start-Sleep -Seconds 6
 Write-Host ""
-Write-Host "[supervisor] services:"
+Write-Host "[collector] services:"
 Get-Service -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -match 'otel|coralogix|opamp|supervisor' } |
     Format-Table Name, Status, StartType, DisplayName -AutoSize | Out-String | Write-Host
@@ -248,10 +349,14 @@ try {
     $r = Invoke-WebRequest -Uri 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 10
     if ($r.StatusCode -eq 200) { $health = $true }
 } catch {}
-Write-Host "[supervisor] health check 127.0.0.1:13133 -> $(if ($health) {'OK (200)'} else {'not responding yet'})"
+Write-Host "[collector] health check 127.0.0.1:13133 -> $(if ($health) {'OK (200)'} else {'not responding yet'})"
 
 if (-not $health) {
     Write-Warning "Collector health endpoint not responding. Check the Application event log (source otelcol-contrib) and confirm CORALOGIX_PRIVATE_KEY is set on the service."
 }
 
-Write-Host "[supervisor] done. Assign a remote config to this host in Coralogix Fleet Management."
+if ($NoSupervisor) {
+    Write-Host "[collector] done (no supervisor). The config on disk is authoritative; there is no Fleet Management registration."
+} else {
+    Write-Host "[supervisor] done. Assign a remote config to this host in Coralogix Fleet Management."
+}

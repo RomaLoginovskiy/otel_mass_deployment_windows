@@ -24,11 +24,13 @@ flowchart LR
 | `docs/iis-instrumentation.md` | **Start here.** Single-host runbook: install the collector, zero-code .NET/IIS instrumentation, shared app-pool config, troubleshooting, full reference `config.yaml`. |
 | `docs/fleet-deployment.md` | Fleet-scale runbook: build a package, push with BatchPatch, Supervisor mode, workload detection → selector attributes, Fleet Management. |
 | `docs/agent-diagnostics.md` | **When something is wrong on a host.** Read-only diagnostics (`doctor.bat` / `Test-Agent.ps1` / the two instrumentation validators), graded exit codes, and what each finding means. |
+| `docs/iis-e2e-matrix.md` | The IIS shapes and log layouts the end-to-end loop covers — and **every layout that needs a fix or a non-default setting** before telemetry works. |
 | `deploy/` | The deployment package payload (see below). |
 | `Build-DeploymentPackage.ps1` | Zips `deploy/` into `coralogix-agent-deploy.zip`. |
 | `poc/` | VirtualBox harness to validate the package on a throwaway Windows Server 2025 VM before fleet rollout. |
 | `SimpleWebApp/` | A minimal ASP.NET Core 8 app (with a SQL Server call) used as an instrumentation target for testing. |
-| `scripts/` | Single-host / test helpers: `deploy-app.ps1` (build + zero-code instrument `SimpleWebApp` on IIS in one pass), `generate-load.ps1` (emit test traffic). See [`scripts/README.md`](scripts/README.md). |
+| `scripts/` | Single-host / test helpers: `deploy-app.ps1` (build + zero-code instrument `SimpleWebApp` on IIS in one pass), `generate-load.ps1` (emit test traffic), and the operator-side `Verify-Coralogix*.ps1` server-side gates. See [`scripts/README.md`](scripts/README.md). |
+| `test/docker-win/` | Windows-container harnesses: the Coralogix E2E (IIS + PM2, and a RabbitMQ variant), the offline **asserting** diagnostics test `Run-DoctorTest.ps1`, and `Run-E2ELoop.ps1` — the full deploy loop over an 8-shape IIS host. See [`test/docker-win/README.md`](test/docker-win/README.md). |
 | `deploy-linux/` | **Linux** path: OpAMP Supervisor install for Linux DB hosts (Redis/Valkey/PostgreSQL/Elasticsearch), managed via Fleet Management. See [`deploy-linux/README.md`](deploy-linux/README.md). |
 
 ## Two paths
@@ -41,7 +43,7 @@ Follow [`docs/iis-instrumentation.md`](docs/iis-instrumentation.md). In short:
    `config.yaml`.
 2. Install the OpenTelemetry .NET auto-instrumentation (Windows PowerShell **5.1**,
    elevated): `Import-Module` → `Install-OpenTelemetryCore` → `Register-OpenTelemetryForIIS`.
-3. Point apps at the local collector (`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`).
+3. Point apps at the local collector (`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`).
    `Instrument-IIS.ps1` (or `deploy-app.ps1 -InstrumentAllApps`) auto-discovers every IIS
    site/app and sets a distinct `OTEL_SERVICE_NAME` per app from the site name + app path
    (root app → site name; nested `/api` → `Site/api`).
@@ -116,12 +118,15 @@ that folder's README.
 | --- | --- |
 | `deploy.bat` | BatchPatch entry point; launches the orchestrator under PowerShell 5.1. |
 | `uninstall.bat` | BatchPatch entry point for uninstall; launches `Uninstall-Agent.ps1` (`CX_PURGE=1` → `-Purge`, `CX_RESTORE=1` → `-RestoreConfigs`). |
-| `Install-Agent.ps1` | Orchestrator: detect → install supervisor → conditional IIS → verify. Opens a backup session and records every config it changes. |
+| `Install-Agent.ps1` | Orchestrator: detect → install supervisor → conditional IIS / Node → verify. Opens a backup session and records every config it changes. |
 | `Uninstall-Agent.ps1` | Reverse the install, manifest-guided (removes only what install added, restores prior values). See **Uninstall & rollback** below. |
-| `Detect-Workloads.ps1` | Detects IIS, .NET, Node, Redis, Valkey, SQL Server, DB2, RabbitMQ, Elasticsearch → `OTEL_RESOURCE_ATTRIBUTES`. |
+| `Detect-Workloads.ps1` | Detects IIS, .NET, Node, PM2, Redis, Valkey, SQL Server, DB2, RabbitMQ, Elasticsearch → `OTEL_RESOURCE_ATTRIBUTES`. Dot-source it to get the probe helpers without running a scan. |
 | `Install-CoralogixSupervisor.ps1` | Collector install with `-Supervisor`; injects selector attributes into the OpAMP AgentDescription. |
 | `Instrument-IIS.ps1` | Zero-code .NET auto-instrumentation, IIS hosts only. |
 | `Resolve-IISServiceNames.ps1` | Per-app `OTEL_SERVICE_NAME` mapping + `web.config` read/write helpers (dot-sourced by the install + uninstall scripts). |
+| `Resolve-IISLogPaths.ps1` | Discovers where IIS really writes access logs (custom `logFile.directory`, central W3C, non-W3C formats) and publishes `CX_IIS_LOG_DIR_n`, so sites logging outside the collector's default glob are not silently lost. |
+| `Instrument-NodePM2.ps1` | Zero-code Node instrumentation via per-app `NODE_OPTIONS`, PM2 hosts only. |
+| `Resolve-NodeServiceNames.ps1` | Per-app Node `OTEL_SERVICE_NAME` mapping helpers (dot-sourced by the install + uninstall scripts). |
 | `Backup-Config.ps1` | Backup + manifest helper; snapshots every config the install mutates before it changes it. |
 | `doctor.bat` | BatchPatch entry point for the read-only host diagnostic; propagates the graded exit code (`0` pass / `1` hard fail / `2` degraded). |
 | `Test-Agent.ps1` | Host doctor: env vars, per-app `OTEL_SERVICE_NAME` readback, services, health, export counters, OTLP ports, effective-config processor, plus the two instrumentation validators. `-Only` runs a subset. See [`docs/agent-diagnostics.md`](docs/agent-diagnostics.md). |

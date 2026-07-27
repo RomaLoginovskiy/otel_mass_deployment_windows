@@ -27,6 +27,18 @@
 .PARAMETER Environment
   Optional deployment.environment.name resource attribute (e.g. production).
 
+.PARAMETER Application
+  Optional Coralogix application name for this host (machine env var CX_APPLICATION).
+  Omit it to let the application name fall back to the host's own name (host.name).
+
+.PARAMETER NoSupervisor
+  Install the collector WITHOUT the OpAMP Supervisor, i.e. as the plain
+  'otelcol-contrib' Windows service reading a local config.
+
+  This switch is forwarded verbatim and affects ONLY the arguments handed to the
+  Coralogix vendor installer. Detection, IIS/Node instrumentation, the env vars
+  that get set, and the diagnostics all behave identically in both modes.
+
 .PARAMETER SkipInstrument
   Skip IIS zero-code instrumentation even if IIS is detected.
 
@@ -42,6 +54,8 @@ param(
     [string] $KeyFile           = $null,
     [string] $PrivateKey        = $null,
     [string] $Environment       = $null,
+    [string] $Application       = $null,
+    [switch] $NoSupervisor,
     [switch] $SkipInstrument,
     [string] $InstrumentVersion = 'v1.16.0-beta.1'
 )
@@ -66,6 +80,10 @@ $status = [ordered]@{
     started       = (Get-Date).ToString('s')
     primaryRole   = $null
     workloads     = @()
+    # 'supervisor' | 'no-supervisor'. The boolean below is kept because
+    # poc/Deploy-FromHost.ps1 and existing runbooks read it; it means "the
+    # collector install step completed", not "the supervisor is running".
+    mode          = $(if ($NoSupervisor) { 'no-supervisor' } else { 'supervisor' })
     supervisor    = $false
     iisInstrumented = $false
     pm2Instrumented = $false
@@ -113,12 +131,18 @@ try {
             }
         })
 
-    # -- 2. Install collector in Supervisor mode --------------------------------
+    # -- 2. Install the collector ----------------------------------------------
+    # -NoSupervisor selects the vendor installer's regular mode. Everything else
+    # about this call is identical between the two modes.
     $supArgs = @{ Domain = $Domain; BaseConfig = (Join-Path $here 'config.supervisor.yaml') }
+    if ($NoSupervisor) { $supArgs['NoSupervisor'] = $true }
     if ($PrivateKey) { $supArgs['PrivateKey'] = $PrivateKey } else { $supArgs['KeyFile'] = $KeyFile }
     # Persist CX_ENVIRONMENT (machine) so the collector's resource/environment
     # processor stamps the env label onto all signals.
     if ($Environment) { $supArgs['Environment'] = $Environment }
+    # Persist CX_APPLICATION (machine) so transform/appname stamps service.namespace.
+    # Unset = the transform is skipped and the exporter falls back to host.name.
+    if ($Application) { $supArgs['Application'] = $Application }
     # Publish the detected selector attributes in the OpAMP AgentDescription (Fleet Mgmt).
     if ($roles.OtelResourceAttributes) { $supArgs['ResourceAttributes'] = $roles.OtelResourceAttributes }
     $supArgs['Session'] = $session

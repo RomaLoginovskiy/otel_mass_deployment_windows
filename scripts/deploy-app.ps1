@@ -38,7 +38,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ancm   = "C:\Program Files\IIS\Asp.Net Core Module\V2\aspnetcorev2.dll"
-$appcmd = Join-Path $env:windir "System32\inetsrv\appcmd.exe"
+# Sysnative, not System32, when this runs 32-bit: WOW64 redirects System32 to
+# SysWOW64, whose inetsrv has appcmd.exe but no config\applicationHost.config.
+# appcmd would still work (bitness-agnostic COM API) while any direct config read
+# silently missed. Same resolver as deploy/Instrument-IIS.ps1.
+$inetsrv = if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+    Join-Path $env:windir 'Sysnative\inetsrv'
+} else {
+    Join-Path $env:windir 'System32\inetsrv'
+}
+$appcmd = Join-Path $inetsrv "appcmd.exe"
 $csproj = Join-Path $SourceDir "SimpleWebApp.csproj"
 
 # The requested OTEL resource attributes (literal Coralogix-visible tag keys).

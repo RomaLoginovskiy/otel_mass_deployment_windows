@@ -17,7 +17,15 @@ REM ===========================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
+REM Always launch the 64-bit PowerShell on 64-bit Windows. PROCESSOR_ARCHITEW6432
+REM is defined only inside a 32-bit process on 64-bit Windows (a 32-bit BatchPatch
+REM agent, a 32-bit scheduled task); there System32 is redirected to SysWOW64,
+REM which has inetsrv\appcmd.exe but no inetsrv\config\applicationHost.config, so
+REM the uninstaller could not read the config back to reverse its own pool env
+REM entries. Sysnative is the un-redirected view and
+REM exists only from WOW64, hence the "if exist" guard. Same shape as deploy.bat.
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if defined PROCESSOR_ARCHITEW6432 if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "PS=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
 
 REM Build optional switches from env vars (each independent).
 set ARGS=

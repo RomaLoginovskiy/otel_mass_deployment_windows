@@ -42,6 +42,11 @@
   is in applicationHost.config, so it still works on a host where the IIS
   management tools are missing - which is itself one of the failure modes the
   fleet has hit.
+
+  WOW64. The inetsrv path is resolved through Get-CxInetsrvDir, not hardcoded to
+  System32. See that function for why: a 32-bit host process can drive appcmd
+  perfectly while every direct read of applicationHost.config returns "not
+  found", which looks exactly like "the config is gone" and is not.
 #>
 # PositionalBinding=$false: reject stray tokens instead of silently binding them
 # to the wrong parameter (see Test-Agent.ps1 for the failure this prevents).
@@ -51,7 +56,11 @@ param(
     # dual-stack host `localhost` resolves to ::1 first and OTLP export is
     # silently dropped (docs/iis-service-ownership.md).
     [string] $ExpectedOtlpEndpoint = 'http://127.0.0.1:4318',
-    [string] $AppHostConfig        = (Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'),
+    # Empty = resolve with Get-CxAppHostConfigPath below. It is NOT defaulted
+    # here because a param default is evaluated at binding time, before any
+    # function in this file exists, and the correct path depends on process
+    # bitness (see Get-CxInetsrvDir).
+    [string] $AppHostConfig,
     [string] $BackupRoot,                # default: Backup-Config.ps1's ProgramData root
     [switch] $Quiet,
     [switch] $PassThru
@@ -70,6 +79,14 @@ $script:CxFmtLoaded = $false
 $fmt = Join-Path $script:CxIisHere 'Write-DeployLog.ps1'
 if (Test-Path -LiteralPath $fmt -ErrorAction SilentlyContinue) {
     try { . $fmt; $script:CxFmtLoaded = $true } catch { }
+}
+
+# IIS log-path discovery. Guarded: without it the log-coverage sub-check reports
+# 'unknown' and everything else still runs. Availability is decided by the function
+# being callable, not by the file existing.
+$logLib = Join-Path $script:CxIisHere 'Resolve-IISLogPaths.ps1'
+if (Test-Path -LiteralPath $logLib -ErrorAction SilentlyContinue) {
+    try { . $logLib } catch { }
 }
 if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) {
     function New-Finding {
@@ -117,9 +134,50 @@ function Test-CxElevated {
     } catch { return $false }
 }
 
+function Get-CxInetsrvDir {
+    <#
+      The REAL inetsrv directory for THIS process.
+
+      On 64-bit Windows the WOW64 file system redirector rewrites
+      %windir%\System32 to %windir%\SysWOW64 for a 32-bit process.
+      SysWOW64\inetsrv exists and contains appcmd.exe. It even has a config\
+      folder - but that folder holds only Schema\ and Export\, never
+      applicationHost.config. The consequence is a genuinely confusing split:
+
+        * appcmd works.       It reaches the IIS configuration system through
+                              the ahadmin COM API, which is bitness-agnostic, so
+                              pool environment variables are written correctly.
+        * direct reads fail.  Get-Content on
+                              %windir%\System32\inetsrv\config\applicationHost.config
+                              lands in SysWOW64\inetsrv\config, which does not
+                              exist, and reports "not found".
+
+      So a 32-bit host process - a 32-bit BatchPatch/RMM agent launching
+      deploy.bat or doctor.bat, a 32-bit scheduled task, a 32-bit cmd - can
+      instrument a host successfully while the doctor swears the config is gone.
+
+      %windir%\Sysnative is the un-redirected view of the real System32. It
+      exists ONLY when observed from a 32-bit process, so this branches on
+      process bitness and NOT on Test-Path: Test-Path returns $false on an
+      access-denied path (applicationHost.config is Administrators-only), which
+      would silently pick the wrong directory on exactly the hosts that matter.
+    #>
+    if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+        return (Join-Path $env:windir 'Sysnative\inetsrv')
+    }
+    return (Join-Path $env:windir 'System32\inetsrv')
+}
+
+function Get-CxAppHostConfigPath {
+    Join-Path (Get-CxInetsrvDir) 'config\applicationHost.config'
+}
+
 function Test-CxIisPresent {
     # Cheap, no module. Mirrors the appcmd probe Instrument-IIS.ps1 relies on.
-    (Test-Path -LiteralPath (Join-Path $env:windir 'System32\inetsrv\appcmd.exe')) -or
+    # appcmd.exe is present under both System32\inetsrv and SysWOW64\inetsrv, so
+    # this probe answers correctly either way; it goes through the resolver for
+    # consistency, not because it has to.
+    (Test-Path -LiteralPath (Join-Path (Get-CxInetsrvDir) 'appcmd.exe') -ErrorAction SilentlyContinue) -or
     [bool](Get-Service -Name 'W3SVC' -ErrorAction SilentlyContinue)
 }
 
@@ -379,7 +437,10 @@ function Test-IISInstrumentation {
     [CmdletBinding()]
     param(
         [string] $ExpectedOtlpEndpoint = 'http://127.0.0.1:4318',
-        [string] $AppHostConfig        = (Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'),
+        # Safe as a default here (unlike the script-level param): a function's
+        # defaults are evaluated when it is CALLED, by which point the whole
+        # file has been sourced and Get-CxAppHostConfigPath exists.
+        [string] $AppHostConfig        = (Get-CxAppHostConfigPath),
         [string] $BackupRoot
     )
 
@@ -619,7 +680,112 @@ function Test-IISInstrumentation {
         }
     }
 
+    # -- g: are the IIS access logs actually reachable by the collector? -------
+    # Spans prove the profiler works. This proves the OTHER half of IIS telemetry:
+    # a site whose logs land somewhere the filelog receiver never looks ships
+    # nothing, and until now said nothing either.
+    #
+    # Assign, THEN iterate. Do not write `foreach (... in @(Test-CxIisLogCoverage ...))`:
+    # the function returns `,@(...)` to stop PowerShell unrolling its array, so it
+    # emits ONE pipeline object that IS the array - and @() around a pipeline wraps
+    # that in a second array. The loop then runs once with the whole array, Add-F
+    # appends it as a single element, and every log finding renders as one row of
+    # System.Object[] instead of N rows. Assignment collects the single item
+    # directly and keeps the array intact.
+    $logFindings = Test-CxIisLogCoverage -AppHostConfig $AppHostConfig
+    foreach ($lf in $logFindings) { Add-F $lf }
+
     return ,@($findings.ToArray())
+}
+
+function Test-CxIisLogCoverage {
+    <#
+      Compare where IIS writes access logs against what the collector is told to
+      read. Returns findings; never throws.
+
+      Coverage is judged against the include globs the collector config carries:
+      its built-in default plus whatever CX_IIS_LOG_DIR_n currently hold. Reading
+      the env vars rather than the YAML is deliberate - the config is Fleet-owned
+      and may not be readable here, but the env vars ARE the contract the deploy
+      scripts publish and the config consumes.
+    #>
+    [CmdletBinding()]
+    param([string] $AppHostConfig)
+
+    $out = New-Object System.Collections.ArrayList
+    function Add-L { param($f) [void]$out.Add($f) }
+
+    if (-not (Get-Command Get-IISLogConfig -ErrorAction SilentlyContinue)) {
+        Add-L (New-Finding -Check 'iisLogs' -Severity 'unknown' -Code 'HELPER_MISSING' `
+            -Message 'Resolve-IISLogPaths.ps1 is not present, so IIS log coverage could not be checked')
+        return ,@($out.ToArray())
+    }
+
+    $cfg = Get-IISLogConfig -AppHostConfig $AppHostConfig
+    if (-not $cfg.Ok) {
+        Add-L (New-Finding -Check 'iisLogs' -Severity 'unknown' -Code 'IIS_LOGCONFIG_UNREADABLE' `
+            -Message $cfg.Error)
+        return ,@($out.ToArray())
+    }
+
+    # The globs in force: the shipped default, plus each populated slot.
+    $globs = @($script:CxDefaultLogGlob)
+    $slotVals = @()
+    for ($i = 1; $i -le $script:CxLogDirSlotCount; $i++) {
+        $v = [Environment]::GetEnvironmentVariable("CX_IIS_LOG_DIR_$i", 'Machine')
+        if ($v) { $slotVals += $v; $globs += (Join-Path $v '**\*.log') }
+    }
+
+    if ($cfg.CentralMode -ne 'Site') {
+        # One file for the whole host: per-site attribution is gone before the data
+        # ever reaches us. Informational, not a fault - it is a valid IIS setup.
+        Add-L (New-Finding -Check 'iisLogs' -Severity 'info' -Code 'IIS_CENTRAL_LOGGING' -Target $cfg.CentralDir `
+            -Message "centralLogFileMode=$($cfg.CentralMode): all sites write one log under '$($cfg.CentralDir)', so per-site attribution is not available" `
+            -Data @{ mode = $cfg.CentralMode; directory = $cfg.CentralDir })
+    }
+
+    $uncovered = @{}
+    foreach ($site in @($cfg.Sites)) {
+        if (-not $site.Enabled) {
+            # Absence of logs here is intended. Saying nothing would leave an
+            # operator hunting for a collector fault that does not exist.
+            Add-L (New-Finding -Check 'iisLogs' -Severity 'info' -Code 'IIS_LOGGING_DISABLED' -Target $site.Name `
+                -Message "logging is turned off for site '$($site.Name)' - no access logs are expected from it")
+            continue
+        }
+
+        if ($site.Format -ne 'W3C') {
+            # The receiver's csv_parser keys off a '#Fields:' header line, which only
+            # W3C emits. IIS/NCSA/Custom files still tail, but arrive unparsed.
+            Add-L (New-Finding -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOG_FORMAT_UNSUPPORTED' -Target $site.Name `
+                -Message "site '$($site.Name)' logs in $($site.Format) format - the collector's csv_parser needs the W3C '#Fields:' header, so these lines arrive unparsed" `
+                -Data @{ format = $site.Format })
+        }
+
+        $root = $site.LogRoot
+        $hit = $false
+        foreach ($g in $globs) { if (Test-IISLogDirCovered -Directory $root -Glob $g) { $hit = $true; break } }
+        if ($hit) {
+            Add-L (New-Finding -Check 'iisLogs' -Severity 'pass' -Target $site.Name `
+                -Message "access logs at '$root' are covered by a collector include")
+        } else {
+            $uncovered[$site.Directory] = $true
+            Add-L (New-Finding -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOGDIR_NOT_COVERED' -Target $site.Name `
+                -Message "site '$($site.Name)' writes access logs to '$root', which no collector include matches - these logs never reach Coralogix. Re-run Instrument-IIS.ps1 to publish CX_IIS_LOG_DIR_n, then restart the collector." `
+                -Data @{ logRoot = $root; directory = $site.Directory; globs = $globs })
+        }
+    }
+
+    # More distinct roots than slots: the extras cannot be expressed at all,
+    # because ${env:VAR} cannot expand into multiple include list entries.
+    $needed = @($uncovered.Keys).Count + @($slotVals).Count
+    if ($needed -gt $script:CxLogDirSlotCount) {
+        Add-L (New-Finding -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOGDIR_SLOTS_EXCEEDED' `
+            -Message "this host needs $needed distinct log directories but the collector config declares only $($script:CxLogDirSlotCount) CX_IIS_LOG_DIR_n slots - add slots to the config template or consolidate the log directories" `
+            -Data @{ needed = $needed; slots = $script:CxLogDirSlotCount })
+    }
+
+    return ,@($out.ToArray())
 }
 
 # ---------------------------------------------------------------------------
@@ -632,11 +798,13 @@ if ($MyInvocation.InvocationName -ne '.') {
     Write-Host "IIS instrumentation check on $env:COMPUTERNAME  ($(Get-Date -Format 's'))"
 
     # NOT $args - that is an automatic variable holding unbound arguments.
+    # AppHostConfig is only forwarded when the caller actually supplied one:
+    # passing '' would override the function's default with an empty path.
     $callArgs = @{
         ExpectedOtlpEndpoint = $ExpectedOtlpEndpoint
-        AppHostConfig        = $AppHostConfig
     }
-    if ($BackupRoot) { $callArgs['BackupRoot'] = $BackupRoot }
+    if ($AppHostConfig) { $callArgs['AppHostConfig'] = $AppHostConfig }
+    if ($BackupRoot)    { $callArgs['BackupRoot']    = $BackupRoot }
 
     $result = Test-IISInstrumentation @callArgs
     $code   = Get-GradedExitCode -Findings $result

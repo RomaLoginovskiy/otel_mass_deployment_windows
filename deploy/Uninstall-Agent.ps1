@@ -27,7 +27,7 @@
   SimpleWebApp site/pool, or any IIS site/pool.
 
   If no manifest is found, it falls back to a conservative removal that only
-  touches installer-owned names (OTEL_*, CORALOGIX_*, CX_ENVIRONMENT) and the
+  touches installer-owned names (OTEL_*, CORALOGIX_*, CX_ENVIRONMENT, CX_APPLICATION) and the
   known service names.
 
 .PARAMETER Purge
@@ -72,8 +72,18 @@ try { Start-Transcript -Path $transcript -Append | Out-Null } catch {}
 . (Join-Path $here 'Resolve-IISServiceNames.ps1')
 if (Test-Path (Join-Path $here 'Resolve-NodeServiceNames.ps1')) { . (Join-Path $here 'Resolve-NodeServiceNames.ps1') }
 
-$appcmd        = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
-$appHostConfig = Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'
+# WOW64: %windir%\System32 is redirected to SysWOW64 for a 32-bit process, and
+# SysWOW64\inetsrv has appcmd.exe but no applicationHost.config (its config\
+# folder holds only Schema\ and Export\). Sysnative is the
+# un-redirected view and exists only from WOW64. Same resolver as
+# Instrument-IIS.ps1 - see the long comment there for the consequences.
+$inetsrv = if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+    Join-Path $env:windir 'Sysnative\inetsrv'
+} else {
+    Join-Path $env:windir 'System32\inetsrv'
+}
+$appcmd        = Join-Path $inetsrv 'appcmd.exe'
+$appHostConfig = Join-Path $inetsrv 'config\applicationHost.config'
 $iisPresent    = Test-Path $appcmd
 
 $status = [ordered]@{
@@ -285,7 +295,7 @@ try {
     }
 
     # -- 3. Machine env vars ----------------------------------------------------
-    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_IIS_SERVICES','CX_NODE_SERVICES')
+    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES')
     if ($manifest -and $manifest.envVars) {
         foreach ($e in @($manifest.envVars)) {
             if (-not $e) { continue }

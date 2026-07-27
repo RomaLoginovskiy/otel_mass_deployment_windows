@@ -31,9 +31,24 @@ Per PM2 app (`deploy/Instrument-NodePM2.ps1`):
    | `OTEL_SERVICE_NAME` | the PM2 app name (override-able) |
    | `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` / `OTEL_LOGS_EXPORTER` | `otlp` |
 
+   > ⚠️ **`localhost` vs `127.0.0.1`.** `http://localhost:4318` is the shipped default
+   > (`Instrument-NodePM2.ps1 -OtlpEndpoint`), but on a dual-stack host `localhost` resolves
+   > to `::1` first and OTLP export is **silently dropped**. `Test-NodeInstrumentation.ps1`
+   > flags every app with `OTLP_ENDPOINT_LOCALHOST` — a genuine finding, not a false
+   > positive. Pass `-OtlpEndpoint http://127.0.0.1:4318`.
+
 3. `pm2 save` — persists the resolved env into the PM2 dump so it survives daemon restart / `pm2 resurrect`.
 4. Machine env `CX_NODE_SERVICES` = comma-joined distinct service names (Node analog of
-   `CX_IIS_SERVICES`) for host Service-ownership labels.
+   `CX_IIS_SERVICES`).
+
+   > ⚠️ **`CX_NODE_SERVICES` has no consumer yet.** No collector config in this repo reads
+   > `${env:CX_NODE_SERVICES}` — there is no `transform/node_service_labels` counterpart to
+   > `transform/iis_service_labels`, so **host Service ownership stays blank on a Node-only
+   > host**. The variable is set now so a processor can be added later without redeploying
+   > every host. `Test-NodeInstrumentation.ps1` reports this as `NODE_SERVICES_NOT_CONSUMED`
+   > (info — it does not affect the exit code), and it decides that by *looking* at the
+   > effective config, so the finding disappears on its own once something consumes the
+   > variable.
 
 ### Why `NODE_OPTIONS`, not PM2 `node_args`
 PM2's ecosystem `node_args` is **not re-applied on a plain `pm2 restart`** (long-standing quirk).
@@ -77,6 +92,33 @@ pwsh scripts/Verify-CoralogixNodeSpans.ps1     # DataPrime gate
 `nodeapp-cluster` shows **>= 2 distinct `process.pid`** (per-worker proof). Metrics are confirmed
 via the collector exporter counters printed in the container log (`[export] sent_metric_points=`)
 and Coralogix APM/Metrics.
+
+## Verify on a real host
+
+The container test above proves the mechanism. On a deployed host use the validator that
+ships in the package — read-only, no Docker, no Coralogix key:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Test-NodeInstrumentation.ps1
+doctor.bat -Only nodeInstrumentation      # or as part of the full sweep
+```
+
+Exit `0` pass / `1` hard fail / `2` degraded. It is also **dual-mode**: dot-source it to get
+`Test-NodeInstrumentation` returning finding objects, which is how `Test-Agent.ps1` consumes
+it. Full code list: [`agent-diagnostics.md`](./agent-diagnostics.md).
+
+## Troubleshooting
+
+| Symptom | Finding | Cause / fix |
+| --- | --- | --- |
+| No spans from any PM2 app | `NODE_OPTIONS_MISSING` | The instrument script never ran for this app, or a plain `pm2 restart` without `--update-env` dropped the env and no `pm2 save` followed. |
+| Spans stopped after a redeploy or npm cleanup | `NODE_REGISTER_PATH_STALE` | `NODE_OPTIONS` points at a `register.js` that no longer exists. Node starts fine and emits nothing. Re-run the instrument script. |
+| Package never staged | `NODE_PACKAGE_MISSING` | `@opentelemetry/auto-instrumentations-node` is not under `-InstallPrefix` (default `C:\cx\otel-node`) — the npm install failed at deploy time (offline host). |
+| Doctor reports no apps on a host you know runs apps | `NODE_PM2_DAEMON_NOT_VISIBLE` / `NO_PM2_APPS` | PM2 is **per-user** on Windows; the daemon belongs to another account, so `pm2 jlist` is empty for the caller. Reported as `unknown`, never a failure — re-run as the owning account. |
+| `pm2` not found | `NODE_PM2_NOT_ON_PATH` | PM2 installed for a different user, or not on the machine PATH. |
+| Service name wrong or missing in Coralogix | `NODE_SERVICE_NAME_MISSING` / `NODE_SERVICE_NAME_DRIFT` | `OTEL_SERVICE_NAME` no longer matches the app set (renamed app, or an override the doctor was not told about). |
+| Everything reports configured, still no data | `OTLP_ENDPOINT_LOCALHOST` | `localhost` → `::1`, export silently dropped. Use `http://127.0.0.1:4318`. |
+| APM fine, but host Service ownership blank | `NODE_SERVICES_NOT_CONSUMED` (info) | Expected — no collector processor reads `CX_NODE_SERVICES`. See **Mechanism** step 4. |
 
 ## Notes / caveats
 - Run the instrument script in the **same user context** that owns the PM2 daemon (PM2 is per-user

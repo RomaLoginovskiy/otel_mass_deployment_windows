@@ -1,0 +1,33 @@
+# escape=`
+# Lightweight Windows container for exercising the host DIAGNOSTIC scripts
+# (deploy/Test-Agent.ps1 + Test-IISInstrumentation.ps1 + Test-NodeInstrumentation.ps1).
+#
+# Deliberately MINIMAL - no Node, no collector binary, no npm layers. It exists so the
+# doctor can be iterated on in seconds against a REAL IIS with a real
+# applicationHost.config, rather than rebuilding the 5.5 GB E2E image (whose
+# `COPY deploy/` sits above the expensive Node layers and invalidates all of them).
+#
+# What it gives you that a dev workstation cannot:
+#   * processes run as ContainerAdministrator, so the doctor's elevation gate is
+#     satisfied without an interactive UAC prompt
+#   * a clean IIS with known sites/pools and no leftover state
+#   * safe to mutate destructively (malformed REG_MULTI_SZ, wrong pool runtime) and
+#     throw away
+#
+# Build from the REPO ROOT:
+#   docker build -f test/docker-win/Dockerfile.doctor -t cx-doctor-test .
+# Requires Docker in Windows-container mode.
+FROM mcr.microsoft.com/windows/servercore/iis:windowsservercore-ltsc2022
+
+SHELL ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+WORKDIR C:\\cx
+
+# The scripts under test. Last layer, so editing them rebuilds in seconds.
+COPY deploy/ C:/cx/deploy/
+COPY test/docker-win/entrypoint.doctor.ps1 C:/cx/entrypoint.doctor.ps1
+# Destructive state mutators for the negative test cases, invoked via docker exec.
+COPY test/docker-win/break-state.ps1 C:/cx/break-state.ps1
+
+ENV CX_TEST_SITES=shop,wallet,blog
+
+ENTRYPOINT ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\cx\\entrypoint.doctor.ps1"]
