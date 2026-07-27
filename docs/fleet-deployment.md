@@ -66,7 +66,14 @@ Two ideas do the heavy lifting:
 | `Install-CoralogixSupervisor.ps1` | Collector install with `-Supervisor` |
 | `Instrument-IIS.ps1` | Zero-code .NET auto-instrumentation (IIS hosts only) |
 | `Resolve-IISServiceNames.ps1` | Per-app service-name mapping + `web.config` read/write helpers |
+| `Instrument-NodePM2.ps1` | Zero-code Node/PM2 instrumentation via `NODE_OPTIONS` (PM2 hosts only) |
+| `Resolve-NodeServiceNames.ps1` | Per-app Node service-name mapping helpers |
 | `Backup-Config.ps1` | Backup + manifest helper; snapshots every config the install mutates |
+| `doctor.bat` | BatchPatch remote-command entry for the **read-only** host diagnostic |
+| `Test-Agent.ps1` | Host doctor — nine checks, graded exit code, `-Only` for a subset |
+| `Test-IISInstrumentation.ps1` | Validates the IIS instrumentation landed; standalone or dot-sourced |
+| `Test-NodeInstrumentation.ps1` | Validates the Node/PM2 instrumentation landed; standalone or dot-sourced |
+| `Write-DeployLog.ps1` | Shared finding model + console formatters for the diagnostics |
 | `config.supervisor.yaml` | Base config = repo `config.yaml` **minus the opamp extension** |
 | `SendDataKey.txt` | Send-Your-Data key (or supply at deploy time — see below) |
 
@@ -500,6 +507,51 @@ Set either/both/neither before the call; each is independent.
 | `CX_PURGE=1` | `-Purge` | Also delete staged config + vendor binaries. |
 | `CX_RESTORE=1` | `-RestoreConfigs` | Restore mutated configs from the backup manifest instead of surgical edits. |
 
+### Diagnostic entry point — `doctor.bat` (env var → `Test-Agent.ps1` flag)
+
+Read-only. Changes nothing on the host; safe to run and re-run at any time.
+
+| Env var | Maps to | Effect |
+| --- | --- | --- |
+| `CX_DOCTOR_ONLY` | `-Only` | Run a subset, **comma-separated, no spaces** (e.g. `env,iisServiceName`). |
+| `CX_DOCTOR_QUIET=1` | `-Quiet` | Print only the checks that are not passing. |
+| `CX_DOCTOR_NOFILE=1` | `-NoFileOutput` | Do not write `agent-doctor.json` next to the scripts. |
+
+### Host diagnostic — `Test-Agent.ps1`
+
+| Flag | Type | Default | Purpose |
+| --- | --- | --- | --- |
+| `-Only` | string[] | all nine | Subset of `env,iisServiceName,services,health,exportCounters,ports,effectiveConfig,iisInstrumentation,nodeInstrumentation`. Accepts a comma-joined string (required under `powershell -File`) or a native array. Case-insensitive. |
+| `-JsonPath` | string | `<scriptdir>\agent-doctor.json` | Machine-readable report path. |
+| `-NoFileOutput` | switch | off | Print only; write no report. |
+| `-Quiet` | switch | off | Suppress `pass`/`skip` rows. |
+| `-PassThru` | switch | off | Also emit the report object to the pipeline. |
+| `-HealthUrl` / `-MetricsUrl` | string | `127.0.0.1:13133` / `:8888/metrics` | Probe targets (parameterised so failure branches are testable). |
+| `-OtlpHttpPort` / `-OtlpGrpcPort` | int | `4318` / `4317` | OTLP receiver ports to check. |
+| `-EffectiveConfig` | string | `C:\ProgramData\opampsupervisor\state\effective.yaml` | Merged config to search for the processor. |
+| `-RequiredProcessors` / `-RequiredPipelines` | string[] | `transform/iis_service_labels` / `logs`,`logs/resource_catalog` | What must be present and wired. |
+| `-ServiceNameOverrides` / `-OverridesJson` | hashtable / string | empty | Must match what the install used, or every app reports false drift. |
+| `-HealthRetries` / `-HealthDelaySec` / `-TimeoutSec` | int | `3` / `5` / `8` | Health probe tuning (shorter than the installer's, which has just restarted the supervisor). |
+| `-SkipIIS` / `-SkipNode` / `-SkipMetrics` | switch | off | Skip a check group. |
+
+Exit codes: `0` pass, `1` hard fail, `2` degraded. See
+[`agent-diagnostics.md`](agent-diagnostics.md) for every finding code.
+
+### Instrumentation validators — `Test-IISInstrumentation.ps1` / `Test-NodeInstrumentation.ps1`
+
+Dual-mode: run directly for a standalone report and graded exit code, or dot-source to get
+`Test-IISInstrumentation` / `Test-NodeInstrumentation` returning findings. `Test-Agent.ps1`
+dot-sources both, so there is one implementation behind both entry points.
+
+| Flag | Applies to | Default | Purpose |
+| --- | --- | --- | --- |
+| `-ExpectedOtlpEndpoint` | both | `http://127.0.0.1:4318` | The endpoint apps should carry. |
+| `-AppHostConfig` | IIS | `%windir%\System32\inetsrv\config\applicationHost.config` | Config to parse. |
+| `-BackupRoot` | IIS | `%ProgramData%\CoralogixDeploy\backups` | Where to read the manifest for the instrumentation version. |
+| `-InstallPrefix` | Node | `C:\cx\otel-node` | Where the OTel Node package should be staged. |
+| `-Package` | Node | `@opentelemetry/auto-instrumentations-node` | Package providing the `register` bootstrap. |
+| `-Quiet` / `-PassThru` | both | off | As above. |
+
 ### Install orchestrator — `Install-Agent.ps1`
 
 The single entry point `deploy.bat` invokes; runnable directly when not using BatchPatch.
@@ -568,16 +620,30 @@ Invoked by the orchestrator; run standalone (with `-SetEnv:$false`) to preview d
 
 ## Troubleshooting
 
+**Start by running the host diagnostic.** `doctor.bat` is read-only, safe to run at any
+time, and answers most of the rows below directly instead of by inference:
+
+```
+doctor.bat                                      # all checks, graded exit code
+set CX_DOCTOR_ONLY=env,iisServiceName && doctor.bat
+```
+
+Exit `0` = pass, `1` = hard fail (collector down / no key / not elevated), `2` = degraded.
+BatchPatch shows both `1` and `2` as red rows — the Exit Code column tells them apart.
+Full finding reference: [`agent-diagnostics.md`](agent-diagnostics.md).
+
 | Symptom | Likely cause / fix |
 | --- | --- |
 | Service won't start | Base config needs `file_storage` → installer must pass `-EnableDynamicIISParsing` (it does). Run `validate`. Confirm `CORALOGIX_PRIVATE_KEY` set on the service. |
 | Agent not in Fleet Management | Supervisor can't reach OpAMP: check `CORALOGIX_DOMAIN`/key, and that the **base config has no opamp extension**. |
 | Selector attributes (`cx.host.role`/`workload.*`) not shown in Fleet Management | They must be in the **Supervisor** config `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` (the vendor template writes only static `service.name`/`cx.agent.type`). `Install-CoralogixSupervisor.ps1` injects them post-install + restarts `opampsupervisor`. If still absent: detection didn't run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed the `non_identifying_attributes:` anchor. Re-run deploy, or patch `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml` + restart. |
-| No IIS telemetry | ASP.NET Core pool not "No Managed Code"; recycle after fixing. |
+| No IIS telemetry | Run `doctor.bat`. `POOL_NOT_NO_MANAGED_CODE` → the ASP.NET Core pool is not "No Managed Code"; recycle after fixing. `PROFILER_NOT_REGISTERED` → `Register-OpenTelemetryForIIS` never ran on this host. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `localhost` resolves to `::1` first and export is silently dropped; use `127.0.0.1`. |
+| `CX_IIS_SERVICES` not set / Service ownership blank | Run `doctor.bat -Only env,iisServiceName,effectiveConfig`. `CX_IIS_SERVICES_MISSING` → `Instrument-IIS.ps1` never ran or was not elevated. `CX_IIS_SERVICES_DRIFT` → sites changed after instrumentation; re-run and restart the collector. `EFFECTIVE_PROCESSOR_MISSING`/`_NOT_WIRED` → the env var is fine but `transform/iis_service_labels` is absent from the **remote** Fleet config, so it is never stamped. |
+| Endpoint fixed centrally but hosts still export nowhere | `POOL_ENV_STALE`. A pool's own `<environmentVariables>` block replaces `applicationPoolDefaults` and is only a snapshot taken when the pool was first written — later changes to the defaults never reach it. Re-run `Instrument-IIS.ps1` and recycle the pool. |
 | GitHub download TLS error | Older Server defaults to TLS 1.0; scripts enable TLS 1.2 first. |
 | BatchPatch row failed | Read `install-agent.log` (or `uninstall-agent.log`) on the host; `deploy.bat`/`uninstall.bat` propagate the PowerShell exit code. |
 | `opampsupervisor` still present after uninstall | Vendor `-Uninstall` doesn't always remove the supervisor service; `Uninstall-Agent.ps1` hard-deletes it via `sc.exe delete`. If it lingers, re-run `uninstall.bat`, or `Stop-Service opampsupervisor; sc.exe delete opampsupervisor`. |
-| IIS won't start after uninstall | A stale profiler entry in the W3SVC/WAS `Environment` REG_MULTI_SZ. `Unregister-OpenTelemetryForIIS` clears it; if hand-edited, restore `W3SVC.reg`/`WAS.reg` from the backup dir (`reg import`). |
+| IIS won't start after uninstall | A stale profiler entry in the W3SVC/WAS `Environment` REG_MULTI_SZ. `Unregister-OpenTelemetryForIIS` clears it; if hand-edited, restore `W3SVC.reg`/`WAS.reg` from the backup dir (`reg import`). `doctor.bat` reports this as `PROFILER_REGISTRY_MALFORMED` (a hard fail) when the value contains an empty element. |
 | Collector crash-loops, health → 503, log `failed getting host cpuinfo: SMBIOS processor information not found` | Host has no SMBIOS Type 4 (VirtualBox / some VMs). The base drops `host.cpu.*`, but a **Fleet-Management remote config** that re-adds them (or the `system` detector) overrides the base and re-triggers it. Remove `host.cpu.*` from the *assigned remote config* too, or don't assign one. Real fleet hardware is unaffected. |
 | `guestcontrol` fails after unattended install (`guest execution service not ready`) | Guest still in first-boot/OOBE. GA run level can read 3 before the exec service is up; wait for the desktop (a first-boot reboot settles it), then poll `guestcontrol run … echo <token>` on **exit code 0**, not a string match. |
 | POC `Deploy`/`Configure` fails `Unknown option: -NoProfile` | Old `Run-TestVM.ps1` passed a bare `--` to `VBoxManage`; PowerShell strips it. Fixed to `'--'`. Update the script. |

@@ -33,13 +33,21 @@ $ErrorActionPreference = 'Stop'
 $deployDir = Join-Path $PSScriptRoot 'deploy'
 if (-not (Test-Path $deployDir)) { throw "deploy/ folder not found at $deployDir" }
 
-# Required members of the package. Includes the install + uninstall entry points,
-# the shared helpers they dot-source (Resolve-IISServiceNames, Backup-Config), and
-# the base config.
-$required = @('deploy.bat','uninstall.bat',
+# Required members of the package. Includes the install + uninstall + diagnostic
+# entry points, the shared helpers they dot-source (Resolve-IISServiceNames,
+# Backup-Config, Write-DeployLog), and the base config.
+#
+# NOTE: every dot-source in the scripts is Test-Path guarded, so a file omitted
+# here does NOT crash on the target host - the feature just silently degrades
+# (a diagnostic check reports UNKNOWN, or output loses its formatting). The
+# foreach below is the safety net: it fails the BUILD instead, loudly.
+$required = @('deploy.bat','uninstall.bat','doctor.bat',
               'Install-Agent.ps1','Uninstall-Agent.ps1',
               'Install-CoralogixSupervisor.ps1','Detect-Workloads.ps1',
-              'Instrument-IIS.ps1','Resolve-IISServiceNames.ps1','Backup-Config.ps1',
+              'Instrument-IIS.ps1','Resolve-IISServiceNames.ps1',
+              'Instrument-NodePM2.ps1','Resolve-NodeServiceNames.ps1',
+              'Backup-Config.ps1','Write-DeployLog.ps1',
+              'Test-Agent.ps1','Test-IISInstrumentation.ps1','Test-NodeInstrumentation.ps1',
               'config.supervisor.yaml')
 foreach ($r in $required) {
     if (-not (Test-Path (Join-Path $deployDir $r))) { throw "Missing package file: deploy\$r" }

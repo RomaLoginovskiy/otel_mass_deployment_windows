@@ -10,14 +10,15 @@
   probe is non-fatal: a failing probe simply reports that workload as absent.
 
   Targets:
-    IIS, .NET (Framework + Core/5+), Node.js (v9 -> latest), RabbitMQ, Redis,
-    Valkey, SQL Server, DB2, Elasticsearch.
+    IIS, .NET (Framework + Core/5+), Node.js (v9 -> latest), PM2 (Node process
+    manager), RabbitMQ, Redis, Valkey, SQL Server, DB2, Elasticsearch.
 
   Output attribute schema (the agent-selector contract):
     cx.host.role=<primary>        single coarse role, by priority
     workload.<name>=true          one per detected workload (multi-role hosts)
     workload.nodejs.version=<v>    when Node.js present
     workload.dotnet.version=<v>    when .NET present
+    workload.pm2.apps=<count>      when PM2 is managing >=1 Node app
 
   These land on the OpAMP AgentDescription (the Supervisor reports the collector's
   resource attributes; resourcedetection/env in the base config promotes
@@ -176,6 +177,42 @@ function Get-NodeInfo {
     return $info
 }
 
+function Get-PM2Info {
+    # Detect the PM2 Node process manager and the apps it currently manages.
+    # PM2 runs a background "God daemon" (itself a node process); managed apps are
+    # listed via `pm2 jlist`, which prints a JSON array. Each element carries
+    # .name, .pid and .pm2_env.exec_mode ('fork_mode' | 'cluster_mode').
+    #   present : pm2 CLI on PATH, or a PM2 home dir exists (daemon may be stopped)
+    #   apps    : distinct managed app names (the future OTEL_SERVICE_NAME per app)
+    #   modes   : distinct exec modes seen (informational)
+    $info = [ordered]@{ present = $false; apps = @(); modes = @() }
+    $cmd = Get-Command pm2 -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        # No pm2 on PATH: last-resort check for a PM2 home dir (installed, daemon down).
+        if (Test-PathAny @("$env:USERPROFILE\.pm2", $env:PM2_HOME)) { $info.present = $true }
+        return $info
+    }
+    $info.present = $true
+    # NOTE: `pm2 jlist` JSON has duplicate keys; Windows PowerShell 5.1 ConvertFrom-Json throws
+    # DuplicateKeysInJsonString on it. Parse tolerantly by splitting into per-process chunks
+    # (each top-level object starts with `{"pid":`) and pulling name/exec_mode by regex.
+    try {
+        $raw = (& pm2 jlist 2>$null | Out-String).Trim()
+        if ($raw -and $raw.StartsWith('[')) {
+            $names = New-Object System.Collections.Generic.List[string]
+            $modes = New-Object System.Collections.Generic.List[string]
+            foreach ($chunk in ($raw -split '\{"pid":')) {
+                if ($chunk -notmatch '"name":"') { continue }
+                if ($chunk -match '"name":"([^"]+)"')      { $names.Add($matches[1]) }
+                if ($chunk -match '"exec_mode":"([^"]+)"') { $modes.Add($matches[1]) }
+            }
+            $info.apps  = @($names | Where-Object { $_ } | Select-Object -Unique)
+            $info.modes = @($modes | Where-Object { $_ } | Select-Object -Unique)
+        }
+    } catch {}
+    return $info
+}
+
 function Get-RedisPresent {
     if (Test-ServiceLike @('Redis*','*Redis*'))  { return $true }
     if (Test-ProcessLike @('redis-server','redis')) { return $true }
@@ -223,12 +260,28 @@ function Get-ElasticPresent {
 }
 
 # ---------------------------------------------------------------------------
+# Dot-source guard
+# ---------------------------------------------------------------------------
+# Everything above is pure function definitions; everything below EXECUTES -
+# it scans the host and, with the default -SetEnv $true, WRITES the machine
+# OTEL_RESOURCE_ATTRIBUTES. So a caller that only wants the probe helpers
+# (Test-ServiceLike / Test-ProcessLike / Test-PortListening / Test-PathAny)
+# must be able to dot-source this file without any of that happening.
+#
+# `return` at script top level ends THIS script only - it does not return out of
+# a dot-sourcing caller, and the functions defined above stay defined. Verified
+# on 5.1. Direct execution (`.\x.ps1`, `& x.ps1`, `powershell -File x.ps1`) sets
+# InvocationName to a path or '&', so the main body still runs normally there.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# ---------------------------------------------------------------------------
 # Run detection
 # ---------------------------------------------------------------------------
 Write-Host "[detect] scanning host for known workloads..."
 
 $dotnet = Get-DotNetInfo
 $node   = Get-NodeInfo
+$pm2    = Get-PM2Info
 
 $roles = [ordered]@{
     IIS           = [bool](Get-IisPresent)
@@ -236,6 +289,8 @@ $roles = [ordered]@{
     DotNetVersion = $dotnet.version
     NodeJs        = [bool]$node.present
     NodeJsVersion = $node.version
+    PM2           = [bool]$pm2.present
+    PM2Apps       = @($pm2.apps)
     RabbitMQ      = [bool](Get-RabbitPresent)
     Redis         = [bool](Get-RedisPresent)
     Valkey        = [bool](Get-ValkeyPresent)
@@ -262,6 +317,7 @@ $priority = @(
     @{ key = 'RabbitMQ';      role = 'rabbitmq' },
     @{ key = 'Redis';         role = 'redis' },
     @{ key = 'Valkey';        role = 'valkey' },
+    @{ key = 'PM2';           role = 'nodejs-pm2' },
     @{ key = 'NodeJs';        role = 'nodejs' },
     @{ key = 'DotNet';        role = 'dotnet' }
 )
@@ -278,6 +334,7 @@ $workloadKeys = [ordered]@{
     'workload.iis'           = $roles.IIS
     'workload.dotnet'        = $roles.DotNet
     'workload.nodejs'        = $roles.NodeJs
+    'workload.pm2'           = $roles.PM2
     'workload.rabbitmq'      = $roles.RabbitMQ
     'workload.redis'         = $roles.Redis
     'workload.valkey'        = $roles.Valkey
@@ -290,6 +347,7 @@ foreach ($k in $workloadKeys.Keys) {
 }
 if ($roles.NodeJs -and $roles.NodeJsVersion) { $attrMap['workload.nodejs.version'] = $roles.NodeJsVersion }
 if ($roles.DotNet -and $roles.DotNetVersion) { $attrMap['workload.dotnet.version'] = $roles.DotNetVersion }
+if ($roles.PM2 -and @($roles.PM2Apps).Count -gt 0) { $attrMap['workload.pm2.apps'] = @($roles.PM2Apps).Count }
 
 foreach ($k in $ExtraAttributes.Keys) { $attrMap[$k] = $ExtraAttributes[$k] }
 
@@ -312,6 +370,7 @@ try {
         primary   = $primary
         workloads = ($workloadKeys.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { $_.Key -replace '^workload\.','' })
         versions  = @{ nodejs = $roles.NodeJsVersion; dotnet = $roles.DotNetVersion }
+        pm2Apps   = @($roles.PM2Apps)
         otel_resource_attributes = $otelAttrs
     }
     $summary | ConvertTo-Json -Depth 5 | Out-File -FilePath $LogPath -Encoding utf8

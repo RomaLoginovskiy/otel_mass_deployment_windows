@@ -35,6 +35,14 @@ publish/
 # === Logs ===
 *.log
 
+# Diagnostic reports written next to the scripts by Test-Agent.ps1 when it is run
+# from a working copy (on a real host these land in the BatchPatch drop dir).
+deploy/agent-doctor.json
+deploy/detect-workloads.json
+deploy/install-agent-status.json
+deploy/uninstall-agent-status.json
+
+
 # === Secrets ===
 SendDataKey.txt
 admin_coralogix.txt
@@ -48,7 +56,27 @@ Thumbs.db
 Desktop.ini
 
 # === Local scratch (untracked, not part of the repo) ===
-misc/
+# Contents are scratch, with two exceptions that ARE part of the repo: the standalone
+# service-label diagnostics and its runbook section. test/docker-win/Dockerfile does
+# `COPY misc/`, so a fresh clone must contain at least the script or the image build fails.
+misc/*
+!misc/Set-CxServiceLabels.ps1
+!misc/installation.md
+# ...but never the log files the script writes next to itself.
+misc/*.log
 
 # baked collector binary for the Windows E2E image (do not commit)
 test/docker-win/otelcol-contrib.exe
+
+# baked Node.js zip for the Windows E2E image (downloaded on host; do not commit)
+test/docker-win/node.zip
+
+# baked node_modules for the Windows E2E image (installed on host, COPY'd into the image;
+# in-container npm is unreliable in the Server Core base). Do not commit.
+test/docker-win/npm-global/
+test/docker-win/otel-node/
+test/docker-win/nodeapp/node_modules/
+
+# RabbitMQ test image installers (downloaded on host, baked into image; not committed)
+test/docker-win/vendor/
+test/

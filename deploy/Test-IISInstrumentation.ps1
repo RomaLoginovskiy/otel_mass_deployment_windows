@@ -1,0 +1,649 @@
+﻿<#
+.SYNOPSIS
+  Read-only check that the zero-code .NET/IIS instrumentation was actually
+  APPLIED on this host - the CLR profiler, the OTLP pool environment, and the
+  pool runtime settings the profiler depends on.
+
+.DESCRIPTION
+  DUAL MODE.
+    * Run it directly            -> prints a table and exits 0 / 1 / 2.
+        powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-IISInstrumentation.ps1
+    * Dot-source it              -> defines Test-IISInstrumentation and returns
+                                    findings for an aggregator (Test-Agent.ps1).
+        . .\Test-IISInstrumentation.ps1 ; $f = Test-IISInstrumentation
+
+  This answers a question nothing else in the repo answers: Instrument-IIS.ps1
+  logs that it ran, but nothing ever reads back whether the profiler is attached.
+  A host can look perfectly healthy - collector up, spans pipeline configured -
+  and still emit nothing because the profiler was never registered, its DLL was
+  deleted, or an app pool is not "No Managed Code".
+
+  Six sub-checks:
+    a. profiler       CORECLR_PROFILER / CORECLR_ENABLE_PROFILING in the W3SVC
+                      and WAS service Environment (REG_MULTI_SZ)
+    b. profilerPath   the profiler DLL the registry points at exists on disk
+    c. profilerReg    the REG_MULTI_SZ is well-formed - an empty element here
+                      PREVENTS IIS FROM STARTING, so this one is a hard fail
+    d. autoHome       OTEL_DOTNET_AUTO_HOME resolves; version cross-checked
+                      against the deploy manifest
+    e. poolOtlp       OTEL_EXPORTER_OTLP_ENDPOINT / _PROTOCOL are EFFECTIVE per
+                      pool, modelling the applicationPoolDefaults inheritance trap
+    f. poolRuntime    every ASP.NET Core app's pool is "No Managed Code"
+
+  READ-ONLY. Reads the registry, applicationHost.config, and each app's
+  web.config. Writes nothing, starts nothing, runs no appcmd and no iisreset.
+
+.NOTES
+  Windows PowerShell 5.1. Run ELEVATED - applicationHost.config and the service
+  registry keys are readable by Administrators only, so a non-elevated run would
+  report every app as unconfigured. The script refuses rather than lie.
+
+  It deliberately does NOT use the WebAdministration module. Everything it needs
+  is in applicationHost.config, so it still works on a host where the IIS
+  management tools are missing - which is itself one of the failure modes the
+  fleet has hit.
+#>
+# PositionalBinding=$false: reject stray tokens instead of silently binding them
+# to the wrong parameter (see Test-Agent.ps1 for the failure this prevents).
+[CmdletBinding(PositionalBinding = $false)]
+param(
+    # The endpoint the pools SHOULD carry. Note 127.0.0.1, not localhost: on a
+    # dual-stack host `localhost` resolves to ::1 first and OTLP export is
+    # silently dropped (docs/iis-service-ownership.md).
+    [string] $ExpectedOtlpEndpoint = 'http://127.0.0.1:4318',
+    [string] $AppHostConfig        = (Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'),
+    [string] $BackupRoot,                # default: Backup-Config.ps1's ProgramData root
+    [switch] $Quiet,
+    [switch] $PassThru
+)
+
+# Native tools are not called here, but keep the repo-wide convention: under
+# 'Stop' a native stderr write becomes a terminating NativeCommandError in 5.1.
+$ErrorActionPreference = 'Continue'
+
+# $PSScriptRoot is empty under `powershell -File <relative>`.
+$script:CxIisHere = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+
+# Shared finding model. Guarded, with a local fallback, so this script still runs
+# if it was copied somewhere on its own.
+$script:CxFmtLoaded = $false
+$fmt = Join-Path $script:CxIisHere 'Write-DeployLog.ps1'
+if (Test-Path -LiteralPath $fmt -ErrorAction SilentlyContinue) {
+    try { . $fmt; $script:CxFmtLoaded = $true } catch { }
+}
+if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) {
+    function New-Finding {
+        param([string]$Check, [string]$Severity, [string]$Code = '', [string]$Message = '', [string]$Target = '', $Data = $null)
+        [pscustomobject]@{ check = $Check; severity = $Severity; code = $Code; target = $Target; message = $Message; data = $Data }
+    }
+}
+if (-not (Get-Command Get-GradedExitCode -ErrorAction SilentlyContinue)) {
+    function Get-GradedExitCode {
+        param([object[]]$Findings)
+        $f = @($Findings) | Where-Object { $_ }
+        if (@($f | Where-Object { $_.severity -eq 'fail' }).Count -gt 0) { return 1 }
+        if (@($f | Where-Object { $_.severity -eq 'warn' }).Count -gt 0) { return 2 }
+        return 0
+    }
+}
+if (-not (Get-Command Write-FindingTable -ErrorAction SilentlyContinue)) {
+    function Write-FindingTable {
+        param([object[]]$Findings, [string]$Title, [switch]$Quiet)
+        if ($Title) { Write-Host ''; Write-Host "== $Title ==" }
+        foreach ($f in @($Findings)) {
+            if (-not $f) { continue }
+            if ($Quiet -and ($f.severity -eq 'pass' -or $f.severity -eq 'skip')) { continue }
+            Write-Host ("  [{0,-7}] {1} {2} {3}" -f $f.severity.ToUpperInvariant(), $f.check, $f.target, $f.message)
+        }
+    }
+}
+if (-not (Get-Command Write-FindingSummary -ErrorAction SilentlyContinue)) {
+    function Write-FindingSummary {
+        param([object[]]$Findings, [string]$Label = 'RESULT', [int]$ExitCode = -1)
+        if ($ExitCode -lt 0) { $ExitCode = Get-GradedExitCode -Findings $Findings }
+        Write-Host "=== $Label RESULT: exit=$ExitCode ==="
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Probes
+# ---------------------------------------------------------------------------
+
+function Test-CxElevated {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $pr = New-Object Security.Principal.WindowsPrincipal($id)
+        return $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Test-CxIisPresent {
+    # Cheap, no module. Mirrors the appcmd probe Instrument-IIS.ps1 relies on.
+    (Test-Path -LiteralPath (Join-Path $env:windir 'System32\inetsrv\appcmd.exe')) -or
+    [bool](Get-Service -Name 'W3SVC' -ErrorAction SilentlyContinue)
+}
+
+function Get-CxServiceEnvironment {
+    <#
+      Read a Windows service's Environment value (REG_MULTI_SZ) as a string[].
+      Returns $null when the key or value is absent - which is NOT an error:
+      a host that was never instrumented has no Environment value at all.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $ServiceName)
+
+    try {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        if (-not (Test-Path -LiteralPath $key -ErrorAction SilentlyContinue)) { return $null }
+        $p = Get-ItemProperty -LiteralPath $key -Name 'Environment' -ErrorAction SilentlyContinue
+        if (-not $p) { return $null }
+        return @($p.Environment)
+    } catch { return $null }
+}
+
+function Get-CxEnvEntry {
+    <#
+      Pull NAME=value out of a REG_MULTI_SZ entry list. Case-insensitive on the
+      name, as Windows environment blocks are. Returns $null if absent.
+    #>
+    [CmdletBinding()]
+    param([string[]] $Entries, [Parameter(Mandatory)][string] $Name)
+
+    foreach ($e in @($Entries)) {
+        if ($null -eq $e) { continue }
+        $i = $e.IndexOf('=')
+        if ($i -lt 1) { continue }
+        if ($e.Substring(0, $i).Trim() -ieq $Name) { return $e.Substring($i + 1) }
+    }
+    return $null
+}
+
+function Get-CxAppHostModel {
+    <#
+      Parse applicationHost.config ONCE into a model:
+
+        Pools    - name -> @{ ManagedRuntimeVersion; HasOwnEnvBlock; Env = @{} }
+        Defaults - the applicationPoolDefaults environmentVariables as @{}
+        Apps     - one record per site/application with Pool + PhysicalPath
+
+      Node selection is done in PowerShell rather than by interpolating names
+      into an XPath literal, so a pool named  Bob's Pool  cannot break the query.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+
+    $model = [pscustomobject]@{
+        Ok       = $false
+        Error    = $null
+        Denied   = $false
+        Pools    = @{}
+        Defaults = @{}
+        Apps     = @()
+    }
+
+    # Read first and classify the failure, rather than pre-checking with Test-Path.
+    # Test-Path on a permission-denied path emits a NON-TERMINATING error (which
+    # escapes a try/catch under 'Continue') and then returns $false - so a
+    # pre-check reports "not found" for a file that exists but is unreadable.
+    # That misdiagnosis is exactly what this script exists to prevent.
+    try {
+        [xml]$xml = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    } catch [System.UnauthorizedAccessException] {
+        $model.Error = "access denied reading applicationHost.config (run elevated): $Path"
+        $model.Denied = $true
+        return $model
+    } catch {
+        if ($_.Exception -is [System.Management.Automation.ItemNotFoundException] -or
+            $_.Exception -is [System.IO.FileNotFoundException] -or
+            $_.Exception -is [System.IO.DirectoryNotFoundException]) {
+            $model.Error = "applicationHost.config not found at $Path"
+        } elseif ($_.Exception.GetType().Name -match 'UnauthorizedAccess') {
+            # PS 5.1 sometimes wraps it rather than surfacing the typed exception.
+            $model.Error = "access denied reading applicationHost.config (run elevated): $Path"
+            $model.Denied = $true
+        } else {
+            $model.Error = "could not read/parse applicationHost.config: $($_.Exception.Message)"
+        }
+        return $model
+    }
+
+    function ConvertTo-EnvMap($node) {
+        $map = @{}
+        if (-not $node) { return $map }
+        $block = $node.SelectSingleNode('environmentVariables')
+        if (-not $block) { return $map }
+        foreach ($a in @($block.SelectNodes('add'))) {
+            $n = [string]$a.GetAttribute('name')
+            if ($n) { $map[$n] = [string]$a.GetAttribute('value') }
+        }
+        return $map
+    }
+
+    try {
+        $poolsRoot = $xml.SelectSingleNode('/configuration/system.applicationHost/applicationPools')
+        if ($poolsRoot) {
+            $defNode = $poolsRoot.SelectSingleNode('applicationPoolDefaults')
+            $model.Defaults = ConvertTo-EnvMap $defNode
+
+            foreach ($p in @($poolsRoot.SelectNodes('add'))) {
+                $name = [string]$p.GetAttribute('name')
+                if (-not $name) { continue }
+                $model.Pools[$name] = [pscustomobject]@{
+                    Name                  = $name
+                    # Absent attribute means "inherit the default", which is v4.0 -
+                    # NOT "No Managed Code". Only an explicitly empty string is
+                    # No Managed Code, so distinguish absent from empty.
+                    ManagedRuntimeVersion = if ($p.HasAttribute('managedRuntimeVersion')) { [string]$p.GetAttribute('managedRuntimeVersion') } else { $null }
+                    HasOwnEnvBlock        = [bool]$p.SelectSingleNode('environmentVariables')
+                    Env                   = (ConvertTo-EnvMap $p)
+                }
+            }
+        }
+
+        $sitesRoot = $xml.SelectSingleNode('/configuration/system.applicationHost/sites')
+        if ($sitesRoot) {
+            # An <application> may OMIT applicationPool, in which case IIS resolves it
+            # from <sites><applicationDefaults applicationPool="...">. The stock
+            # "Default Web Site" does exactly this on a fresh IIS, so skipping this
+            # fallback makes the pool look empty and every check keyed on it report a
+            # FALSE "not configured" - on essentially every host in the fleet.
+            $poolDefault = ''
+            $defNode = $sitesRoot.SelectSingleNode('applicationDefaults')
+            if ($defNode) { $poolDefault = [string]$defNode.GetAttribute('applicationPool') }
+
+            foreach ($site in @($sitesRoot.SelectNodes('site'))) {
+                $siteName = [string]$site.GetAttribute('name')
+                foreach ($app in @($site.SelectNodes('application'))) {
+                    $appPath = [string]$app.GetAttribute('path')
+                    if (-not $appPath) { $appPath = '/' }
+
+                    # Resolution order, matching IIS: the application's own attribute,
+                    # then a per-site applicationDefaults, then the sites-wide default.
+                    $pool = [string]$app.GetAttribute('applicationPool')
+                    if (-not $pool) {
+                        $siteDef = $site.SelectSingleNode('applicationDefaults')
+                        if ($siteDef) { $pool = [string]$siteDef.GetAttribute('applicationPool') }
+                    }
+                    if (-not $pool) { $pool = $poolDefault }
+
+                    $phys = ''
+                    foreach ($vd in @($app.SelectNodes('virtualDirectory'))) {
+                        if (([string]$vd.GetAttribute('path')) -eq '/') {
+                            $phys = [string]$vd.GetAttribute('physicalPath'); break
+                        }
+                    }
+                    if ($phys) {
+                        try { $phys = [Environment]::ExpandEnvironmentVariables($phys) } catch { }
+                    }
+
+                    $model.Apps += [pscustomobject]@{
+                        Site         = $siteName
+                        AppPath      = $appPath
+                        Pool         = $pool
+                        PhysicalPath = $phys
+                    }
+                }
+            }
+        }
+
+        $model.Ok = $true
+    } catch {
+        $model.Error = "unexpected shape in applicationHost.config: $($_.Exception.Message)"
+    }
+
+    return $model
+}
+
+function Test-CxAspNetCoreApp {
+    <#
+      True when an app's web.config declares <aspNetCore> - i.e. it is an
+      ASP.NET Core app and therefore REQUIRES a "No Managed Code" pool.
+
+      Matches with //aspNetCore because the publish output commonly wraps the
+      node in <location path="." ...> rather than putting it directly under
+      <system.webServer> - the same reason Set-WebConfigServiceName does.
+
+      Returns $null (not $false) when the answer is unknowable: no physical path,
+      missing or unreadable web.config. Callers must not treat that as "no".
+    #>
+    [CmdletBinding()]
+    param([string] $PhysicalPath)
+
+    if (-not $PhysicalPath) { return $null }
+    try {
+        $wc = Join-Path $PhysicalPath 'web.config'
+        # SilentlyContinue: an access-denied Test-Path emits a non-terminating
+        # error that escapes this try/catch under 'Continue'. We return $null
+        # (unknown) either way, but the console must stay clean.
+        if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
+        [xml]$x = Get-Content -LiteralPath $wc -Raw -ErrorAction Stop
+        return [bool]$x.SelectSingleNode('//aspNetCore')
+    } catch { return $null }
+}
+
+function Get-CxEffectivePoolEnv {
+    <#
+      A pool's own <environmentVariables> block REPLACES applicationPoolDefaults;
+      it is not merged with it. So checking the defaults alone can report a false
+      pass for a pool that has its own block.
+
+      OBSERVED BEHAVIOUR (verified in the ltsc2022 IIS container): when appcmd
+      first writes ANY env var to a pool, IIS MATERIALISES the current
+      applicationPoolDefaults entries into that pool's new block alongside it. So
+      in practice a freshly instrumented pool carries a full copy, not an empty
+      one - which is why "pool has a block but no endpoint" is rare and mostly
+      reachable only by hand-editing applicationHost.config.
+
+      The consequential case is that the copy is a SNAPSHOT: change
+      applicationPoolDefaults afterwards and every pool that already has its own
+      block keeps the OLD value forever. Get-CxPoolEnvDrift below reports that.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Pool, [hashtable] $Defaults)
+
+    if ($Pool.HasOwnEnvBlock) { return $Pool.Env }
+    return $Defaults
+}
+
+function Get-CxPoolEnvDrift {
+    <#
+      Names present in BOTH applicationPoolDefaults and the pool's own block whose
+      values disagree. Each one is a stale snapshot: the default was changed after
+      this pool was instrumented, and the pool never picked the change up.
+
+      This is the failure mode behind "I fixed the OTLP endpoint centrally and
+      half the fleet still exports nowhere".
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $Pool, [hashtable] $Defaults)
+
+    $drift = @()
+    if (-not $Pool.HasOwnEnvBlock) { return $drift }
+    foreach ($k in @($Defaults.Keys)) {
+        if ($Pool.Env.ContainsKey($k) -and ([string]$Pool.Env[$k]) -ne ([string]$Defaults[$k])) {
+            $drift += [pscustomobject]@{ Name = $k; Pool = [string]$Pool.Env[$k]; Default = [string]$Defaults[$k] }
+        }
+    }
+    return $drift
+}
+
+# ---------------------------------------------------------------------------
+# The check
+# ---------------------------------------------------------------------------
+
+function Test-IISInstrumentation {
+    <#
+      Run the six sub-checks and return findings. Never throws; anything it
+      cannot determine comes back as `unknown`, which does not move the grade.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $ExpectedOtlpEndpoint = 'http://127.0.0.1:4318',
+        [string] $AppHostConfig        = (Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'),
+        [string] $BackupRoot
+    )
+
+    $findings = New-Object System.Collections.ArrayList
+    function Add-F { param($f) [void]$findings.Add($f) }
+
+    # -- gate 0: elevation ---------------------------------------------------
+    if (-not (Test-CxElevated)) {
+        Add-F (New-Finding -Check 'iisInstr' -Severity 'fail' -Code 'NOT_ELEVATED' `
+            -Message 'not running as Administrator - applicationHost.config and the service registry are unreadable, so every result would be a false negative')
+        return ,@($findings.ToArray())
+    }
+
+    # -- gate 1: is there any IIS here at all? -------------------------------
+    if (-not (Test-CxIisPresent)) {
+        Add-F (New-Finding -Check 'iisInstr' -Severity 'skip' -Code 'IIS_ABSENT' `
+            -Message 'no IIS on this host - nothing to instrument')
+        return ,@($findings.ToArray())
+    }
+
+    $model = Get-CxAppHostModel -Path $AppHostConfig
+    if (-not $model.Ok) {
+        $code = if ($model.Denied) { 'APPHOST_ACCESS_DENIED' } else { 'APPHOST_UNREADABLE' }
+        Add-F (New-Finding -Check 'iisInstr' -Severity 'unknown' -Code $code `
+            -Message $model.Error -Target $AppHostConfig)
+    }
+
+    $appCount = @($model.Apps).Count
+
+    # -- gate 2: IIS role present but no applications ------------------------
+    # A golden image with the role baked in and no sites yet is a legitimate
+    # steady state. Telling it the profiler is missing would be noise.
+    if ($model.Ok -and $appCount -eq 0) {
+        Add-F (New-Finding -Check 'iisInstr' -Severity 'skip' -Code 'IIS_NO_APPS' `
+            -Message 'IIS is installed but hosts no applications - instrumentation is not expected' `
+            -Data @{ appCount = 0 })
+        return ,@($findings.ToArray())
+    }
+
+    # -- a/b/c: the CLR profiler in the service Environment blocks -----------
+    foreach ($svc in @('W3SVC', 'WAS')) {
+        $entries = Get-CxServiceEnvironment -ServiceName $svc
+
+        if ($null -eq $entries) {
+            Add-F (New-Finding -Check 'profiler' -Severity 'warn' -Code 'PROFILER_NOT_REGISTERED' -Target $svc `
+                -Message "$svc has no Environment value - Register-OpenTelemetryForIIS never ran (or was undone). No .NET app on this host is instrumented.")
+            continue
+        }
+
+        # (c) FIRST - a malformed block is act-now severity. An empty element in
+        # this REG_MULTI_SZ prevents IIS from starting ("cannot contain empty
+        # strings"), so it outranks every other finding here.
+        $emptyCount = @($entries | Where-Object { [string]::IsNullOrEmpty($_) }).Count
+        if ($emptyCount -gt 0) {
+            Add-F (New-Finding -Check 'profilerReg' -Severity 'fail' -Code 'PROFILER_REGISTRY_MALFORMED' -Target $svc `
+                -Message "$svc Environment REG_MULTI_SZ contains $emptyCount empty element(s) - this PREVENTS IIS FROM STARTING. Restore $svc.reg from the deploy backup dir (reg import) or remove the blank entry." `
+                -Data @{ entryCount = @($entries).Count; emptyCount = $emptyCount })
+        } else {
+            Add-F (New-Finding -Check 'profilerReg' -Severity 'pass' -Target $svc `
+                -Message "$svc Environment is well-formed ($(@($entries).Count) entries)")
+        }
+
+        # (a) profiler registration. CORECLR_* is .NET Core/5+; COR_* is Framework.
+        $clrGuid   = Get-CxEnvEntry -Entries $entries -Name 'CORECLR_PROFILER'
+        $clrEnable = Get-CxEnvEntry -Entries $entries -Name 'CORECLR_ENABLE_PROFILING'
+        $fwGuid    = Get-CxEnvEntry -Entries $entries -Name 'COR_PROFILER'
+        $fwEnable  = Get-CxEnvEntry -Entries $entries -Name 'COR_ENABLE_PROFILING'
+
+        if (-not $clrGuid -and -not $fwGuid) {
+            Add-F (New-Finding -Check 'profiler' -Severity 'warn' -Code 'PROFILER_NOT_REGISTERED' -Target $svc `
+                -Message "$svc Environment has no CORECLR_PROFILER or COR_PROFILER - the CLR profiler is not attached, so no spans are produced regardless of collector health")
+        } elseif ($clrGuid -and $clrEnable -ne '1') {
+            Add-F (New-Finding -Check 'profiler' -Severity 'warn' -Code 'PROFILER_NOT_ENABLED' -Target $svc `
+                -Message "$svc has CORECLR_PROFILER but CORECLR_ENABLE_PROFILING='$clrEnable' (expected '1') - the profiler is registered but switched off" `
+                -Data @{ profiler = $clrGuid; enable = $clrEnable })
+        } else {
+            Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
+                -Message "profiler registered (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
+                -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; coreclrEnable = $clrEnable; corEnable = $fwEnable })
+        }
+
+        # (b) does the DLL the registry points at still exist? A stale path lets
+        # IIS start and emit nothing - completely invisible until now.
+        $pathNames = @('CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32','CORECLR_PROFILER_PATH',
+                       'COR_PROFILER_PATH_64','COR_PROFILER_PATH_32','COR_PROFILER_PATH')
+        $checked = 0
+        foreach ($pn in $pathNames) {
+            $dll = Get-CxEnvEntry -Entries $entries -Name $pn
+            if (-not $dll) { continue }
+            $checked++
+            if (Test-Path -LiteralPath $dll -ErrorAction SilentlyContinue) {
+                Add-F (New-Finding -Check 'profilerPath' -Severity 'pass' -Target "$svc/$pn" `
+                    -Message "profiler DLL present" -Data @{ path = $dll })
+            } else {
+                Add-F (New-Finding -Check 'profilerPath' -Severity 'warn' -Code 'PROFILER_PATH_MISSING' -Target "$svc/$pn" `
+                    -Message "$pn points at a file that does not exist - IIS starts but emits no telemetry: $dll" `
+                    -Data @{ path = $dll })
+            }
+        }
+        if ($checked -eq 0 -and ($clrGuid -or $fwGuid)) {
+            Add-F (New-Finding -Check 'profilerPath' -Severity 'warn' -Code 'PROFILER_PATH_MISSING' -Target $svc `
+                -Message "$svc declares a profiler GUID but no *_PROFILER_PATH* entry - the CLR cannot load the profiler")
+        }
+    }
+
+    # -- d: the auto-instrumentation home + version --------------------------
+    $w3 = Get-CxServiceEnvironment -ServiceName 'W3SVC'
+    $autoHome = Get-CxEnvEntry -Entries $w3 -Name 'OTEL_DOTNET_AUTO_HOME'
+    if (-not $autoHome) {
+        if ($w3) {
+            Add-F (New-Finding -Check 'autoHome' -Severity 'warn' -Code 'AUTO_HOME_MISSING' `
+                -Message 'OTEL_DOTNET_AUTO_HOME is not set on W3SVC - Install-OpenTelemetryCore did not complete')
+        }
+    } elseif (-not (Test-Path -LiteralPath $autoHome -ErrorAction SilentlyContinue)) {
+        Add-F (New-Finding -Check 'autoHome' -Severity 'warn' -Code 'AUTO_HOME_MISSING' `
+            -Message "OTEL_DOTNET_AUTO_HOME points at a missing directory: $autoHome" -Data @{ path = $autoHome })
+    } else {
+        Add-F (New-Finding -Check 'autoHome' -Severity 'pass' `
+            -Message "auto-instrumentation home present" -Data @{ path = $autoHome })
+    }
+
+    # Version is best-effort: the deploy manifest is the only place it is recorded.
+    $manifestVersion = $null
+    try {
+        $bc = Join-Path $script:CxIisHere 'Backup-Config.ps1'
+        if (Test-Path -LiteralPath $bc -ErrorAction SilentlyContinue) {
+            . $bc
+            $root = if ($BackupRoot) { $BackupRoot } else { Get-DefaultBackupRoot }
+            $m = Get-LatestManifest -BackupRoot $root
+            if ($m) { $manifestVersion = [string]$m.instrumentVersion }
+        }
+    } catch { }
+
+    if ($manifestVersion) {
+        Add-F (New-Finding -Check 'autoHome' -Severity 'info' `
+            -Message "deploy manifest records instrumentation version $manifestVersion" `
+            -Data @{ instrumentVersion = $manifestVersion })
+    } elseif ($autoHome) {
+        Add-F (New-Finding -Check 'autoHome' -Severity 'info' -Code 'INSTRUMENTATION_VERSION_UNKNOWN' `
+            -Message 'no deploy manifest found, so the installed instrumentation version cannot be confirmed')
+    }
+
+    if (-not $model.Ok) { return ,@($findings.ToArray()) }
+
+    # -- e: OTLP endpoint effective per pool ---------------------------------
+    # Only pools that actually host an application matter.
+    $usedPools = @($model.Apps | ForEach-Object { $_.Pool } | Where-Object { $_ } | Select-Object -Unique)
+
+    $defEndpoint = $model.Defaults['OTEL_EXPORTER_OTLP_ENDPOINT']
+    if (-not $defEndpoint) {
+        Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target 'applicationPoolDefaults' `
+            -Message 'OTEL_EXPORTER_OTLP_ENDPOINT is not set on applicationPoolDefaults - pools that do not set it themselves have no exporter target')
+    }
+
+    foreach ($poolName in $usedPools) {
+        $pool = $model.Pools[$poolName]
+        if (-not $pool) {
+            Add-F (New-Finding -Check 'poolOtlp' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $poolName `
+                -Message 'an application references a pool that is not declared in applicationHost.config')
+            continue
+        }
+
+        $eff      = Get-CxEffectivePoolEnv -Pool $pool -Defaults $model.Defaults
+        $endpoint = $eff['OTEL_EXPORTER_OTLP_ENDPOINT']
+
+        if (-not $endpoint) {
+            if ($pool.HasOwnEnvBlock -and $defEndpoint) {
+                # The trap, caught: defaults look fine, this pool silently opted out.
+                Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_LOST_INHERITANCE' -Target $poolName `
+                    -Message "pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do" `
+                    -Data @{ defaultsEndpoint = $defEndpoint; poolEnvKeys = @($pool.Env.Keys) })
+            } else {
+                Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target $poolName `
+                    -Message 'no effective OTEL_EXPORTER_OTLP_ENDPOINT for this pool')
+            }
+            continue
+        }
+
+        if ($endpoint -match 'localhost') {
+            # Real, documented silent-failure mode - and the shipped default.
+            Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'OTLP_ENDPOINT_LOCALHOST' -Target $poolName `
+                -Message "endpoint uses 'localhost' ($endpoint). On a dual-stack host that resolves to ::1 first and OTLP export is silently dropped. Use $ExpectedOtlpEndpoint." `
+                -Data @{ endpoint = $endpoint; expected = $ExpectedOtlpEndpoint })
+        } elseif ($endpoint -ne $ExpectedOtlpEndpoint) {
+            Add-F (New-Finding -Check 'poolOtlp' -Severity 'info' -Target $poolName `
+                -Message "endpoint '$endpoint' differs from the expected '$ExpectedOtlpEndpoint' (intentional if this host exports elsewhere)" `
+                -Data @{ endpoint = $endpoint; expected = $ExpectedOtlpEndpoint })
+        } else {
+            Add-F (New-Finding -Check 'poolOtlp' -Severity 'pass' -Target $poolName `
+                -Message "endpoint $endpoint" -Data @{ endpoint = $endpoint; inherited = (-not $pool.HasOwnEnvBlock) })
+        }
+
+        if (-not $eff['OTEL_EXPORTER_OTLP_PROTOCOL']) {
+            Add-F (New-Finding -Check 'poolOtlp' -Severity 'info' -Target $poolName `
+                -Message 'OTEL_EXPORTER_OTLP_PROTOCOL is not set; the SDK default applies')
+        }
+
+        # Stale snapshot: this pool's own block disagrees with the current
+        # defaults, so a later central fix never reached it.
+        foreach ($d in (Get-CxPoolEnvDrift -Pool $pool -Defaults $model.Defaults)) {
+            Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_ENV_STALE' -Target "$poolName/$($d.Name)" `
+                -Message "pool has '$($d.Pool)' but applicationPoolDefaults now says '$($d.Default)'. A pool's own <environmentVariables> block replaces the defaults and is only a snapshot taken when the pool was first written, so this pool never picked up the change. Re-run Instrument-IIS.ps1 and recycle the pool." `
+                -Data @{ name = $d.Name; pool = $d.Pool; default = $d.Default })
+        }
+    }
+
+    # -- f: ASP.NET Core pools must be "No Managed Code" ---------------------
+    # Wrong here means NO telemetry at all, regardless of everything above.
+    foreach ($app in $model.Apps) {
+        $label = "$($app.Site)$($app.AppPath)"
+        $isCore = Test-CxAspNetCoreApp -PhysicalPath $app.PhysicalPath
+
+        if ($null -eq $isCore) {
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
+                -Message "cannot read web.config, so it is unknown whether this is an ASP.NET Core app needing 'No Managed Code'" `
+                -Data @{ physicalPath = $app.PhysicalPath })
+            continue
+        }
+        if (-not $isCore) { continue }   # Framework app: managed runtime is correct
+
+        $pool = $model.Pools[$app.Pool]
+        if (-not $pool) {
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $label `
+                -Message "pool '$($app.Pool)' is not declared in applicationHost.config")
+            continue
+        }
+
+        $mrv = $pool.ManagedRuntimeVersion
+        if ($mrv -eq '') {
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'pass' -Target $label `
+                -Message "ASP.NET Core app on pool '$($app.Pool)' is No Managed Code")
+        } else {
+            $shown = if ($null -eq $mrv) { '<inherited default>' } else { $mrv }
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'POOL_NOT_NO_MANAGED_CODE' -Target $label `
+                -Message "ASP.NET Core app but pool '$($app.Pool)' has managedRuntimeVersion=$shown - it must be '' (No Managed Code) or the app emits NO telemetry at all" `
+                -Data @{ pool = $app.Pool; managedRuntimeVersion = $mrv })
+        }
+    }
+
+    return ,@($findings.ToArray())
+}
+
+# ---------------------------------------------------------------------------
+# Main body - runs ONLY on direct execution, never when dot-sourced.
+# Dot-sourcing sets $MyInvocation.InvocationName to '.' (verified on 5.1 for
+# `. .\x.ps1`, `. (Join-Path ...)`, and `powershell -Command ". 'x.ps1'"`).
+# ---------------------------------------------------------------------------
+if ($MyInvocation.InvocationName -ne '.') {
+    Write-Host ''
+    Write-Host "IIS instrumentation check on $env:COMPUTERNAME  ($(Get-Date -Format 's'))"
+
+    # NOT $args - that is an automatic variable holding unbound arguments.
+    $callArgs = @{
+        ExpectedOtlpEndpoint = $ExpectedOtlpEndpoint
+        AppHostConfig        = $AppHostConfig
+    }
+    if ($BackupRoot) { $callArgs['BackupRoot'] = $BackupRoot }
+
+    $result = Test-IISInstrumentation @callArgs
+    $code   = Get-GradedExitCode -Findings $result
+
+    Write-FindingTable   -Findings $result -Title 'IIS instrumentation' -Quiet:$Quiet
+    Write-FindingSummary -Findings $result -Label 'IIS-INSTRUMENTATION' -ExitCode $code
+
+    if ($PassThru) { $result }
+    exit $code
+}
