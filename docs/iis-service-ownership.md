@@ -89,12 +89,19 @@ Each host's **Service ownership** items are **exactly the per-app `OTEL_SERVICE_
 - `deploy/Instrument-IIS.ps1` (and `scripts/deploy-app.ps1 -InstrumentAllApps`) build the app
   list **once** with `Get-IISServiceMap`. Each record's `.ServiceName` is assigned as that
   app's `OTEL_SERVICE_NAME` (pool env or `web.config`).
-- The **same** map is passed to `Get-IISServiceLabelValue -Map $svcMap`, which produces
-  `CX_IIS_SERVICES` (distinct `.ServiceName`, comma-joined). The collector splits it into the
-  ownership array.
+- The records whose assignment **succeeded** are passed to `Get-IISServiceLabelValue`, which
+  produces `CX_IIS_SERVICES` (distinct `.ServiceName`, comma-joined). The collector splits it
+  into the ownership array.
 - Therefore `set(CX_IIS_SERVICES) == set(OTEL_SERVICE_NAME across apps)`. In the single-app
   `deploy-app.ps1` path, `CX_IIS_SERVICES = $ServiceName`, which is exactly that pool's
   `OTEL_SERVICE_NAME`.
+
+> **Succeeded, not merely attempted.** Some apps cannot be named at all: a shared-pool app
+> with no `web.config`, or a classic ASP.NET Framework app with no `<aspNetCore>` element to
+> write into. Those are **excluded** from `CX_IIS_SERVICES`. Including them (which the script
+> used to do) advertised ownership of a service that emits nothing and made the doctor report
+> `CX_IIS_SERVICES_DRIFT` **permanently**, since re-running reproduced the same value. See
+> [`iis-e2e-matrix.md`](iis-e2e-matrix.md).
 
 Result: an APM service (e.g. `SimpleWebApp`) always matches one of its host's Service-ownership
 items, so APM ↔ infrastructure resource correlation can select a single service.
@@ -113,6 +120,16 @@ items, so APM ↔ infrastructure resource correlation can select a single servic
   the processor must be present in the **remote** config to take effect in production. (The
   base's copy is used for deterministic *hybrid-mode* tests, where no remote config is
   assigned to the test agent.)
+
+> **Checking this on a host.** `doctor.bat -Only effectiveConfig` reads
+> `C:\ProgramData\opampsupervisor\state\effective.yaml` — the **merged** config the collector
+> is actually running — and reports `EFFECTIVE_PROCESSOR_MISSING` when
+> `transform/iis_service_labels` is absent, or `EFFECTIVE_PROCESSOR_NOT_WIRED` when it is
+> defined but not listed in the `logs` / `logs/resource_catalog` pipelines. This is the exact
+> failure this section warns about, and from Coralogix it is **indistinguishable** from "the
+> env var was never set" — both produce blank ownership. The check is a text match (no YAML
+> parser in PS 5.1) with comment lines excluded; it can confirm the name is present and
+> inside the pipeline block, not that the processor is semantically correct.
 
 ## Scope (pipelines)
 
@@ -173,12 +190,37 @@ and `CX_SERVICE_NAME` produced no ownership. Data landing was confirmed by DataP
 query against the ingested telemetry; ownership resolution was read from Infrastructure
 Explorer.
 
+That POC established **which keys work**, once. To verify a **live** host today, do not
+re-run it — use the packaged diagnostics, which check the three things that can independently
+break:
+
+| Question | Check |
+| --- | --- |
+| Is the variable set, and does it match the apps? | `doctor.bat -Only env,iisServiceName` |
+| Does a processor actually consume it? | `doctor.bat -Only effectiveConfig` |
+| Did Coralogix resolve ownership from the stamped keys? | `scripts/Verify-CoralogixInfraLabels.ps1`, then Infrastructure Explorer (~15 min) |
+
+Only the last one needs a query key and server-side lag; the first two are read-only and
+instant on the host.
+
 ## Operational notes
 
 - Set `CX_IIS_SERVICES` (machine scope) before the collector starts; a Windows service reads
   the machine environment at start, so restart the collector after changing it.
+  The doctor's `env` check reports `CX_IIS_SERVICES_MISSING` when it is unset,
+  `CX_IIS_SERVICES_STALE` when it holds a value on a host with no IIS or no IIS apps (a
+  leftover from a prior deploy, still being stamped onto that host's telemetry), and
+  `CX_IIS_SERVICES_DRIFT` when the value no longer matches the apps actually present.
 - On IIS, point the app's `OTEL_EXPORTER_OTLP_ENDPOINT` at `http://127.0.0.1:4318` (not
-  `localhost`, which resolves to `::1` first and can silently drop OTLP export).
+  `localhost`, which resolves to `::1` first and can silently drop OTLP export). Reported
+  per pool as `OTLP_ENDPOINT_LOCALHOST` by `Test-IISInstrumentation.ps1`.
+- The alignment guarantee described above is a **construction-time** property — it holds
+  because one `Get-IISServiceMap` result feeds both assignments. To confirm it on a **live**
+  host, run `doctor.bat -Only iisServiceName`: it reads each app's `OTEL_SERVICE_NAME` back
+  from the pool **or** its `web.config` and compares `CX_IIS_SERVICES` against them as a
+  **set**. That is the only check that catches sites added or renamed *after* the deploy ran.
+  Pass the same `-ServiceNameOverrides` / `-OverridesJson` the install used, or every app
+  reports false drift.
 - A transform processor applies **per-signal** statement blocks — this one covers only the
   logs signal, so it defines only `log_statements`. (If the label is ever needed on spans or
   metrics, add `trace_statements` / `metric_statements` with the same body and wire the

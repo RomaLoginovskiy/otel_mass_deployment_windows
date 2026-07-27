@@ -60,7 +60,7 @@ Two ideas do the heavy lifting:
 | --- | --- |
 | `deploy.bat` | BatchPatch remote-command entry; launches the orchestrator under PowerShell 5.1 |
 | `uninstall.bat` | BatchPatch remote-command entry for uninstall; launches `Uninstall-Agent.ps1` |
-| `Install-Agent.ps1` | Orchestrator: detect → install supervisor → conditional IIS → verify |
+| `Install-Agent.ps1` | Orchestrator: detect → install supervisor → conditional IIS / Node → verify |
 | `Uninstall-Agent.ps1` | Reverse the install (manifest-guided); see **Uninstall** below |
 | `Detect-Workloads.ps1` | Workload detection → `OTEL_RESOURCE_ATTRIBUTES` + JSON summary |
 | `Install-CoralogixSupervisor.ps1` | Collector install with `-Supervisor` |
@@ -122,6 +122,37 @@ BatchPatch has no atomic "copy + run" object, so we ship one folder and one
 > The same model matches how New Relic / Dynatrace agents were pushed — both the
 > collector install and the instrumentation are PowerShell.
 
+### WOW64 (32-bit host processes)
+
+`deploy.bat`, `uninstall.bat`, and `doctor.bat` all re-launch themselves through
+`%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe` when
+`PROCESSOR_ARCHITEW6432` is defined — that is, when the process that started them is
+32-bit. Nothing to configure; this is a note on *why*, because the failure it prevents is
+one that looks like success.
+
+On 64-bit Windows the WOW64 file system redirector rewrites `%windir%\System32` to
+`%windir%\SysWOW64` for a 32-bit process. `SysWOW64\inetsrv` exists and contains
+`appcmd.exe`; it even has a `config\` folder, but that folder holds only `Schema\` and
+`Export\` — there is **no `applicationHost.config`** under it. So inside a 32-bit deploy:
+
+- **`appcmd` still works.** It reaches the IIS configuration store through the
+  bitness-agnostic `ahadmin` COM API, so pool environment variables are written correctly
+  and the deploy reports success.
+- **Every direct file operation on `applicationHost.config` silently misses.** Before this
+  was fixed, that meant `Backup-DeployFile` snapshotted nothing and `Test-PoolEnvPresent`
+  returned `$false` for every variable — the run mutated the live config with **no backup**
+  and recorded the customer's pre-existing `OTEL_*` values as its own, so a later uninstall
+  would delete them.
+- **`%ProgramFiles%` resolves to `Program Files (x86)`**, so the .NET auto-instrumentation
+  would install into the wrong tree.
+- **`doctor.bat` reported `APPHOST_UNREADABLE`** on a host that was in fact instrumented.
+
+A 32-bit launcher is not exotic: BatchPatch and several RMM agents are 32-bit
+applications, as are scheduled tasks created by 32-bit tooling. The `.bat` guard is the
+primary fix; the PowerShell scripts additionally resolve the directory themselves
+(`Get-CxInetsrvDir`) for the case where a `.ps1` is invoked directly from a 32-bit shell.
+`test/docker-win/Run-DoctorTest.ps1` group **E** pins both paths.
+
 ## Step 3 — Assign remote config in Coralogix Fleet Management
 
 1. In Coralogix (**eu1**), open **Fleet Management**. New agents appear as they
@@ -156,6 +187,40 @@ Explorer and APM.
 - The same value is also fed to the OpAMP AgentDescription
   (`deployment.environment.name`) so you can **group by environment** in Fleet
   Management.
+
+---
+
+## Application naming (hostname fallback)
+
+The Coralogix **application** name is resolved per signal by the `coralogix`
+exporter, which walks `application_name_attributes` in order and takes the **first
+non-empty resource attribute**:
+
+| # | Source | Set by |
+| --- | --- | --- |
+| 1 | `cx.application.name` | An explicit per-signal override from a sender / remote Fleet config. |
+| 2 | `service.namespace` | `transform/appname`, from the machine env var **`CX_APPLICATION`** (`Install-Agent.ps1 -Application`). Skipped entirely when the var is unset. |
+| 3 | `host.name` | **The default.** The `system` detector in `resourcedetection/env`. Each host reports under its own name. |
+| 4 | `application_name: otel` | Static last resort; unreachable in practice because `host.name` is always present. The exporter *requires* a non-empty value here, so it stays. |
+
+So on a fresh fleet host you set nothing and the host names its own application.
+`CX_APPLICATION` exists only to group several hosts under one shared application.
+
+Two implementation notes worth keeping:
+
+- A bare `cx.application.name` **resource attribute is not enough on its own** — the
+  exporter only consults it directly when `application_name` is empty, which its own
+  config validation rejects. It works here purely because it is listed in
+  `application_name_attributes`.
+- `service.namespace` is set by a **transform with a condition**, not by the
+  `resource` processor. `value: ${env:CX_APPLICATION:-}` on a `resource` processor
+  fails at startup when the var is unset: confmap types a value that is entirely one
+  `${env:...}` reference, an empty expansion becomes YAML `null`, and the processor
+  rejects it with *"error creating AttrProc. Either field `value`, `from_attribute`
+  … must be specified"*. Quoting does not help. Inside an OTTL statement the same
+  reference is plain string substitution, so empty is harmless.
+
+Verify with `scripts\Verify-CoralogixAppName.ps1 -ExpectedApplication <hostname>`.
 
 ---
 
@@ -209,6 +274,7 @@ the workload present; every probe is non-fatal.
 | IIS | `W3SVC`/`WAS` service, `w3wp` process, IIS optional feature, `appcmd.exe` |
 | .NET | `dotnet` CLI / install dir, .NET Framework `NDP\v4\Full` registry |
 | Node.js (9→latest) | `node --version`, `%ProgramFiles%\nodejs` |
+| PM2 (Node process manager) | `pm2` on PATH, `pm2 jlist` app list, `%USERPROFILE%\.pm2` / `$PM2_HOME` |
 | RabbitMQ | `RabbitMQ*` service, ports 5672/15672, install dir |
 | Redis | `Redis*` service, `redis-server` process, port 6379 |
 | Valkey | `Valkey*` service, `valkey-server` process, port 6379 |
@@ -220,8 +286,10 @@ Emitted `OTEL_RESOURCE_ATTRIBUTES` (the agent-selector contract):
 
 | Attribute | Meaning |
 | --- | --- |
-| `cx.host.role=<primary>` | Single coarse role, by priority: `iis > sqlserver > db2 > elasticsearch > rabbitmq > redis > valkey > nodejs > dotnet` |
+| `cx.host.role=<primary>` | Single coarse role, by priority: `iis > sqlserver > db2 > elasticsearch > rabbitmq > redis > valkey > nodejs-pm2 > nodejs > dotnet` |
 | `workload.<name>=true` | One per detected workload (multi-role hosts get several) |
+| `workload.pm2` | PM2 present (a Node host managed by PM2 takes the `nodejs-pm2` role) |
+| `workload.pm2.apps` | Number of Node apps PM2 is managing, when ≥ 1 |
 | `workload.nodejs.version` | Node.js version, when present |
 | `workload.dotnet.version` | .NET version, when present |
 
@@ -255,6 +323,43 @@ Reminders from `iis-instrumentation.md`:
 - Requires **Windows PowerShell 5.1** (not 7).
 - ASP.NET **Core** app pools must be **"No Managed Code"** or they emit nothing.
 - A trailing blank line in the W3SVC `Environment` REG_MULTI_SZ prevents IIS start.
+
+> ⚠️ **`localhost` vs `127.0.0.1`.** The endpoint above is the shipped default, but on a
+> dual-stack host `localhost` resolves to `::1` first and OTLP export is **silently
+> dropped**. `doctor.bat` flags every pool with `OTLP_ENDPOINT_LOCALHOST`; that is a real
+> finding, not a false positive. Pass `-OtlpEndpoint http://127.0.0.1:4318` to avoid it.
+
+> **A pool's env block is a snapshot.** A pool with its own `<environmentVariables>`
+> **replaces** `applicationPoolDefaults`, and IIS copies the defaults into that block the
+> first time `appcmd` writes any variable to the pool. The copy never refreshes — so
+> changing the defaults later never reaches an already-instrumented pool. Reported as
+> `POOL_ENV_STALE`.
+
+To read back what actually landed on a host, run `Test-IISInstrumentation.ps1` (or
+`doctor.bat`): it checks the CLR profiler registration, that the profiler DLL still exists,
+the per-pool OTLP env, and the "No Managed Code" requirement above.
+
+---
+
+## Conditional Node/PM2 zero-code instrumentation
+
+When detection reports PM2 (`workload.pm2`), the orchestrator runs `Instrument-NodePM2.ps1`
+unless `-SkipInstrument` is set:
+
+- Stages `@opentelemetry/auto-instrumentations-node` under `-InstallPrefix`
+  (default `C:\cx\otel-node`) — this needs npm registry access at deploy time, or a
+  pre-staged prefix with `-SkipInstall` — then resolves the absolute `register` bootstrap.
+- Per app from `pm2 jlist`: sets `NODE_OPTIONS=--require <register>`, the `OTEL_*` exporter
+  vars, and a per-app `OTEL_SERVICE_NAME`, then `pm2 restart --update-env` and `pm2 save`
+  so the env survives a daemon restart.
+- Sets machine `CX_NODE_SERVICES` — but **no collector config consumes it today**, so Node
+  host Service-ownership stays blank. See
+  [`nodejs-pm2-instrumentation.md`](./nodejs-pm2-instrumentation.md).
+
+Run it in the **same user context that owns the PM2 daemon** — PM2 is per-user on Windows.
+`Test-NodeInstrumentation.ps1` reports a mismatch as `NODE_PM2_DAEMON_NOT_VISIBLE`
+(`unknown`, never a failure, because querying the wrong daemon must not look like "not
+instrumented").
 
 ---
 
@@ -457,6 +562,17 @@ conservative removal of the installer-owned names/services only. Result is writt
 
 ## Verification
 
+0. **Run the doctor** — `doctor.bat` on the host. Read-only, changes nothing, and it
+   covers steps 3 and 5 below mechanically plus things they cannot see: whether anything
+   is actually being *exported*, whether the CLR profiler is attached, and whether
+   `transform/iis_service_labels` is in the **effective** (merged) config. Exit `0` pass,
+   `2` degraded, `1` hard fail; each finding is a specific code rather than a symptom, and
+   `agent-doctor.json` is written next to the scripts for post-hoc collection.
+   Full reference: [`agent-diagnostics.md`](agent-diagnostics.md).
+
+   Steps 2, 4 and 6 are the ones the doctor does *not* replace — config `validate`,
+   server-side confirmation in Coralogix, and the installer's own status file.
+
 1. **Detection** — run `Detect-Workloads.ps1 -SetEnv:$false` on a host; confirm the
    printed `OTEL_RESOURCE_ATTRIBUTES` matches reality and `detect-workloads.json`
    is written.
@@ -470,6 +586,8 @@ conservative removal of the installer-owned names/services only. Result is writt
 5. **IIS APM** — on an IIS host, spans reach the APM Service Catalog (allow a few
    minutes for span-metrics flush).
 6. **Status file** — `install-agent-status.json` shows `result: success`.
+   `agent-doctor.json` sits alongside it (and `detect-workloads.json`); harvest all three
+   after a BatchPatch sweep.
 
 ## Command & flag reference
 
@@ -499,6 +617,42 @@ Set either/both/neither before the call; each is independent.
 | --- | --- | --- |
 | `CORALOGIX_PRIVATE_KEY` | `-PrivateKey` | Send-Your-Data key at deploy time (overrides a baked-in `SendDataKey.txt`). |
 | `CX_ENVIRONMENT` | `-Environment` | Stamps the deployment environment on all of this host's telemetry. |
+| `CX_APPLICATION` | `-Application` | Coralogix **application** name for this host. **Leave unset** to get the default: the application name falls back to the host's own name (`host.name`). Set it only to group several hosts under one application. |
+| `CX_NO_SUPERVISOR=1` | `-NoSupervisor` | Install the collector **without** the OpAMP Supervisor — the plain `otelcol-contrib` service, config authoritative on disk, no Fleet Management registration. See [Collector modes](#collector-modes-supervisor-or-not) below. |
+| `CX_SKIP_INSTRUMENT=1` | `-SkipInstrument` | Install the collector but leave IIS and Node alone. |
+
+### Collector modes (supervisor or not)
+
+`CX_NO_SUPERVISOR=1` changes **only** the arguments handed to the Coralogix vendor
+installer:
+
+```
+supervisor (default)   -Supervisor -SupervisorCollectorBaseConfig <cfg> -EnableDynamicIISParsing
+CX_NO_SUPERVISOR=1     -Config <cfg> -EnableDynamicIISParsing
+```
+
+Everything else is identical: the same workload detection, the same IIS/Node
+instrumentation, the same machine env vars, the same diagnostics. `-Config` is
+regular-mode only (the vendor installer rejects it with `-Supervisor`), and the
+installer itself owns config placement in that mode — it copies the file into
+`%ProgramData%\OpenTelemetry\Collector`.
+
+**One recommended config serves both modes.** `Install-CoralogixSupervisor.ps1`
+produces `config.recommended.yaml` into its own folder from the shipped
+`config.supervisor.yaml` template and passes that path to whichever argument the
+mode selects. The config must stay free of an `opamp` extension: it is invalid in
+supervisor mode (the Supervisor owns the OpAMP connection) and it is what makes
+no-supervisor mode deterministic — with opamp present, a remote config could
+silently replace what is on disk.
+
+What you give up without the supervisor: Fleet Management registration, and
+therefore remote config and `cx.host.role` / `workload.*` **targeting**. The
+selector attributes still reach the telemetry data via
+`OTEL_RESOURCE_ATTRIBUTES`; what is unavailable is selecting the agent by them.
+
+The diagnostics take no mode flag — they report whichever collector is on the host,
+and search the supervisor's `effective.yaml`, then its base `collector.yaml`, then
+the plain service's `%ProgramData%\OpenTelemetry\Collector\config.yaml`.
 
 ### Uninstall entry point — `uninstall.bat` (env var → `Uninstall-Agent.ps1` flag)
 
@@ -532,7 +686,12 @@ Read-only. Changes nothing on the host; safe to run and re-run at any time.
 | `-RequiredProcessors` / `-RequiredPipelines` | string[] | `transform/iis_service_labels` / `logs`,`logs/resource_catalog` | What must be present and wired. |
 | `-ServiceNameOverrides` / `-OverridesJson` | hashtable / string | empty | Must match what the install used, or every app reports false drift. |
 | `-HealthRetries` / `-HealthDelaySec` / `-TimeoutSec` | int | `3` / `5` / `8` | Health probe tuning (shorter than the installer's, which has just restarted the supervisor). |
-| `-SkipIIS` / `-SkipNode` / `-SkipMetrics` | switch | off | Skip a check group. |
+| `-ExpectedOtlpEndpoint` | string | `http://127.0.0.1:4318` | Endpoint apps should carry; anything containing `localhost` raises `OTLP_ENDPOINT_LOCALHOST`. |
+| `-BaseCollectorConfig` | string | `C:\Program Files\OpenTelemetry OpAMP Supervisor\collector.yaml` | Fallback config to search when the supervisor's effective config is absent. |
+| `-NodeInstallPrefix` | string | `C:\cx\otel-node` | Where the OTel Node package should be staged; forwarded to `Test-NodeInstrumentation`. |
+
+There is **no** skip switch — omit a check with `-Only`. Anything not listed reports
+`NOT_SELECTED` (a skip) and does not affect the exit code.
 
 Exit codes: `0` pass, `1` hard fail, `2` degraded. See
 [`agent-diagnostics.md`](agent-diagnostics.md) for every finding code.
@@ -546,8 +705,9 @@ dot-sources both, so there is one implementation behind both entry points.
 | Flag | Applies to | Default | Purpose |
 | --- | --- | --- | --- |
 | `-ExpectedOtlpEndpoint` | both | `http://127.0.0.1:4318` | The endpoint apps should carry. |
-| `-AppHostConfig` | IIS | `%windir%\System32\inetsrv\config\applicationHost.config` | Config to parse. |
+| `-AppHostConfig` | IIS | resolved by `Get-CxInetsrvDir` — `%windir%\System32\inetsrv\config\applicationHost.config`, or `%windir%\Sysnative\…` in a 32-bit process | Config to parse. See [WOW64](#wow64-32-bit-host-processes). |
 | `-BackupRoot` | IIS | `%ProgramData%\CoralogixDeploy\backups` | Where to read the manifest for the instrumentation version. |
+| `-EffectiveConfig` | Node | `C:\ProgramData\opampsupervisor\state\effective.yaml` | Config searched to answer "does anything consume `CX_NODE_SERVICES`?" — drives `NODE_SERVICES_NOT_CONSUMED`. |
 | `-InstallPrefix` | Node | `C:\cx\otel-node` | Where the OTel Node package should be staged. |
 | `-Package` | Node | `@opentelemetry/auto-instrumentations-node` | Package providing the `register` bootstrap. |
 | `-Quiet` / `-PassThru` | both | off | As above. |
@@ -592,6 +752,33 @@ Invoked by the orchestrator on IIS hosts; runnable standalone.
 | `-NoReset` | switch | off | Skip the final `iisreset` (and pass `-NoReset` to `Register-OpenTelemetryForIIS`). |
 | `-ServiceNameOverrides` | hashtable | `@{}` | Rename apps, keyed by the auto-derived service name, e.g. `@{ 'Wallet/api' = 'wallet-api' }`. Merged over `-OverridesJson` if both are given. |
 | `-OverridesJson` | string | *(unset)* | Path to a JSON file of the same `{ autoName = overrideName }` shape. |
+| `-LocalArchive` | string | `$env:CX_OTEL_DOTNET_ARCHIVE` | Pre-staged `opentelemetry-dotnet-instrumentation-windows.zip`, passed to the vendor module as `-LocalPath`. See **Offline / proxied hosts** below. |
+| `-LocalModule` | string | `$env:CX_OTEL_DOTNET_MODULE` | Pre-staged `OpenTelemetry.DotNet.Auto.psm1`. |
+
+#### Offline / proxied hosts
+
+`Instrument-IIS.ps1` normally downloads the vendor module and lets it fetch a ~19 MB
+archive from GitHub. Where that cannot happen — an outbound proxy, an air-gapped
+network, or a TLS stack that fails the transfer — stage both files once and point the
+machine env vars at them:
+
+```powershell
+[Environment]::SetEnvironmentVariable('CX_OTEL_DOTNET_ARCHIVE', 'C:\cx\otel-dotnet.zip', 'Machine')
+[Environment]::SetEnvironmentVariable('CX_OTEL_DOTNET_MODULE',  'C:\cx\OpenTelemetry.DotNet.Auto.psm1', 'Machine')
+```
+
+`deploy.bat` then needs no extra flags. A bad `-LocalArchive` path throws rather than
+falling back to a download the host cannot do.
+
+**Why this matters beyond air-gapped hosts:** the archive download is the *first*
+thing `Instrument-IIS.ps1` does. If it fails, the script aborts before assigning any
+per-app `OTEL_SERVICE_NAME`, before writing the pool OTLP variables, and before
+setting `CX_IIS_SERVICES` — so one failed download costs you the entire
+instrumentation, not just the profiler.
+
+> An interrupted run can leave the temp `.psm1` locked, and the next run then fails
+> with *"the process cannot access the file"* — a stale lock, not a permissions
+> problem. The download path clears that file first.
 
 ### Collector install — `Install-CoralogixSupervisor.ps1`
 
@@ -606,6 +793,7 @@ Invoked by the orchestrator; documented for standalone supervisor installs.
 | `-StageDir` | string | `C:\otel` | Where the base config is staged on the host. |
 | `-Version` | string | `$null` | Collector version to pin (vendor installer `-Version`). |
 | `-Environment` | string | `$null` | Persisted as machine env var `CX_ENVIRONMENT`. |
+| `-Application` | string | `$null` | Persisted as machine env var `CX_APPLICATION`. Unset → application name falls back to `host.name`. |
 | `-ResourceAttributes` | string | `$null` → machine `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` selector attrs published in the OpAMP AgentDescription. |
 
 ### Workload detection — `Detect-Workloads.ps1`
@@ -617,6 +805,20 @@ Invoked by the orchestrator; run standalone (with `-SetEnv:$false`) to preview d
 | `-SetEnv` | bool | `$true` | Persist the attr string to machine `OTEL_RESOURCE_ATTRIBUTES` (requires elevation). `-SetEnv:$false` = dry run. |
 | `-LogPath` | string | `.\detect-workloads.json` | JSON detection summary path. |
 | `-ExtraAttributes` | hashtable | `@{}` | Additional resource attributes to merge. |
+
+**Dot-sourcing.** The script guards its main body with
+`if ($MyInvocation.InvocationName -eq '.') { return }`, so dot-sourcing it defines the probe
+helpers (`Test-ServiceLike`, `Test-ProcessLike`, `Test-PortListening`, `Test-PathAny`)
+**without** running a workload scan and **without** writing machine
+`OTEL_RESOURCE_ATTRIBUTES` or `detect-workloads.json`. `Test-Agent.ps1` depends on this for
+its read-only `ports` check; if the file is missing, that check degrades to `HELPER_MISSING`
+(unknown) rather than failing. Calling the script with `&`, by path, or via
+`powershell -File` is unaffected and still runs detection normally.
+
+> **`-SetEnv` under `powershell -File`.** `-File` passes every argument as a *string*, so
+> `powershell -File Detect-Workloads.ps1 -SetEnv $false` fails to bind (`Cannot convert
+> value "System.String" to type "System.Boolean"`). Use `-SetEnv:$false` from an existing
+> PowerShell session, or invoke with `-Command` instead.
 
 ## Troubleshooting
 
@@ -639,6 +841,7 @@ Full finding reference: [`agent-diagnostics.md`](agent-diagnostics.md).
 | Selector attributes (`cx.host.role`/`workload.*`) not shown in Fleet Management | They must be in the **Supervisor** config `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` (the vendor template writes only static `service.name`/`cx.agent.type`). `Install-CoralogixSupervisor.ps1` injects them post-install + restarts `opampsupervisor`. If still absent: detection didn't run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed the `non_identifying_attributes:` anchor. Re-run deploy, or patch `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml` + restart. |
 | No IIS telemetry | Run `doctor.bat`. `POOL_NOT_NO_MANAGED_CODE` → the ASP.NET Core pool is not "No Managed Code"; recycle after fixing. `PROFILER_NOT_REGISTERED` → `Register-OpenTelemetryForIIS` never ran on this host. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `localhost` resolves to `::1` first and export is silently dropped; use `127.0.0.1`. |
 | `CX_IIS_SERVICES` not set / Service ownership blank | Run `doctor.bat -Only env,iisServiceName,effectiveConfig`. `CX_IIS_SERVICES_MISSING` → `Instrument-IIS.ps1` never ran or was not elevated. `CX_IIS_SERVICES_DRIFT` → sites changed after instrumentation; re-run and restart the collector. `EFFECTIVE_PROCESSOR_MISSING`/`_NOT_WIRED` → the env var is fine but `transform/iis_service_labels` is absent from the **remote** Fleet config, so it is never stamped. |
+| Doctor says the config is unreadable, but the deploy plainly worked | `APPHOST_UNREADABLE` / `APPHOST_ACCESS_DENIED`. `appcmd` reaches the config through the IIS COM API; the diagnostics do a plain file read, so one can fail while the other works. Usual cause is **WOW64** — see [below](#wow64-32-bit-host-processes). Other causes and the one-liner that tells them apart: [`agent-diagnostics.md`](agent-diagnostics.md#apphost_unreadable-when-the-deployment-clearly-worked). |
 | Endpoint fixed centrally but hosts still export nowhere | `POOL_ENV_STALE`. A pool's own `<environmentVariables>` block replaces `applicationPoolDefaults` and is only a snapshot taken when the pool was first written — later changes to the defaults never reach it. Re-run `Instrument-IIS.ps1` and recycle the pool. |
 | GitHub download TLS error | Older Server defaults to TLS 1.0; scripts enable TLS 1.2 first. |
 | BatchPatch row failed | Read `install-agent.log` (or `uninstall-agent.log`) on the host; `deploy.bat`/`uninstall.bat` propagate the PowerShell exit code. |

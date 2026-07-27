@@ -41,7 +41,7 @@ if (-not (Test-Path $deployDir)) { throw "deploy/ folder not found at $deployDir
 # here does NOT crash on the target host - the feature just silently degrades
 # (a diagnostic check reports UNKNOWN, or output loses its formatting). The
 # foreach below is the safety net: it fails the BUILD instead, loudly.
-$required = @('deploy.bat','uninstall.bat','doctor.bat',
+$required = @('deploy.bat','uninstall.bat','doctor.bat','Resolve-IISLogPaths.ps1',
               'Install-Agent.ps1','Uninstall-Agent.ps1',
               'Install-CoralogixSupervisor.ps1','Detect-Workloads.ps1',
               'Instrument-IIS.ps1','Resolve-IISServiceNames.ps1',

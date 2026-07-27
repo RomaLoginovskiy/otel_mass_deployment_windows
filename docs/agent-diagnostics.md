@@ -114,6 +114,136 @@ consuming it, so Node host Service-ownership stays blank. The doctor reports thi
 *looking* at the effective config, so the finding disappears on its own if a processor is
 ever added.
 
+## Every finding code
+
+All 54 codes the three scripts can emit. Severity drives the exit code: any `fail` → `1`,
+otherwise any `warn` → `2`, otherwise `0`. `info` / `skip` / `unknown` never move it.
+
+### `fail` — exit 1
+
+| Code | Meaning |
+| --- | --- |
+| `NOT_ELEVATED` | Not running as Administrator. Nothing else was checked, because the answers would be false. |
+| `PRIVATE_KEY_MISSING` | No machine `CORALOGIX_PRIVATE_KEY` — the collector cannot authenticate and nothing reaches Coralogix. |
+| `COLLECTOR_SERVICE_MISSING` | Neither `opampsupervisor` nor `otelcol-contrib` is installed. |
+| `COLLECTOR_SERVICE_STOPPED` | The service exists but is not Running. |
+| `COLLECTOR_PROCESS_MISSING` | `opampsupervisor` is Running but no `otelcol` child process exists — the collector is crash-looping. Check the Application event log, source `otelcol-contrib`. |
+| `HEALTH_UNREACHABLE` | No response from `127.0.0.1:13133` after the configured retries. |
+| `HEALTH_UNHEALTHY` | The endpoint answered with a non-200 (commonly 503 during a crash-loop). |
+| `PROFILER_REGISTRY_MALFORMED` | An empty element in the W3SVC/WAS `Environment` REG_MULTI_SZ. **Prevents IIS from starting** — act-now severity, which is why it outranks every other instrumentation finding. |
+
+### `warn` — exit 2
+
+| Code | Meaning |
+| --- | --- |
+| `DOMAIN_MISSING` | `CORALOGIX_DOMAIN` unset; the collector falls back to whatever the config hardcodes. |
+| `CX_ENVIRONMENT_MISSING` | `CX_ENVIRONMENT` unset; all telemetry from this host is labelled `unspecified`. |
+| `RESOURCE_ATTRS_MISSING` | `OTEL_RESOURCE_ATTRIBUTES` unset; Fleet Management selector attributes will be absent. |
+| `CX_IIS_SERVICES_MISSING` | Instrumented apps exist but the variable is unset — Service ownership will be blank. |
+| `CX_IIS_SERVICES_STALE` | Set on a host with no IIS or no IIS apps; a leftover still being stamped on this host's telemetry. |
+| `CX_IIS_SERVICES_DRIFT` | Set, but does not match the apps present (compared as a **set**, so reordering is not drift). |
+| `IIS_SERVICE_NAME_MISSING` | An app has no `OTEL_SERVICE_NAME` on its pool or in its `web.config`; its spans land under a default name. |
+| `IIS_SERVICE_NAME_DRIFT` | The name found differs from what the current IIS layout implies — the site was renamed or moved after instrumentation. |
+| `PROFILER_NOT_REGISTERED` | No `CORECLR_PROFILER`/`COR_PROFILER` in the service `Environment` — `Register-OpenTelemetryForIIS` never ran. No .NET app on the host is instrumented. |
+| `PROFILER_NOT_ENABLED` | The profiler GUID is registered but `CORECLR_ENABLE_PROFILING` is not `1` — registered and switched off. |
+| `PROFILER_PATH_MISSING` | The profiler DLL the registry points at does not exist (or no `*_PROFILER_PATH*` entry at all). IIS starts and emits nothing. |
+| `AUTO_HOME_MISSING` | `OTEL_DOTNET_AUTO_HOME` unset or pointing at a missing directory — `Install-OpenTelemetryCore` did not complete. |
+| `POOL_NOT_NO_MANAGED_CODE` | An ASP.NET Core app on a pool whose `managedRuntimeVersion` is not `""`. Emits **no** telemetry at all. |
+| `IIS_OTLP_DEFAULTS_MISSING` | No effective `OTEL_EXPORTER_OTLP_ENDPOINT` for a pool (or none on `applicationPoolDefaults`). |
+| `POOL_LOST_INHERITANCE` | A pool declares its own `<environmentVariables>` (which replaces the defaults) and has no endpoint, while the defaults do. |
+| `POOL_ENV_STALE` | A pool's own value disagrees with the current `applicationPoolDefaults` — the block is a snapshot taken when the pool was first written and never refreshes. See the trap below. |
+| `OTLP_ENDPOINT_LOCALHOST` | Endpoint uses `localhost`, which resolves to `::1` first and silently drops export. |
+| `EXPORT_COUNTERS_ZERO` | Nothing has been exported yet. Normal for a collector restarted moments ago; otherwise the exporter is not reaching Coralogix. |
+| `EXPORT_SEND_FAILED` | Non-zero `send_failed`/`enqueue_failed` counters — telemetry is produced but rejected or dropped. |
+| `METRICS_UNREACHABLE` | `127.0.0.1:8888` did not respond, so export volume is unknown. |
+| `PORT_4318_NOT_LISTENING` | Nothing listening on the OTLP HTTP port; instrumented apps have nowhere to send. |
+| `STARTTYPE_NOT_AUTOMATIC` | The service runs now but its StartType is not Automatic — it will not return after a reboot. |
+| `EFFECTIVE_PROCESSOR_MISSING` | `transform/iis_service_labels` is absent from the effective config, so `CX_IIS_SERVICES` is never stamped however correct the variable is. Add it to the **remote** Fleet config. |
+| `EFFECTIVE_PROCESSOR_NOT_WIRED` | The processor is defined but not listed in a required pipeline's `processors`, so it never runs for that signal. |
+| `NODE_PACKAGE_MISSING` | The OTel Node package is not staged under the install prefix. |
+| `NODE_OPTIONS_MISSING` | A PM2 app carries no `NODE_OPTIONS=--require <register>` — it is not instrumented. |
+| `NODE_REGISTER_PATH_STALE` | `NODE_OPTIONS` points at a register bootstrap that no longer exists. |
+| `NODE_SERVICE_NAME_MISSING` | A PM2 app has no `OTEL_SERVICE_NAME`, or `CX_NODE_SERVICES` is unset while apps carry names. |
+| `NODE_SERVICE_NAME_DRIFT` | `CX_NODE_SERVICES` does not match the running apps (set comparison). |
+| `IIS_LOGDIR_NOT_COVERED` | A site writes access logs to a directory no collector `include` matches, so **those logs never reach Coralogix**. Re-run `Instrument-IIS.ps1` to publish `CX_IIS_LOG_DIR_n`, then restart the collector. |
+| `IIS_LOGDIR_SLOTS_EXCEEDED` | More distinct log directories than the config has `CX_IIS_LOG_DIR_n` slots. `${env:VAR}` expands to one scalar and `include:` is a list, so the extras cannot be expressed — consolidate the directories or add slots. |
+| `IIS_LOG_FORMAT_UNSUPPORTED` | The site's `logFormat` is not W3C. The lines tail fine but the `csv_parser` needs the W3C `#Fields:` header, so they arrive unsplit. |
+
+### `info` / `skip` / `unknown` — never affect the exit code
+
+| Code | Severity | Meaning |
+| --- | --- | --- |
+| `INSTRUMENTATION_VERSION_UNKNOWN` | info | No deploy manifest found, so the installed version cannot be confirmed. |
+| `IIS_CENTRAL_LOGGING` | info | `centralLogFileMode` is not `Site`: one log file for the whole host, so per-site attribution is unavailable. A valid IIS setup, not a fault. |
+| `IIS_LOGGING_DISABLED` | info | Access logging is off for this site. The absence of its logs is intended — reported so nobody hunts a collector fault that does not exist. |
+| `IIS_LOGCONFIG_UNREADABLE` | unknown | The logging section of `applicationHost.config` could not be read, so log coverage is unknown. |
+| `NODE_SERVICES_NOT_CONSUMED` | info | `CX_NODE_SERVICES` is set but nothing reads it — see below. |
+| `IIS_ABSENT` | skip | No IIS on this host; the IIS checks do not apply. |
+| `IIS_NO_APPS` | skip | IIS installed but hosting no applications — a legitimate steady state. |
+| `NO_PM2` / `NO_PM2_APPS` | skip | PM2 absent, or present with no apps. |
+| `NOT_SELECTED` | skip | Excluded by `-Only`. |
+| `HELPER_MISSING` | unknown | A required script is not present next to this one; the check could not run. |
+| `CHECK_ERRORED` | unknown | A delegated validator threw; the message carries the exception. |
+| `WEBADMINISTRATION_MISSING` | unknown | `Get-IISServiceMap` failed, so expected names were derived from `applicationHost.config` instead. |
+| `WEBCONFIG_UNREADABLE` | unknown | An app's `web.config` is missing or unreadable, so whether it is ASP.NET Core is unknown. |
+| `POOL_NOT_FOUND` | unknown | An application references a pool not declared in `applicationHost.config`. |
+| `EFFECTIVE_CONFIG_NOT_FOUND` | unknown | Neither the supervisor effective config nor the base collector config exists. |
+| `EFFECTIVE_CONFIG_UNREADABLE` | unknown | The config file exists but could not be read. |
+| `EFFECTIVE_PIPELINE_NOT_FOUND` | unknown | A required pipeline block could not be located to confirm the processor is wired into it. |
+| `NODE_PM2_DAEMON_NOT_VISIBLE` | unknown | PM2 is installed but its app list is empty/unreadable — almost always the wrong user's daemon. **Never** a failure. |
+| `NODE_PM2_NOT_ON_PATH` | unknown | Node processes are running but `pm2` is not on this account's PATH. |
+
+Two codes are computed rather than literal: the `env`/`iisServiceName` checks pick
+`APPHOST_ACCESS_DENIED` vs `APPHOST_UNREADABLE` depending on whether reading
+`applicationHost.config` failed on permissions or on absence.
+
+### `APPHOST_UNREADABLE` when the deployment clearly worked
+
+The confusing shape of this one is worth spelling out: **the doctor says the config
+cannot be read, yet the installer set the pool environment variables just fine.**
+That is not a contradiction, because the two use different mechanisms.
+
+| | how it reaches the config |
+| --- | --- |
+| `Instrument-IIS.ps1` | `appcmd.exe` → the IIS configuration COM API (`ahadmin`) |
+| the diagnostics | a plain file read of `…\inetsrv\config\applicationHost.config` |
+
+Same data on a healthy host. Four things break the file read while leaving `appcmd` working:
+
+| Cause | Message you see | Why `appcmd` survives |
+| --- | --- | --- |
+| **WOW64** — a 32-bit host process | `applicationHost.config not found at …` | `SysWOW64\inetsrv` has `appcmd.exe` but **no** `config\applicationHost.config` (that folder holds only `Schema\` and `Export\`), while the COM API is bitness-agnostic |
+| **IIS Shared Configuration** | `not found`, or silently stale results | `redirection.config` points `appcmd` at the UNC store; a file read still hits the local copy |
+| Install ran as **SYSTEM**, doctor as an admin *user*, config ACL hardened | `access denied … (run elevated)` → `APPHOST_ACCESS_DENIED` | SYSTEM retained access |
+| Transient — WAS rewriting the file mid-read | `could not read/parse …` | `appcmd` writes temp-then-replace; a raw reader can catch it half-written. Passes on re-run |
+
+Since the WOW64 fix, the first row should no longer occur: `deploy.bat` / `uninstall.bat` /
+`doctor.bat` re-launch themselves through `%SystemRoot%\Sysnative\…\powershell.exe` when
+`PROCESSOR_ARCHITEW6432` is defined, and the scripts resolve the directory themselves via
+`Get-CxInetsrvDir` for the case where a `.ps1` is invoked directly from a 32-bit shell. If
+you see it anyway, confirm the bitness from an **elevated** prompt on that host:
+
+```powershell
+[pscustomobject]@{
+  Is64Proc  = [Environment]::Is64BitProcess
+  Native    = Test-Path "$env:windir\System32\inetsrv\config\applicationHost.config"
+  Sysnative = Test-Path "$env:windir\Sysnative\inetsrv\config\applicationHost.config"
+  Shared    = Test-Path "$env:windir\System32\inetsrv\config\redirection.config"
+} | Format-List
+```
+
+`Is64Proc=False` with `Sysnative=True` and `Native=False` is WOW64, conclusively —
+`Sysnative` exists *only* when observed from a 32-bit process. `Shared=True` means IIS
+Shared Configuration. Run it elevated or the result is meaningless: `Test-Path` returns
+`$false` on a permission-denied path, so a non-elevated `Native=False` proves nothing.
+
+> **Why this mattered beyond the diagnostics.** Before the fix, `Instrument-IIS.ps1` and
+> `Uninstall-Agent.ps1` hardcoded the same `System32` path. In a 32-bit host process the
+> install still wrote pool env vars through `appcmd`, but `Backup-DeployFile` snapshotted a
+> path that did not exist and `Test-PoolEnvPresent` returned `$false` for every variable —
+> so the run mutated `applicationHost.config` with **no backup**, and recorded the
+> customer's pre-existing `OTEL_*` values as its own, which uninstall would then delete.
+
 ## Output
 
 Console output is the surface BatchPatch harvests and is designed to stand alone. A machine
@@ -138,8 +268,16 @@ Builds `Dockerfile.doctor` (a lightweight IIS image — no Node, no collector), 
 realistic layout, then asserts each check against a deliberately broken state:
 `CX_IIS_SERVICES` cleared and drifted, a pool put back on managed runtime, stale pool env,
 a malformed profiler registry, a stale profiler DLL path, plus argument handling,
-standalone/aggregator parity, and the read-only invariant. Mutations live in
+standalone/aggregator parity, WOW64, and the read-only invariant. Mutations live in
 `test/docker-win/break-state.ps1` and only ever touch the disposable container.
+
+Group **E** covers the 32-bit case described above: it runs the validators through
+`C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe`, asserts `Get-CxInetsrvDir`
+returns `Sysnative` there and `System32` in a 64-bit process, asserts a 32-bit run reads
+the config rather than reporting `APPHOST_UNREADABLE`, and drives `doctor.bat` from
+`SysWOW64\cmd.exe` to prove the `PROCESSOR_ARCHITEW6432` re-launch works. One case
+deliberately forces the redirected path to confirm the failure is still reproducible —
+otherwise the group could pass because the bug quietly stopped existing.
 
 Container processes run as `ContainerAdministrator`, so the elevation-gated paths execute
 without an interactive UAC prompt.
