@@ -146,6 +146,60 @@ is no file to write the name into.
 
 **Remediation:** add a `web.config`, or move the app to its own pool.
 
+### ✅ "cannot read web.config" on a host where nothing was wrong — FIXED
+
+Reported from a real host, on the app every host has:
+
+```
+[UNKNOWN] poolRuntime[Default Web Site/]  cannot read web.config, so it is unknown
+                                          whether this is an ASP.NET Core app
+                                          needing 'No Managed Code'  (WEBCONFIG_UNREADABLE)
+```
+
+Nothing was wrong. Stock IIS ships `C:\inetpub\wwwroot` with `iisstart.htm` and
+`iisstart.png` and **no `web.config` at all**, and the reader returned the same
+"unknown" for a file that is missing as for one it could not open:
+
+```powershell
+if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
+[xml]$x = Get-Content -LiteralPath $wc -Raw -ErrorAction Stop
+```
+
+So the default site read as a permissions problem on essentially every host in the
+fleet — noise that trains people to ignore the check, right next to the codes that
+do matter.
+
+Those are different answers. ANCM is wired *by* `web.config`, so no `web.config`
+means the app is not ASP.NET Core and the pool's `managedRuntimeVersion` is
+irrelevant — determinate, not unknown.
+
+| State | Code | Severity |
+| --- | --- | --- |
+| no `web.config` (or the physical directory is gone) | `WEBCONFIG_ABSENT` | info |
+| present but unopenable/unparsable, or the app has no `physicalPath` | `WEBCONFIG_UNREADABLE` | unknown, message carries the reason |
+
+Two details the fix depends on:
+
+- **Read through `[System.IO.File]`, not `Test-Path`.** Under
+  `-ErrorAction SilentlyContinue` a `Test-Path` returns `$false` for an
+  access-denied path exactly as it does for a missing one, so keeping it would
+  have inverted the confusion instead of removing it. The .NET exceptions
+  (`FileNotFoundException` / `DirectoryNotFoundException` / everything else)
+  separate the cases cleanly.
+- **Absent does not always mean "not Core".** `<system.webServer>` inherits into
+  child applications, so an app with no `web.config` under a parent that declares
+  `<aspNetCore>` *is* ANCM-hosted. `dotnet publish` emits
+  `<location path="." inheritInChildApplications="false">` precisely to stop this,
+  but hand-written configs often omit it. The check now walks the URL hierarchy —
+  not the filesystem, which is not what IIS inherits along — to the nearest
+  ancestor application that has a `web.config`, and if that one is inheritable
+  Core the child is treated as Core and its pool runtime is still checked. The
+  finding then says `(<aspNetCore> inherited from 'shop/')`.
+
+Pinned by five cases in group C2 of `Run-DoctorTest.ps1`, including the same site
+flipped between `absent` and `unreadable`, and the same child app flipping to Core
+when only the parent's `<location>` wrapper is removed.
+
 ### ⚠️ Re-running the deploy fails while IIS is up — profiler DLLs are locked
 
 `Install-OpenTelemetryCore` replaces the assemblies under
