@@ -54,7 +54,7 @@ Desktop.ini
 # Contents are scratch, with two exceptions that ARE part of the repo: the standalone
 # service-label diagnostics and its runbook section. test/docker-win/Dockerfile does
 # `COPY misc/`, so a fresh clone must contain at least the script or the image build fails.
-misc/*
+
 
 misc/*.log
 
