@@ -31,15 +31,36 @@ REM ===========================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
+REM Always launch the 64-bit PowerShell on 64-bit Windows. PROCESSOR_ARCHITEW6432
+REM is defined only inside a 32-bit process on 64-bit Windows - a 32-bit
+REM BatchPatch/RMM agent, a 32-bit scheduled task, a 32-bit cmd. There
+REM %SystemRoot%\System32 is redirected to SysWOW64, whose inetsrv folder has
+REM appcmd.exe but no config\applicationHost.config, so the doctor would report
+REM APPHOST_UNREADABLE on a perfectly healthy host. The scripts also resolve the
+REM path defensively (Get-CxInetsrvDir), so this is belt and braces.
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if defined PROCESSOR_ARCHITEW6432 if exist "%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe" set "PS=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
 
-REM Build optional args from env vars (each independent; any combination).
+REM Two ways in, and they are mutually exclusive by design:
+REM
+REM   doctor.bat -Only env              command-line args win; env vars ignored
+REM   set CX_DOCTOR_ONLY=env && doctor.bat    for BatchPatch, which generally
+REM                                           cannot pass arguments to a remote command
+REM
+REM They must NOT be combined into one invocation. Passing -Only twice is not
+REM "last one wins" - PowerShell fails parameter binding outright ("parameter
+REM 'Only' is specified more than once"), the script never runs, and BatchPatch
+REM shows a red row with no diagnostics at all. So if any argument was typed, the
+REM env-var block is skipped entirely.
 set ARGS=
+if not "%~1"=="" goto :runargs
+
 if defined CX_DOCTOR_ONLY set ARGS=%ARGS% -Only %CX_DOCTOR_ONLY%
 if defined CX_DOCTOR_QUIET set ARGS=%ARGS% -Quiet
 if defined CX_DOCTOR_NOFILE set ARGS=%ARGS% -NoFileOutput
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Test-Agent.ps1"%ARGS%
+:runargs
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Test-Agent.ps1"%ARGS% %*
 
 set "RC=%ERRORLEVEL%"
 echo doctor.bat exit code: %RC%

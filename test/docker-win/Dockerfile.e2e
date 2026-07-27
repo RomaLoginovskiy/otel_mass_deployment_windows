@@ -1,0 +1,64 @@
+# escape=`
+# Windows E2E image for the FULL deploy loop: install the agent with deploy.bat,
+# instrument a realistically-shaped IIS host, break it, diagnose with doctor.bat,
+# fix it, and confirm the telemetry in Coralogix.
+#
+# How this differs from the other three images, and why it is a separate one:
+#
+#   Dockerfile         E2E for service-ownership. Its entrypoint does the
+#                      instrumenting itself and runs a BAKED collector binary
+#                      directly - so it never exercises deploy.bat or the vendor
+#                      installer at all.
+#   Dockerfile.doctor  offline diagnostics only. No collector, no network.
+#   Dockerfile.e2e     THIS ONE. The entrypoint only PROVISIONS IIS and then waits.
+#                      Every subsequent action - install, instrument, break, fix -
+#                      is driven from outside via `docker exec deploy.bat` /
+#                      `doctor.bat`, which is the whole point: the thing under test
+#                      is the real operator entry point, not a re-implementation
+#                      of it.
+#
+# No Node layers: this is IIS-only, so the image stays small and rebuilds in
+# seconds when deploy/ changes.
+#
+# Build from the REPO ROOT:
+#   docker build -f test/docker-win/Dockerfile.e2e -t cx-e2e-test .
+# Requires Docker in Windows-container mode.
+FROM mcr.microsoft.com/windows/servercore/iis:windowsservercore-ltsc2022
+
+SHELL ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+WORKDIR C:\\cx
+
+# Server Core defaults to legacy TLS. The vendor installer is downloaded from
+# GitHub by Install-CoralogixSupervisor.ps1, so this is load-bearing here in a way
+# it is not for the doctor image: without it the download fails with "The
+# decryption operation failed" and the deploy never reaches IIS.
+RUN Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' -Name SchUseStrongCrypto -Value 1 -Type DWord; `
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319' -Name SchUseStrongCrypto -Value 1 -Type DWord
+
+# The OTel .NET auto-instrumentation archive, PRE-STAGED. Instrument-IIS.ps1 would
+# normally have the vendor module download it, but that download fails in this base
+# with "The decryption operation failed" - the same .NET/Schannel limitation that
+# forced baking the collector binary and the Node.js zip. curl.exe on the same box
+# fetches it fine, so it is fetched on the HOST into the build context:
+#
+#   curl -sL -o test/docker-win/otel-dotnet.zip `
+#     https://github.com/open-telemetry/opentelemetry-dotnet-instrumentation/releases/download/v1.16.0-beta.1/opentelemetry-dotnet-instrumentation-windows.zip
+#
+# CX_OTEL_DOTNET_ARCHIVE is the real, documented offline path (for proxied and
+# air-gapped fleet hosts) - not a test-only hook - so deploy.bat still drives the
+# instrumentation exactly as it would on a real host.
+COPY test/docker-win/otel-dotnet.zip C:/cx/otel-dotnet.zip
+ENV CX_OTEL_DOTNET_ARCHIVE=C:\cx\otel-dotnet.zip
+
+# Provisioning + destructive state mutators. Copied before deploy/ so that editing
+# the scripts under test does not invalidate them.
+COPY test/docker-win/entrypoint.e2e.ps1 C:/cx/entrypoint.e2e.ps1
+COPY test/docker-win/break-state.ps1 C:/cx/break-state.ps1
+
+# The actual thing under test. Last layer.
+COPY deploy/ C:/cx/deploy/
+
+# Send key and domain are supplied at run time (docker run -e ...), never baked in.
+ENV CORALOGIX_DOMAIN=eu1.coralogix.com
+
+ENTRYPOINT ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "C:\\cx\\entrypoint.e2e.ps1"]

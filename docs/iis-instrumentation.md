@@ -41,7 +41,8 @@ The installer requires a config file. Start from the attached `config.yaml` (the
 Before installing, update these values for your environment:
 
 - `exporters.coralogix.domain`: set to your Coralogix domain. The attached file uses `eu1.coralogix.com`.
-- `exporters.coralogix.application_name` and `subsystem_name`: set these to meaningful names. The attached file uses `iis-instrumentation-test` and `SimpleWebApp`, which are placeholders from testing.
+- `exporters.coralogix.subsystem_name`: set this to a meaningful name. The attached file uses `SimpleWebApp`, a placeholder from testing.
+- `exporters.coralogix.application_name`: usually leave it alone. In the fleet base config (`deploy/config.supervisor.yaml`) the application name resolves from `application_name_attributes` — first non-empty of `cx.application.name` → `service.namespace` (machine env var `CX_APPLICATION`) → **`host.name`** → the static `application_name`. Unset `CX_APPLICATION` and each host reports under its own hostname; set it only to group several hosts under one application. See *Application naming* in `docs/fleet-deployment.md`.
 - `private_key` is read from the `CORALOGIX_PRIVATE_KEY` environment variable, which the installer sets for you. Do not paste the key into the file.
 
 ### 2. Run the installer
@@ -77,6 +78,13 @@ Get-EventLog -LogName Application -Source otelcol-contrib -Newest 20
 ```
 
 The config exposes a health check on `127.0.0.1:13133` and internal collector metrics on `127.0.0.1:8888`, which you can use to confirm the collector is healthy.
+
+On a host deployed from the fleet package, `doctor.bat` does all of the above in one
+read-only pass — plus things these commands cannot tell you: whether anything is actually
+being **exported** (`EXPORT_COUNTERS_ZERO` vs `EXPORT_SEND_FAILED`), whether the OTLP
+receiver ports are listening, and whether the CLR profiler is attached. Restrict it to the
+collector with `doctor.bat -Only services,health,exportCounters,ports`. See
+[`agent-diagnostics.md`](./agent-diagnostics.md).
 
 ### 4. Useful install variants
 
@@ -190,10 +198,17 @@ The apps need a few environment variables. The most important are the OTLP endpo
 
 | Variable | Value | Purpose |
 | --- | --- | --- |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Send to the local collector |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://127.0.0.1:4318` | Send to the local collector |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | Match the HTTP endpoint |
 | `OTEL_SERVICE_NAME` | unique per app | Names the service in APM |
 | `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=production,service.version=1.0.0` | Extra APM dimensions |
+
+> ⚠️ **Use `127.0.0.1`, not `localhost`.** On a dual-stack host `localhost` resolves to `::1`
+> first and OTLP export is dropped **with no error** — the app looks healthy and no spans
+> arrive. Several examples further down still show `localhost`; prefer `127.0.0.1` in all of
+> them. `Instrument-IIS.ps1` also still defaults to `http://127.0.0.1:4318`, so a stock fleet
+> deploy raises `OTLP_ENDPOINT_LOCALHOST` on every pool — see
+> [`agent-diagnostics.md`](./agent-diagnostics.md).
 
 > **Environment label.** To split telemetry by environment in Coralogix (Infra
 > Explorer / APM), set `CX_ENVIRONMENT` on the host. `deploy-app.ps1 -Environment
@@ -230,7 +245,7 @@ There are three places to set these, in increasing order of scope.
     <aspNetCore processPath="dotnet" arguments=".\MyApp.dll">
       <environmentVariables>
         <environmentVariable name="OTEL_SERVICE_NAME" value="wallet-api" />
-        <environmentVariable name="OTEL_EXPORTER_OTLP_ENDPOINT" value="http://localhost:4318" />
+        <environmentVariable name="OTEL_EXPORTER_OTLP_ENDPOINT" value="http://127.0.0.1:4318" />
         <environmentVariable name="OTEL_EXPORTER_OTLP_PROTOCOL" value="http/protobuf" />
       </environmentVariables>
     </aspNetCore>
@@ -248,7 +263,7 @@ Registry path:
 HKLM\SYSTEM\CurrentControlSet\Services\W3SVC\Environment
 ```
 
-This is a REG_MULTI_SZ value with one `NAME=VALUE` entry per line. Add lines such as `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`. Do the same under the `WAS` service. Service name is the one thing you usually keep per app rather than host-wide, so set `OTEL_SERVICE_NAME` in each app's config even when everything else is global.
+This is a REG_MULTI_SZ value with one `NAME=VALUE` entry per line. Add lines such as `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318` and `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`. Do the same under the `WAS` service. Service name is the one thing you usually keep per app rather than host-wide, so set `OTEL_SERVICE_NAME` in each app's config even when everything else is global.
 
 There is also a per app pool option: `Enable-OpenTelemetryForIISAppPool -AppPoolName <name>` and its `Disable-` counterpart toggle instrumentation for a single pool. An app pool environment variable takes precedence over the host-wide W3SVC registration. For setting the OTLP variables once across the apps that share a pool, see Part 4.
 
@@ -335,7 +350,7 @@ Import-Module WebAdministration
 
 Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
   -filter "system.applicationHost/applicationPools/applicationPoolDefaults/environmentVariables" `
-  -name "." -value @{name='OTEL_EXPORTER_OTLP_ENDPOINT'; value='http://localhost:4318'}
+  -name "." -value @{name='OTEL_EXPORTER_OTLP_ENDPOINT'; value='http://127.0.0.1:4318'}
 
 Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
   -filter "system.applicationHost/applicationPools/applicationPoolDefaults/environmentVariables" `
@@ -345,7 +360,7 @@ Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
 Or with appcmd from an elevated Command Prompt, one line per variable:
 
 ```bash
-%windir%\system32\inetsrv\appcmd.exe set config -section:system.applicationHost/applicationPools /+"applicationPoolDefaults.environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT',value='http://localhost:4318']" /commit:apphost
+%windir%\system32\inetsrv\appcmd.exe set config -section:system.applicationHost/applicationPools /+"applicationPoolDefaults.environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT',value='http://127.0.0.1:4318']" /commit:apphost
 ```
 
 ### Option B: Set the variables on one shared pool
@@ -356,7 +371,7 @@ Use this when several apps share a single pool and you want the variables scoped
 <applicationPools>
   <add name="SharedAppPool" managedRuntimeVersion="v4.0">
     <environmentVariables>
-      <add name="OTEL_EXPORTER_OTLP_ENDPOINT" value="http://localhost:4318" />
+      <add name="OTEL_EXPORTER_OTLP_ENDPOINT" value="http://127.0.0.1:4318" />
       <add name="OTEL_EXPORTER_OTLP_PROTOCOL" value="http/protobuf" />
       <add name="OTEL_RESOURCE_ATTRIBUTES" value="deployment.environment=production" />
     </environmentVariables>
@@ -374,20 +389,20 @@ $pool = "SharedAppPool"
 
 Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
   -filter "system.applicationHost/applicationPools/add[@name='$pool']/environmentVariables" `
-  -name "." -value @{name='OTEL_EXPORTER_OTLP_ENDPOINT'; value='http://localhost:4318'}
+  -name "." -value @{name='OTEL_EXPORTER_OTLP_ENDPOINT'; value='http://127.0.0.1:4318'}
 ```
 
 or with appcmd:
 
 ```bash
-%windir%\system32\inetsrv\appcmd.exe set config -section:system.applicationHost/applicationPools /+"[name='SharedAppPool'].environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT',value='http://localhost:4318']" /commit:apphost
+%windir%\system32\inetsrv\appcmd.exe set config -section:system.applicationHost/applicationPools /+"[name='SharedAppPool'].environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT',value='http://127.0.0.1:4318']" /commit:apphost
 ```
 
 To change or remove a variable later with appcmd:
 
 ```bash
 REM change an existing value
-%windir%\system32\inetsrv\appcmd.exe set config -section:system.applicationHost/applicationPools /"[name='SharedAppPool'].environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT'].value:'http://localhost:4318'" /commit:apphost
+%windir%\system32\inetsrv\appcmd.exe set config -section:system.applicationHost/applicationPools /"[name='SharedAppPool'].environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT'].value:'http://127.0.0.1:4318'" /commit:apphost
 
 REM remove one variable
 %windir%\system32\inetsrv\appcmd.exe set config -section:system.applicationHost/applicationPools /"[name='SharedAppPool'].environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT']" /commit:apphost
@@ -427,19 +442,29 @@ $u='https://github.com/coralogix/telemetry-shippers/releases/latest/download/cor
 
 ## Troubleshooting
 
-**Spans arrive but the APM Service Catalog or span metrics stay empty.** This is the exact issue hit at the end of the session: trace data was visible under tracing, but APM metrics were not generating. Likely causes: the `service.name` contains dots or hyphens that need normalizing, or the span-metrics connector is not producing metrics. Confirm the `spanmetrics` connector is in the traces pipeline, check that spans carry `http.response.status_code` (semantic conventions 1.21 or later) for error tracking, and review the service naming. Give it a few minutes after a change, since span metrics flush on an interval.
+**Start with the doctor.** On a host deployed from the `deploy/` package, `doctor.bat` is
+read-only and answers most of the entries below with a specific finding code instead of a
+guess; `Test-IISInstrumentation.ps1` runs just the IIS half. Exit `0` pass / `1` hard fail /
+`2` degraded. Every code is listed in [`agent-diagnostics.md`](./agent-diagnostics.md).
+
+**Spans arrive but the APM Service Catalog or span metrics stay empty.** First confirm data
+is leaving the box at all — the doctor's `exportCounters` check distinguishes
+`EXPORT_COUNTERS_ZERO` (nothing exported) from `EXPORT_SEND_FAILED` (exported and rejected);
+zero counters means the problem is upstream of the connector, not in it. This is the exact issue hit at the end of the session: trace data was visible under tracing, but APM metrics were not generating. Likely causes: the `service.name` contains dots or hyphens that need normalizing, or the span-metrics connector is not producing metrics. Confirm the `spanmetrics` connector is in the traces pipeline, check that spans carry `http.response.status_code` (semantic conventions 1.21 or later) for error tracking, and review the service naming. Give it a few minutes after a change, since span metrics flush on an interval.
 
 **"Could not find path to OpenTelemetry" or the module is not found.** The register or install step ran before the module was imported or the core files were installed. Run the steps in order: download, `Import-Module`, `Install-OpenTelemetryCore`, then `Register-OpenTelemetryForIIS`.
 
-**No telemetry from an ASP.NET Core app.** The app pool is probably not set to "No Managed Code". Fix the pool and recycle it.
+**No telemetry from an ASP.NET Core app.** The app pool is probably not set to "No Managed Code". Fix the pool and recycle it. Reported per app as `POOL_NOT_NO_MANAGED_CODE`, naming the pool. If that passes and there is still nothing, look for `PROFILER_NOT_REGISTERED` (the register step never ran on this host), `PROFILER_PATH_MISSING` (the profiler DLL the registry points at was deleted — IIS starts and emits nothing), and `OTLP_ENDPOINT_LOCALHOST`.
 
-**Service fails to start.** Common causes: the config uses an IIS or `file_storage` feature the host is missing (install the IIS role, or re-run with `-EnableDynamicIISParsing`), the config is invalid (run the `validate` command), or `CORALOGIX_PRIVATE_KEY` is not set on the service. Check `Get-EventLog -LogName Application -Source otelcol-contrib -Newest 20`.
+**Endpoint fixed centrally but the pools still export nowhere.** A pool with its own `<environmentVariables>` block **replaces** `applicationPoolDefaults` rather than merging with it, and IIS copies the defaults into that block the first time `appcmd` writes any variable to the pool. That copy never refreshes, so later edits to the defaults never reach an already-instrumented pool. Reported as `POOL_ENV_STALE`; fix by re-running `Instrument-IIS.ps1` and recycling the pool. (See Part 4, "Where the variables can live, and what wins".)
+
+**Service fails to start.** Common causes: the config uses an IIS or `file_storage` feature the host is missing (install the IIS role, or re-run with `-EnableDynamicIISParsing`), the config is invalid (run the `validate` command), or `CORALOGIX_PRIVATE_KEY` is not set on the service. Check `Get-EventLog -LogName Application -Source otelcol-contrib -Newest 20`. The doctor's `services` check separates `COLLECTOR_SERVICE_MISSING`, `COLLECTOR_SERVICE_STOPPED`, `COLLECTOR_PROCESS_MISSING` (supervisor up but the collector child is crash-looping) and `STARTTYPE_NOT_AUTOMATIC` (running now, but will not come back after a reboot).
 
 **GitHub download fails with an SSL/TLS error.** The host is defaulting to TLS 1.0. Enable TLS 1.2 first: `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12`.
 
 **PowerShell execution policy blocks the script.** Run `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`, or launch with `powershell -ExecutionPolicy Bypass`.
 
-**IIS will not start after editing the registry variables.** A trailing empty line in the REG_MULTI_SZ triggers "cannot contain empty strings". Remove the blank entry.
+**IIS will not start after editing the registry variables.** A trailing empty line in the REG_MULTI_SZ triggers "cannot contain empty strings". Remove the blank entry. `Test-IISInstrumentation.ps1` detects the empty element as `PROFILER_REGISTRY_MALFORMED` — the **only** instrumentation finding graded as a hard fail (exit `1`), because it stops IIS rather than merely degrading telemetry. Run it **before** the next `iisreset` on a host whose registry you have hand-edited.
 
 ---
 
@@ -454,7 +479,7 @@ The goal from the session was a small set of repeatable templates keyed to what 
 | App already has the OpenTelemetry SDK in code | Collector only; point the app at `localhost:4317` or `4318` |
 | Linux box (for example with Redis) | Separate Linux collector config with the matching receivers; not covered here |
 | Windows box running RabbitMQ | Collector base + the RabbitMQ fragment `deploy/templates/rabbitmq.yaml` (adds the `rabbitmq` receiver + `filelog/rabbitmq`); see `deploy/templates/README.md` |
-| Node.js front end | Node.js auto-instrumentation; a separate template, to be validated |
+| Node.js app under **PM2** | Zero-code via `NODE_OPTIONS=--require @opentelemetry/auto-instrumentations-node/register` + per-app `OTEL_SERVICE_NAME`. Implemented, shipped, and validated E2E — see [`nodejs-pm2-instrumentation.md`](./nodejs-pm2-instrumentation.md) |
 
 Redis, RabbitMQ and similar components are optional add-ons rather than a baseline, so keep them as separate template fragments layered on the vanilla config only where that component actually runs. The Windows per-workload fragments live in `deploy/templates/` (mirroring `deploy-linux/templates/`).
 

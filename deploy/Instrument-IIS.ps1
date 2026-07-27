@@ -48,6 +48,19 @@ param(
     [string]    $Version              = 'v1.16.0-beta.1',
     [string]    $OtlpEndpoint          = 'http://localhost:4318',
     [switch]    $NoReset,
+    # Pre-staged copies, for hosts that cannot reach GitHub: an outbound proxy, an
+    # air-gapped network, or a TLS stack that cannot complete the download (Windows
+    # Server Core containers fail the archive fetch with "The decryption operation
+    # failed" while curl.exe on the same box succeeds).
+    #
+    # Both also read an env var, so a fleet can stage the files once and set the
+    # variables machine-wide instead of threading flags through deploy.bat.
+    #   -LocalArchive / CX_OTEL_DOTNET_ARCHIVE  the *-windows.zip release archive,
+    #                                           passed to Install-OpenTelemetryCore
+    #                                           -LocalPath
+    #   -LocalModule  / CX_OTEL_DOTNET_MODULE   OpenTelemetry.DotNet.Auto.psm1
+    [string]    $LocalArchive          = $env:CX_OTEL_DOTNET_ARCHIVE,
+    [string]    $LocalModule           = $env:CX_OTEL_DOTNET_MODULE,
     [hashtable] $ServiceNameOverrides  = @{},
     [string]    $OverridesJson,
     # Optional backup/manifest session (from Backup-Config.ps1, created by the
@@ -82,12 +95,34 @@ if (Test-Path $backupHelper) { . $backupHelper }
 $module_url    = "https://github.com/open-telemetry/opentelemetry-dotnet-instrumentation/releases/download/$Version/OpenTelemetry.DotNet.Auto.psm1"
 $download_path = Join-Path $env:TEMP 'OpenTelemetry.DotNet.Auto.psm1'
 
-Write-Host "[iis-instr] downloading auto-instrumentation module $Version ..."
-Invoke-WebRequest -Uri $module_url -OutFile $download_path -UseBasicParsing
+if ($LocalModule -and (Test-Path -LiteralPath $LocalModule)) {
+    $download_path = $LocalModule
+    Write-Host "[iis-instr] using pre-staged module: $LocalModule"
+} else {
+    # A leftover, still-locked temp file from an interrupted earlier run makes this
+    # fail with "the process cannot access the file", which reads like a permissions
+    # problem and is not. Clear it first.
+    if (Test-Path -LiteralPath $download_path) {
+        Remove-Item -LiteralPath $download_path -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "[iis-instr] downloading auto-instrumentation module $Version ..."
+    Invoke-WebRequest -Uri $module_url -OutFile $download_path -UseBasicParsing
+}
 
 Import-Module $download_path -Force
 Write-Host "[iis-instr] Install-OpenTelemetryCore ..."
-Install-OpenTelemetryCore
+if ($LocalArchive) {
+    # -LocalPath makes the vendor module install from a pre-staged archive instead
+    # of downloading it. Fail loudly on a bad path rather than silently falling
+    # back to the download an air-gapped host cannot do.
+    if (-not (Test-Path -LiteralPath $LocalArchive)) {
+        throw "LocalArchive not found: $LocalArchive (from -LocalArchive or CX_OTEL_DOTNET_ARCHIVE)"
+    }
+    Write-Host "[iis-instr] installing from pre-staged archive: $LocalArchive"
+    Install-OpenTelemetryCore -LocalPath $LocalArchive
+} else {
+    Install-OpenTelemetryCore
+}
 
 # Snapshot the CLR-profiler registry (REG_MULTI_SZ Environment) BEFORE the vendor
 # register writes it, and mark the run as IIS-instrumented in the manifest.
@@ -102,9 +137,28 @@ Write-Host "[iis-instr] Register-OpenTelemetryForIIS ..."
 if ($NoReset) { Register-OpenTelemetryForIIS -NoReset } else { Register-OpenTelemetryForIIS }
 
 # ---- 2. Host-wide OTLP endpoint via applicationPoolDefaults -------------------
-$appcmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
+# WOW64. In a 32-bit process on 64-bit Windows the file system redirector
+# rewrites %windir%\System32 to %windir%\SysWOW64. SysWOW64\inetsrv exists and
+# holds appcmd.exe; its config\ folder holds only Schema\ and Export\, never
+# applicationHost.config. Hardcoding System32 here
+# is therefore silently dangerous rather than merely wrong: appcmd keeps working
+# (it goes through the bitness-agnostic ahadmin COM API and mutates the real
+# config), while $appHostConfig points at a file that does not exist - so
+# Backup-DeployFile below snapshots nothing and Test-PoolEnvPresent returns
+# $false for every variable, making the uninstaller believe it added entries
+# that were really the customer's. Writes without a backup, in other words.
+#
+# %windir%\Sysnative is the un-redirected view of the real System32 and exists
+# ONLY from a 32-bit process. Branch on process bitness, not on Test-Path:
+# Test-Path returns $false on an access-denied path.
+$inetsrv = if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOperatingSystem) {
+    Join-Path $env:windir 'Sysnative\inetsrv'
+} else {
+    Join-Path $env:windir 'System32\inetsrv'
+}
+$appcmd = Join-Path $inetsrv 'appcmd.exe'
 if (-not (Test-Path $appcmd)) { throw "appcmd.exe not found - is the IIS management role installed?" }
-$appHostConfig = Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'
+$appHostConfig = Join-Path $inetsrv 'config\applicationHost.config'
 
 function Test-PoolEnvPresent {
     # True if an environment variable is already declared on a pool (or, when
@@ -131,10 +185,20 @@ function Set-PoolDefaultEnv {
         Backup-DeployFile -Session $Session -Path $appHostConfig | Out-Null
         Record-PoolEnv    -Session $Session -Pool 'applicationPoolDefaults' -Name $Name -Value $Value -Preexisted (Test-PoolEnvPresent -Pool '' -Name $Name)
     }
-    # Idempotent: remove any existing entry, then add. Removal is best-effort.
+    # Idempotent: remove any existing entry, then add.
+    #
+    # BOTH lines address applicationPoolDefaults WITHOUT a [name=...] predicate on
+    # the parent - that predicate selects an element of the `add` collection (a named
+    # pool), and applicationPoolDefaults is not one. The remove used to carry
+    # "/-[name='applicationPoolDefaults']...", which silently matched nothing; the
+    # following add then hit an existing element and left the OLD value in place.
+    # Net effect: this function could only ever write a value ONCE. Changing
+    # -OtlpEndpoint and re-running did nothing to the defaults, so the documented
+    # remediation for POOL_ENV_STALE ("re-run Instrument-IIS.ps1") did not work.
+    # Found by the E2E loop, which measured defaults and pools disagreeing after a
+    # re-run. Removal is still best-effort: a first run has nothing to remove.
     & $appcmd set config -section:system.applicationHost/applicationPools `
-        "/-[name='applicationPoolDefaults'].environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
-    # applicationPoolDefaults is addressed without a [name=...] predicate on the parent.
+        "/-applicationPoolDefaults.environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
     & $appcmd set config -section:system.applicationHost/applicationPools `
         "/+applicationPoolDefaults.environmentVariables.[name='$Name',value='$Value']" /commit:apphost | Out-Null
     Write-Host "[iis-instr] applicationPoolDefaults env: $Name=$Value"
@@ -184,6 +248,9 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
     }
 } else {
     Write-Host "[iis-instr] assigning per-app OTEL_SERVICE_NAME ($(@($svcMap).Count) app(s)):"
+    # Only apps whose name assignment actually SUCCEEDED. CX_IIS_SERVICES is built
+    # from this, not from $svcMap - see the comment at the label value below.
+    $namedApps = New-Object System.Collections.ArrayList
     foreach ($r in $svcMap) {
         Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}]" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope)
         if ($r.Scope -eq 'pool') {
@@ -192,18 +259,35 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'           -Value $r.ServiceName
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+            [void]$namedApps.Add($r)
         } else {
             # Shared pool: keep inheriting OTLP defaults, set only the per-app name in web.config.
-            [void](Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName -Session $Session)
+            # Set-WebConfigServiceName returns $false when it declines - no web.config,
+            # or a classic ASP.NET Framework app with no <aspNetCore> node to write into.
+            if (Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName -Session $Session) {
+                [void]$namedApps.Add($r)
+            }
         }
     }
 
-    # Machine env var CX_IIS_SERVICES = comma-joined distinct IIS service name(s), built from
-    # the SAME $svcMap whose .ServiceName was just assigned as each app's OTEL_SERVICE_NAME
-    # above. The collector's transform/iis_service_labels processor (remote Fleet config)
-    # splits it into an array and stamps it onto INFRASTRUCTURE telemetry, so every host
-    # Service-ownership item equals a per-app OTEL_SERVICE_NAME (APM service name) - aligned.
-    $iisServices = Get-IISServiceLabelValue -Map $svcMap
+    $unnamed = @($svcMap).Count - $namedApps.Count
+    if ($unnamed -gt 0) {
+        Write-Warning "[iis-instr] $unnamed app(s) could not be given an OTEL_SERVICE_NAME (see the warnings above). They are EXCLUDED from CX_IIS_SERVICES so the host does not claim ownership of a service that emits nothing."
+    }
+
+    # Machine env var CX_IIS_SERVICES = comma-joined distinct IIS service name(s).
+    # The collector's transform/iis_service_labels processor (remote Fleet config)
+    # splits it into an array and stamps it onto INFRASTRUCTURE telemetry, so every
+    # host Service-ownership item equals a per-app OTEL_SERVICE_NAME (APM service
+    # name) - the alignment guarantee in docs/iis-service-ownership.md.
+    #
+    # Built from $namedApps, NOT $svcMap. Using the full map broke the guarantee for
+    # any app whose name could not be written (shared pool + no web.config, or an
+    # ASP.NET Framework app with no <aspNetCore> node): the host advertised ownership
+    # of a service nothing emits, and because the doctor compares the variable
+    # against the names actually present, CX_IIS_SERVICES_DRIFT was reported
+    # PERMANENTLY - re-running could never clear it. Found by the E2E loop.
+    $iisServices = Get-IISServiceLabelValue -Map @($namedApps.ToArray())
     if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
         $priorIisSvc = [Environment]::GetEnvironmentVariable('CX_IIS_SERVICES', 'Machine')
         Record-EnvChange -Session $Session -Name 'CX_IIS_SERVICES' -PriorValue $priorIisSvc
@@ -211,6 +295,65 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
     [Environment]::SetEnvironmentVariable('CX_IIS_SERVICES', $iisServices, 'Machine')
     $env:CX_IIS_SERVICES = $iisServices
     Write-Host "[iis-instr] set machine CX_IIS_SERVICES=$iisServices (collector stamps it on infra telemetry)" -ForegroundColor Green
+}
+
+# ---- 2c. Publish the IIS access-log directories -------------------------------
+# The collector's filelog/iis receiver ships ONE hardcoded include:
+# C:\inetpub\logs\LogFiles\W3SVC*\*.log. A site with its own logFile directory, or
+# a host using central W3C logging, writes somewhere that glob never matches - so
+# its access logs simply never arrive, silently. Publish the directories the
+# default does not already cover into the fixed CX_IIS_LOG_DIR_n slots the config
+# template reads.
+#
+# Slots, not a list: ${env:VAR} expands to ONE scalar and an OTel `include:` is a
+# list, so a single variable cannot become N entries. Overflow is reported, never
+# dropped quietly.
+$logLib = Join-Path $PSScriptRoot 'Resolve-IISLogPaths.ps1'
+if (Test-Path $logLib) {
+    . $logLib
+    $logCfg = Get-IISLogConfig
+    if (-not $logCfg.Ok) {
+        Write-Warning "[iis-instr] could not read the IIS log configuration: $($logCfg.Error)"
+    } else {
+        $logDirs = Get-IISLogDirValue -Config $logCfg
+        $slotInfo = Get-IISLogDirSlots -Value $logDirs
+
+        # Empty slots are written as $null on purpose: a slot left over from a
+        # previous deploy would otherwise keep pointing the collector at a log
+        # directory that no longer belongs to any site.
+        foreach ($k in $slotInfo.Slots.Keys) {
+            $v = $slotInfo.Slots[$k]
+            if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+                Record-EnvChange -Session $Session -Name $k -PriorValue ([Environment]::GetEnvironmentVariable($k, 'Machine'))
+            }
+            $set = if ($v) { $v } else { $null }
+            [Environment]::SetEnvironmentVariable($k, $set, 'Machine')
+            Set-Item -Path "env:$k" -Value $v -ErrorAction SilentlyContinue
+        }
+
+        if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+            Record-EnvChange -Session $Session -Name 'CX_IIS_LOG_DIRS' -PriorValue ([Environment]::GetEnvironmentVariable('CX_IIS_LOG_DIRS', 'Machine'))
+        }
+        [Environment]::SetEnvironmentVariable('CX_IIS_LOG_DIRS', $(if ($logDirs) { $logDirs } else { $null }), 'Machine')
+        $env:CX_IIS_LOG_DIRS = $logDirs
+
+        if ($logDirs) {
+            Write-Host "[iis-instr] non-default IIS log directories -> $logDirs" -ForegroundColor Green
+        } else {
+            Write-Host "[iis-instr] all IIS access logs are under the collector's default path; no extra log slots needed"
+        }
+        if ($logCfg.CentralMode -ne 'Site') {
+            Write-Host "[iis-instr] centralLogFileMode=$($logCfg.CentralMode): one log for the whole host, per-site attribution unavailable" -ForegroundColor Yellow
+        }
+        foreach ($s in @($logCfg.Sites | Where-Object { $_.Enabled -and $_.Format -ne 'W3C' })) {
+            Write-Warning "[iis-instr] site '$($s.Name)' logs in $($s.Format) format - the collector can tail it but cannot field-parse it (W3C '#Fields:' header required)"
+        }
+        foreach ($o in @($slotInfo.Overflow)) {
+            Write-Warning "[iis-instr] no free log slot for '$o' - the collector config declares $($slotInfo.SlotCount) CX_IIS_LOG_DIR_n slots. Add slots to the config template or consolidate the log directories."
+        }
+    }
+} else {
+    Write-Warning "[iis-instr] Resolve-IISLogPaths.ps1 not found next to this script - IIS log directories were not published"
 }
 
 # ---- 3. Recycle IIS -----------------------------------------------------------
