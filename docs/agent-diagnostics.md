@@ -185,7 +185,8 @@ otherwise any `warn` → `2`, otherwise `0`. `info` / `skip` / `unknown` never m
 | `HELPER_MISSING` | unknown | A required script is not present next to this one; the check could not run. |
 | `CHECK_ERRORED` | unknown | A delegated validator threw; the message carries the exception. |
 | `WEBADMINISTRATION_MISSING` | unknown | `Get-IISServiceMap` failed, so expected names were derived from `applicationHost.config` instead. |
-| `WEBCONFIG_UNREADABLE` | unknown | An app's `web.config` is missing or unreadable, so whether it is ASP.NET Core is unknown. |
+| `WEBCONFIG_ABSENT` | info | The app has no `web.config`, so it is not ASP.NET Core and needs no "No Managed Code" pool. **Expected on the stock `Default Web Site`** — `C:\inetpub\wwwroot` ships `iisstart.htm` and no `web.config`. Only worrying if you believe you deployed an ASP.NET Core app to that path, in which case the publish output is incomplete and IIS is not routing to ANCM either. When the physical directory itself is gone, the message says so. |
+| `WEBCONFIG_UNREADABLE` | unknown | An app's `web.config` exists but could not be opened or parsed (ACL, lock, malformed XML), or the application has no `physicalPath`, so whether it is ASP.NET Core is unknown. The message carries the underlying reason. Distinct from `WEBCONFIG_ABSENT`. |
 | `POOL_NOT_FOUND` | unknown | An application references a pool not declared in `applicationHost.config`. |
 | `EFFECTIVE_CONFIG_NOT_FOUND` | unknown | Neither the supervisor effective config nor the base collector config exists. |
 | `EFFECTIVE_CONFIG_UNREADABLE` | unknown | The config file exists but could not be read. |

@@ -238,6 +238,54 @@ $r = Invoke-Doctor -ScriptFile 'Test-NodeInstrumentation.ps1'
 Assert-Case -Name 'Test-NodeInstrumentation standalone, no PM2 => exit 0' -Result $r -ExpectExit 0 -Expect @('NO_PM2')
 
 Write-Host ''
+Write-Host '== C2. web.config presence vs readability ==' -ForegroundColor Cyan
+
+# Stock IIS ships C:\inetpub\wwwroot with iisstart.htm and NO web.config, so the
+# Default Web Site hits this path on essentially every real host. Reporting it as
+# "cannot read web.config" made a normal static site look like an ACL problem.
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+Assert-Case -Name 'stock Default Web Site: absent, not unreadable' -Result $r `
+    -Expect @('WEBCONFIG_ABSENT', 'Normal for the stock Default Web Site') `
+    -Reject @('WEBCONFIG_UNREADABLE')
+
+# C2b. A web.config that exists but does not parse IS unknown, and the message has
+#      to carry the reason - an ACL and malformed XML need different remediations.
+$null = Invoke-BreakSite -Case 'webConfigMalformed' -Site 'blog'
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+Assert-Case -Name 'malformed web.config is UNREADABLE with a reason' -Result $r -Expect @(
+    'WEBCONFIG_UNREADABLE', 'not well-formed XML'
+)
+
+# C2c. Deleting it flips the same site to absent. Same app, opposite finding: that
+#      is the distinction the split exists for.
+$null = Invoke-BreakSite -Case 'webConfigRemove' -Site 'blog'
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+Assert-Case -Name 'deleted web.config is ABSENT, not unreadable' -Result $r `
+    -Expect @('WEBCONFIG_ABSENT') -Reject @('WEBCONFIG_UNREADABLE')
+$null = Invoke-BreakSite -Case 'webConfigRestore' -Site 'blog'
+
+# C2d. A child app with no web.config under a NON-inheriting parent really is not
+#      ASP.NET Core - inheritInChildApplications="false" is what publish emits.
+$null = Invoke-BreakSite -Case 'childNoWebConfig' -Site 'shop'
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+Assert-Case -Name 'child of a non-inheriting parent is absent' -Result $r -Expect @(
+    'WEBCONFIG_ABSENT', 'shop/child'
+)
+
+# C2e. Drop the <location> wrapper and <system.webServer> flows downward, so the
+#      SAME child IS an ASP.NET Core app and its pool runtime does matter. Missing
+#      this would silently skip the No-Managed-Code check for the app.
+$null = Invoke-BreakSite -Case 'webConfigInherit' -Site 'shop'
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+Assert-Case -Name 'child inherits <aspNetCore> from an inheriting parent' -Result $r -Expect @(
+    "inherited from 'shop/'"
+)
+$null = Invoke-BreakSite -Case 'webConfigRestore' -Site 'shop'
+# Undo the extra app: a second app on the pool would flip shop from pool scope to
+# web.config scope and move the later groups' expected names out from under them.
+$null = Invoke-BreakSite -Case 'removeChildApp' -Site 'shop'
+
+Write-Host ''
 Write-Host '== D. broken states ==' -ForegroundColor Cyan
 
 # D1. CX_IIS_SERVICES cleared - the original customer incident.

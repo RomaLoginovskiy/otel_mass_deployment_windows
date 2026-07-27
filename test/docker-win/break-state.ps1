@@ -30,9 +30,17 @@
   logCentralW3C      switch the host to central W3C logging
   restoreLogCentral  undo logCentralW3C
   clearLogSlots      remove the machine CX_IIS_LOG_DIR_n slots
+  webConfigRemove    delete a site's web.config entirely
+  webConfigMalformed replace a site's web.config with XML that does not parse
+  webConfigInherit   rewrite a site's web.config so <aspNetCore> is NOT wrapped in
+                     <location inheritInChildApplications="false">, i.e. it flows
+                     into child applications
+  webConfigRestore   put back the location-wrapped ASP.NET Core web.config
+  childNoWebConfig   add a child application under a site with NO web.config
+  removeChildApp     undo childNoWebConfig (leave the site single-app again)
 
 .PARAMETER Site
-  Which site the log cases act on. Default: shop
+  Which site the log and web.config cases act on. Default: shop
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +49,9 @@ param(
                  'poolManagedRuntime','restorePoolRuntime','poolEnvStale',
                  'profilerMalformed','profilerStalePath','profilerClear',
                  'logDirCustom','restoreLogDir','logFormatIis','logDisabled',
-                 'logCentralW3C','restoreLogCentral','clearLogSlots')]
+                 'logCentralW3C','restoreLogCentral','clearLogSlots',
+                 'webConfigRemove','webConfigMalformed','webConfigInherit',
+                 'webConfigRestore','childNoWebConfig','removeChildApp')]
     [string] $Case,
     [string] $Pool = 'shop',
     [string] $Site = 'shop',
@@ -200,5 +210,79 @@ switch ($Case) {
         }
         [Environment]::SetEnvironmentVariable('CX_IIS_LOG_DIRS', $null, 'Machine')
         Write-Host 'cleared CX_IIS_LOG_DIR_1..3 and CX_IIS_LOG_DIRS'
+    }
+
+    # ---- web.config presence / shape ---------------------------------------
+    # "no web.config" and "web.config cannot be read" are different answers and
+    # must not collapse into one finding: the stock Default Web Site has no
+    # web.config at all, so conflating them reported an ACL problem on every host.
+
+    'webConfigRemove' {
+        $p = "C:\inetpub\$Site\web.config"
+        if (Test-Path -LiteralPath $p) { [IO.File]::Delete($p) }
+        Write-Host "removed $p"
+    }
+
+    'webConfigMalformed' {
+        # Unclosed tag: [xml] throws, which is the 'unreadable' branch. A real host
+        # reaches this via a half-written deploy - and IIS itself 500.19s on it.
+        Set-Content -LiteralPath "C:\inetpub\$Site\web.config" -Encoding utf8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <aspNetCore processPath="dotnet"
+'@
+        Write-Host "site '$Site' web.config is now malformed XML"
+    }
+
+    'webConfigInherit' {
+        # No <location> wrapper, so <system.webServer> flows into child applications.
+        # `dotnet publish` emits inheritInChildApplications="false" to prevent exactly
+        # this; a hand-written config often does not.
+        Set-Content -LiteralPath "C:\inetpub\$Site\web.config" -Encoding utf8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <aspNetCore processPath="dotnet" arguments=".\App.dll" hostingModel="inprocess" />
+  </system.webServer>
+</configuration>
+'@
+        Write-Host "site '$Site' web.config now INHERITS <aspNetCore> into child apps"
+    }
+
+    'webConfigRestore' {
+        Set-Content -LiteralPath "C:\inetpub\$Site\web.config" -Encoding utf8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <location path="." inheritInChildApplications="false">
+    <system.webServer>
+      <aspNetCore processPath="dotnet" arguments=".\App.dll" hostingModel="inprocess" />
+    </system.webServer>
+  </location>
+</configuration>
+'@
+        Write-Host "site '$Site' web.config restored (location-wrapped, non-inheriting)"
+    }
+
+    'childNoWebConfig' {
+        Import-Module WebAdministration
+        $p = "C:\inetpub\$Site\child"
+        New-Item -ItemType Directory -Force -Path $p | Out-Null
+        Set-Content -LiteralPath "$p\index.html" -Value '<h1>child</h1>' -Encoding utf8
+        if (-not (Get-WebApplication -Site $Site -Name 'child' -ErrorAction SilentlyContinue)) {
+            New-WebApplication -Site $Site -Name 'child' -PhysicalPath $p -ApplicationPool $Site | Out-Null
+        }
+        Write-Host "added application '$Site/child' with no web.config"
+    }
+
+    'removeChildApp' {
+        # Must be undone: a second app on the pool flips Resolve-IISServiceNames
+        # from pool scope to web.config scope, which would move later cases'
+        # expected service names out from under them.
+        Import-Module WebAdministration
+        if (Get-WebApplication -Site $Site -Name 'child' -ErrorAction SilentlyContinue) {
+            Remove-WebApplication -Site $Site -Name 'child'
+        }
+        Write-Host "removed application '$Site/child'"
     }
 }

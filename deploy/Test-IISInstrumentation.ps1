@@ -352,31 +352,114 @@ function Get-CxAppHostModel {
     return $model
 }
 
-function Test-CxAspNetCoreApp {
+function Get-CxWebConfigCoreState {
     <#
-      True when an app's web.config declares <aspNetCore> - i.e. it is an
-      ASP.NET Core app and therefore REQUIRES a "No Managed Code" pool.
+      Does this app's own web.config declare <aspNetCore> - i.e. is it an
+      ASP.NET Core app, which REQUIRES a "No Managed Code" pool?
 
-      Matches with //aspNetCore because the publish output commonly wraps the
-      node in <location path="." ...> rather than putting it directly under
+      Returns a state, not a tri-state boolean, because "there is no web.config"
+      and "web.config could not be read" are DIFFERENT ANSWERS and reporting them
+      as one produced a wrong diagnosis on essentially every host in the fleet:
+      stock IIS ships C:\inetpub\wwwroot with iisstart.htm and no web.config at
+      all, so "Default Web Site/" always came back as unreadable and read like a
+      permissions problem.
+
+        nopath      the application has no physicalPath in applicationHost.config
+        absent      no web.config there (DirMissing says whether the folder is
+                    gone too). ANCM is wired BY web.config, so barring inheritance
+                    from a parent application this is NOT an ASP.NET Core app
+        unreadable  it exists but could not be opened or parsed - Error carries
+                    the reason, which is the only way to tell an ACL apart from
+                    malformed XML
+        ok          parsed; IsCore is authoritative
+
+      Matched with //aspNetCore because the publish output commonly wraps the node
+      in <location path="." ...> rather than putting it directly under
       <system.webServer> - the same reason Set-WebConfigServiceName does.
 
-      Returns $null (not $false) when the answer is unknowable: no physical path,
-      missing or unreadable web.config. Callers must not treat that as "no".
+      Inheritable reports whether that <location> lets the setting flow into child
+      applications. `dotnet publish` emits inheritInChildApplications="false"
+      precisely to stop it; when it is absent, a child app with no web.config of
+      its own still gets ANCM from the parent.
+
+      Reads through [System.IO.File] rather than Test-Path/Get-Content on purpose:
+      the .NET exceptions distinguish not-found from access-denied, where a
+      Test-Path under SilentlyContinue returns $false for both.
     #>
     [CmdletBinding()]
     param([string] $PhysicalPath)
 
-    if (-not $PhysicalPath) { return $null }
+    # $Reason, not $Error: a parameter named Error would shadow the automatic
+    # $Error collection inside this function.
+    function New-State {
+        param($State, $IsCore, $Inheritable = $false, $DirMissing = $false, $Reason = $null)
+        [pscustomobject]@{
+            State = $State; IsCore = $IsCore; Inheritable = $Inheritable
+            DirMissing = $DirMissing; Error = $Reason
+        }
+    }
+
+    if (-not $PhysicalPath) {
+        return (New-State 'nopath' $null -Reason 'the application has no physicalPath in applicationHost.config, so its web.config cannot be located')
+    }
+
+    $wc = Join-Path $PhysicalPath 'web.config'
+    $raw = $null
     try {
-        $wc = Join-Path $PhysicalPath 'web.config'
-        # SilentlyContinue: an access-denied Test-Path emits a non-terminating
-        # error that escapes this try/catch under 'Continue'. We return $null
-        # (unknown) either way, but the console must stay clean.
-        if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
-        [xml]$x = Get-Content -LiteralPath $wc -Raw -ErrorAction Stop
-        return [bool]$x.SelectSingleNode('//aspNetCore')
-    } catch { return $null }
+        $raw = [System.IO.File]::ReadAllText($wc)
+    } catch [System.IO.DirectoryNotFoundException] {
+        return (New-State 'absent' $false -DirMissing $true)
+    } catch [System.IO.FileNotFoundException] {
+        return (New-State 'absent' $false)
+    } catch {
+        return (New-State 'unreadable' $null -Reason $_.Exception.Message)
+    }
+
+    try {
+        [xml]$x = $raw
+    } catch {
+        return (New-State 'unreadable' $null -Reason "web.config is not well-formed XML: $($_.Exception.Message)")
+    }
+
+    $core = $x.SelectSingleNode('//aspNetCore')
+    $inheritable = $true
+    if ($core) {
+        foreach ($loc in @($core.SelectNodes('ancestor::location'))) {
+            $v = [string]$loc.GetAttribute('inheritInChildApplications')
+            if ($v -match '^\s*(false|0)\s*$') { $inheritable = $false; break }
+        }
+    }
+    return (New-State 'ok' ([bool]$core) -Inheritable $inheritable)
+}
+
+function Get-CxAncestorApps {
+    <#
+      Applications on the same site that sit ABOVE this one in the URL hierarchy,
+      nearest first. IIS config inheritance follows the URL path, not the physical
+      one, so this - and not a walk up the filesystem - is how a child app finds
+      the web.config it may be inheriting from.
+    #>
+    [CmdletBinding()]
+    param($Model, $App)
+
+    $self = ([string]$App.AppPath).TrimEnd('/')      # '/' -> '',  '/api' -> '/api'
+    $out = @($Model.Apps | Where-Object {
+        $_.Site -eq $App.Site -and $_.AppPath -ne $App.AppPath -and
+        ($_.AppPath -eq '/' -or $self.StartsWith((([string]$_.AppPath).TrimEnd('/') + '/'), [StringComparison]::OrdinalIgnoreCase))
+    })
+    return ,@($out | Sort-Object { ([string]$_.AppPath).Length } -Descending)
+}
+
+function Test-CxAspNetCoreApp {
+    <#
+      Back-compat wrapper: $true / $false / $null-when-unknowable. Prefer
+      Get-CxWebConfigCoreState, which says WHY the answer is unknown.
+    #>
+    [CmdletBinding()]
+    param([string] $PhysicalPath)
+    $s = Get-CxWebConfigCoreState -PhysicalPath $PhysicalPath
+    if ($s.State -eq 'ok' -or $s.State -eq 'absent') { return [bool]$s.IsCore }
+    return $null
 }
 
 function Get-CxEffectivePoolEnv {
@@ -651,15 +734,53 @@ function Test-IISInstrumentation {
     # Wrong here means NO telemetry at all, regardless of everything above.
     foreach ($app in $model.Apps) {
         $label = "$($app.Site)$($app.AppPath)"
-        $isCore = Test-CxAspNetCoreApp -PhysicalPath $app.PhysicalPath
+        $wc    = Get-CxWebConfigCoreState -PhysicalPath $app.PhysicalPath
 
-        if ($null -eq $isCore) {
+        # A read FAILURE is genuinely unknown. A web.config that is simply not
+        # there is not, and reporting both as "cannot read web.config" made the
+        # stock Default Web Site - wwwroot ships iisstart.htm and no web.config -
+        # look like an ACL problem on every host in the fleet.
+        if ($wc.State -eq 'unreadable' -or $wc.State -eq 'nopath') {
             Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
-                -Message "cannot read web.config, so it is unknown whether this is an ASP.NET Core app needing 'No Managed Code'" `
-                -Data @{ physicalPath = $app.PhysicalPath })
+                -Message "$($wc.Error) - so it is unknown whether this is an ASP.NET Core app needing 'No Managed Code'" `
+                -Data @{ physicalPath = $app.PhysicalPath; error = $wc.Error })
             continue
         }
-        if (-not $isCore) { continue }   # Framework app: managed runtime is correct
+
+        $isCore        = [bool]$wc.IsCore
+        $inheritedFrom = $null
+
+        if ($wc.State -eq 'absent') {
+            # No web.config of its own. ANCM is wired per-application BY web.config,
+            # so that normally settles it - except <system.webServer> inherits into
+            # child applications unless a parent wraps it in
+            # <location inheritInChildApplications="false">. The nearest ancestor
+            # that HAS a web.config decides; anything above it is already shadowed.
+            foreach ($anc in (Get-CxAncestorApps -Model $model -App $app)) {
+                $awc = Get-CxWebConfigCoreState -PhysicalPath $anc.PhysicalPath
+                if ($awc.State -ne 'ok') { continue }
+                if ($awc.IsCore -and $awc.Inheritable) {
+                    $isCore = $true
+                    $inheritedFrom = "$($anc.Site)$($anc.AppPath)"
+                }
+                break
+            }
+
+            if (-not $isCore) {
+                $msg = if ($wc.DirMissing) {
+                    "physical path '$($app.PhysicalPath)' does not exist, so there is no web.config - IIS cannot serve this app at all, and it is certainly not ASP.NET Core"
+                } else {
+                    "no web.config at '$($app.PhysicalPath)' - ASP.NET Core in IIS is wired by <aspNetCore> in web.config, so this is a static or ASP.NET Framework app and needs no 'No Managed Code' pool. Normal for the stock Default Web Site."
+                }
+                Add-F (New-Finding -Check 'poolRuntime' -Severity 'info' -Code 'WEBCONFIG_ABSENT' -Target $label `
+                    -Message $msg -Data @{ physicalPath = $app.PhysicalPath; dirMissing = [bool]$wc.DirMissing })
+                continue
+            }
+        }
+
+        if (-not $isCore) { continue }   # Framework app: a managed runtime is correct
+
+        $via = if ($inheritedFrom) { " (<aspNetCore> inherited from '$inheritedFrom'; it has no web.config of its own)" } else { '' }
 
         $pool = $model.Pools[$app.Pool]
         if (-not $pool) {
@@ -671,12 +792,12 @@ function Test-IISInstrumentation {
         $mrv = $pool.ManagedRuntimeVersion
         if ($mrv -eq '') {
             Add-F (New-Finding -Check 'poolRuntime' -Severity 'pass' -Target $label `
-                -Message "ASP.NET Core app on pool '$($app.Pool)' is No Managed Code")
+                -Message "ASP.NET Core app on pool '$($app.Pool)' is No Managed Code$via")
         } else {
             $shown = if ($null -eq $mrv) { '<inherited default>' } else { $mrv }
             Add-F (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'POOL_NOT_NO_MANAGED_CODE' -Target $label `
-                -Message "ASP.NET Core app but pool '$($app.Pool)' has managedRuntimeVersion=$shown - it must be '' (No Managed Code) or the app emits NO telemetry at all" `
-                -Data @{ pool = $app.Pool; managedRuntimeVersion = $mrv })
+                -Message "ASP.NET Core app but pool '$($app.Pool)' has managedRuntimeVersion=$shown - it must be '' (No Managed Code) or the app emits NO telemetry at all$via" `
+                -Data @{ pool = $app.Pool; managedRuntimeVersion = $mrv; inheritedFrom = $inheritedFrom })
         }
     }
 
