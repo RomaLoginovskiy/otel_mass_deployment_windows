@@ -136,8 +136,22 @@ with a warning.
 On a **dedicated** pool this does not matter — the name goes on the pool. It only
 bites when a Framework app **shares** a pool with another app.
 
+**`appSettings` does not fix the shared-pool case.** On .NET Framework the `OTEL_*`
+values in `Web.config` are promoted to *process-level* environment variables at
+startup and the SDK initialises once per worker process, so in a shared pool the
+first application to start decides the service name for every app in it. Writing
+`appSettings` would hand you a name chosen by a startup race — which is also why the
+writer must keep returning `$false` here: counting the app as named would put that
+race result into `CX_IIS_SERVICES` and reintroduce permanent
+`CX_IIS_SERVICES_DRIFT`.
+
+**Not silent, though.** With nothing configured the instrumentation auto-detects
+`SiteName\VirtualPath`, so the app *does* report — it is simply named by the SDK
+rather than by us, and excluded from `CX_IIS_SERVICES`.
+
 **Remediation:** give the app its own pool (then the pool carries the name), or set
-`OTEL_SERVICE_NAME` from application code / `appSettings`.
+`OTEL_SERVICE_NAME` from application code. `appSettings` is valid only when the app
+already has a **dedicated** pool, where the pool variable is the simpler route anyway.
 
 ### ⚠️ App with no `web.config` on a shared pool cannot be named
 

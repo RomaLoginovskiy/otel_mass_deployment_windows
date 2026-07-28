@@ -8,8 +8,11 @@
     * three dedicated-pool sites (Scope='pool'  -> OTEL_SERVICE_NAME on the pool)
     * one shared pool hosting two apps (Scope='webconfig' -> name in web.config),
       which is the only way to exercise the web.config readback
-    * applicationPoolDefaults carrying the OTLP endpoint, deliberately using the
-      SHIPPED default 'localhost' so the OTLP_ENDPOINT_LOCALHOST finding fires
+    * applicationPoolDefaults carrying the OTLP endpoint, with 'localhost'
+      hand-planted so the OTLP_ENDPOINT_LOCALHOST finding fires. This USED to be
+      the shipped default; the instrumenters now default to 127.0.0.1 and rewrite
+      a `localhost` value, so the fault has to be injected deliberately - which is
+      why it is written straight through appcmd below and not via Instrument-IIS.ps1
 
   It does NOT install a collector. Checks 3-7 are therefore expected to report
   FAIL/WARN - that is intentional: those are the failure branches, and this
@@ -84,10 +87,15 @@ foreach ($sub in 'api','admin') {
 
 Write-Host "[iis] sites: $((Get-Website | ForEach-Object Name) -join ', ')"
 
-# --- 3. OTLP defaults, using the SHIPPED default endpoint -------------------
-# Instrument-IIS.ps1 defaults -OtlpEndpoint to http://localhost:4318. That is a real
-# documented silent-failure mode (localhost -> ::1 first, OTLP dropped), so the
-# container reproduces it on purpose and the doctor must warn about it.
+# --- 3. OTLP defaults, with a hand-planted 'localhost' fault -----------------
+# localhost -> ::1 first on a dual-stack host, the collector listens on IPv4 only,
+# and the export is dropped with no exporter error - a real documented silent-failure
+# mode, so the container reproduces it on purpose and the doctor must warn about it.
+#
+# Written straight through appcmd rather than via Instrument-IIS.ps1: that script now
+# defaults to 127.0.0.1 AND rewrites a `localhost` value it is handed
+# (Resolve-CxOtlpEndpoint), so it can no longer produce this state. Keeping the raw
+# write is what preserves OTLP_ENDPOINT_LOCALHOST detector coverage.
 & $appcmd set config -section:system.applicationHost/applicationPools `
     "/-applicationPoolDefaults.environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT']" /commit:apphost 2>$null | Out-Null
 & $appcmd set config -section:system.applicationHost/applicationPools `

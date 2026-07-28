@@ -309,13 +309,16 @@ When detection reports IIS, the orchestrator runs `Instrument-IIS.ps1`:
 - Installs the OpenTelemetry .NET auto-instrumentation module in strict order
   (`Import-Module` → `Install-OpenTelemetryCore` → `Register-OpenTelemetryForIIS`).
 - Sets the OTLP endpoint **host-wide** on `applicationPoolDefaults`
-  (`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318`,
+  (`OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318`,
   `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`) — the fleet "set once" pattern.
 - Auto-discovers every IIS site + application (`Resolve-IISServiceNames.ps1`) and sets
   a distinct `OTEL_SERVICE_NAME` for each, from the site name + app path (root app →
   site name; nested app `/api` → `Site/api`). Apps on a **dedicated** pool get the name
   on the pool (the OTLP endpoint/protocol are re-set there too, per the inheritance
-  rule below); apps that **share** a pool get it in their own `web.config`. Rename
+  rule below); apps that **share** a pool get it in their own `web.config`. A shared
+  pool that already declares its own `<environmentVariables>` also gets the OTLP
+  endpoint/protocol written directly onto it, because such a pool does not inherit the
+  defaults at all (see the snapshot note below). Rename
   specific apps with `-ServiceNameOverrides @{ 'Site/api' = 'custom' }` or
   `-OverridesJson <path>` (see [Command & flag reference](#command--flag-reference)).
 
@@ -324,10 +327,13 @@ Reminders from `iis-instrumentation.md`:
 - ASP.NET **Core** app pools must be **"No Managed Code"** or they emit nothing.
 - A trailing blank line in the W3SVC `Environment` REG_MULTI_SZ prevents IIS start.
 
-> ⚠️ **`localhost` vs `127.0.0.1`.** The endpoint above is the shipped default, but on a
-> dual-stack host `localhost` resolves to `::1` first and OTLP export is **silently
-> dropped**. `doctor.bat` flags every pool with `OTLP_ENDPOINT_LOCALHOST`; that is a real
-> finding, not a false positive. Pass `-OtlpEndpoint http://127.0.0.1:4318` to avoid it.
+> ⚠️ **`localhost` vs `127.0.0.1`.** The IPv4 literal above is deliberate: on a dual-stack
+> host `localhost` resolves to `::1` first, the collector's receivers bind IPv4 only, and OTLP
+> export is **silently dropped** — no exporter error, so the app looks instrumented and nothing
+> arrives. `Instrument-IIS.ps1` defaults to `127.0.0.1` and rewrites a `localhost` value passed
+> to `-OtlpEndpoint` (`Resolve-CxOtlpEndpoint` in `Write-DeployLog.ps1`). `doctor.bat` still
+> flags `OTLP_ENDPOINT_LOCALHOST` if it finds one from another source — a hand edit, a
+> pre-existing pool block, or an older install. That is a real finding, not a false positive.
 
 > **A pool's env block is a snapshot.** A pool with its own `<environmentVariables>`
 > **replaces** `applicationPoolDefaults`, and IIS copies the defaults into that block the
@@ -748,7 +754,7 @@ Invoked by the orchestrator on IIS hosts; runnable standalone.
 | Flag | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `-Version` | string | `v1.16.0-beta.1` | Auto-instrumentation release tag. |
-| `-OtlpEndpoint` | string | `http://localhost:4318` | Local collector OTLP HTTP endpoint. |
+| `-OtlpEndpoint` | string | `http://127.0.0.1:4318` | Local collector OTLP HTTP endpoint. A `localhost` value is rewritten to the IPv4 literal. |
 | `-NoReset` | switch | off | Skip the final `iisreset` (and pass `-NoReset` to `Register-OpenTelemetryForIIS`). |
 | `-ServiceNameOverrides` | hashtable | `@{}` | Rename apps, keyed by the auto-derived service name, e.g. `@{ 'Wallet/api' = 'wallet-api' }`. Merged over `-OverridesJson` if both are given. |
 | `-OverridesJson` | string | *(unset)* | Path to a JSON file of the same `{ autoName = overrideName }` shape. |
@@ -839,7 +845,7 @@ Full finding reference: [`agent-diagnostics.md`](agent-diagnostics.md).
 | Service won't start | Base config needs `file_storage` → installer must pass `-EnableDynamicIISParsing` (it does). Run `validate`. Confirm `CORALOGIX_PRIVATE_KEY` set on the service. |
 | Agent not in Fleet Management | Supervisor can't reach OpAMP: check `CORALOGIX_DOMAIN`/key, and that the **base config has no opamp extension**. |
 | Selector attributes (`cx.host.role`/`workload.*`) not shown in Fleet Management | They must be in the **Supervisor** config `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` (the vendor template writes only static `service.name`/`cx.agent.type`). `Install-CoralogixSupervisor.ps1` injects them post-install + restarts `opampsupervisor`. If still absent: detection didn't run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed the `non_identifying_attributes:` anchor. Re-run deploy, or patch `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml` + restart. |
-| No IIS telemetry | Run `doctor.bat`. `POOL_NOT_NO_MANAGED_CODE` → the ASP.NET Core pool is not "No Managed Code"; recycle after fixing. `PROFILER_NOT_REGISTERED` → `Register-OpenTelemetryForIIS` never ran on this host. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `localhost` resolves to `::1` first and export is silently dropped; use `127.0.0.1`. |
+| No IIS telemetry | Run `doctor.bat`. `POOL_NOT_NO_MANAGED_CODE` → the ASP.NET Core pool is not "No Managed Code"; recycle after fixing. `PROFILER_NOT_REGISTERED` → `Register-OpenTelemetryForIIS` never ran on this host. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `localhost` resolves to `::1` first and export is silently dropped; use `127.0.0.1`. `POOL_LOST_INHERITANCE` → the pool has its own `<environmentVariables>` and so never saw `applicationPoolDefaults`; re-run `deploy.bat` (the instrumenter writes the OTLP vars straight onto such pools) and recycle. |
 | `CX_IIS_SERVICES` not set / Service ownership blank | Run `doctor.bat -Only env,iisServiceName,effectiveConfig`. `CX_IIS_SERVICES_MISSING` → `Instrument-IIS.ps1` never ran or was not elevated. `CX_IIS_SERVICES_DRIFT` → sites changed after instrumentation; re-run and restart the collector. `EFFECTIVE_PROCESSOR_MISSING`/`_NOT_WIRED` → the env var is fine but `transform/iis_service_labels` is absent from the **remote** Fleet config, so it is never stamped. |
 | Doctor says the config is unreadable, but the deploy plainly worked | `APPHOST_UNREADABLE` / `APPHOST_ACCESS_DENIED`. `appcmd` reaches the config through the IIS COM API; the diagnostics do a plain file read, so one can fail while the other works. Usual cause is **WOW64** — see [below](#wow64-32-bit-host-processes). Other causes and the one-liner that tells them apart: [`agent-diagnostics.md`](agent-diagnostics.md#apphost_unreadable-when-the-deployment-clearly-worked). |
 | Endpoint fixed centrally but hosts still export nowhere | `POOL_ENV_STALE`. A pool's own `<environmentVariables>` block replaces `applicationPoolDefaults` and is only a snapshot taken when the pool was first written — later changes to the defaults never reach it. Re-run `Instrument-IIS.ps1` and recycle the pool. |

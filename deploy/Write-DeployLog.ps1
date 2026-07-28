@@ -3,14 +3,20 @@
   Shared output helper for the Coralogix fleet deploy + diagnostic scripts.
 
 .DESCRIPTION
-  Dot-source this file to expose a small function library. It currently carries
-  the DIAGNOSTIC FINDING model used by Test-Agent.ps1 and the standalone
+  Dot-source this file to expose a small function library. It carries the
+  DIAGNOSTIC FINDING model used by Test-Agent.ps1 and the standalone
   Test-*Instrumentation.ps1 validators:
 
      New-Finding          - build one finding record
      Write-FindingTable   - render findings to the console (BatchPatch-visible)
      Get-FindingCounts    - tally by severity
      Get-GradedExitCode   - map findings to the graded exit code 0 / 1 / 2
+
+  ...plus one shared value normalizer used by the INSTRUMENTERS (Instrument-IIS.ps1,
+  Instrument-NodePM2.ps1, scripts/deploy-app.ps1), which is here rather than in a
+  fourth file because it is the only helper all three of them need:
+
+     Resolve-CxOtlpEndpoint - rewrite a `localhost` OTLP host to 127.0.0.1
 
   Severity model (a finding carries exactly one):
 
@@ -35,6 +41,46 @@
   before the caller's try/catch. A stray pipeline object or an exception here
   would corrupt a caller or destroy its error handling.
 #>
+
+function Resolve-CxOtlpEndpoint {
+    <#
+      Normalize an OTLP endpoint so its HOST is never `localhost`.
+
+      The collector's OTLP receivers bind ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1},
+      i.e. IPv4 only. On a dual-stack Windows host `localhost` resolves to ::1
+      first, nothing is listening there, and the export is dropped SILENTLY - the
+      SDK reports no exporter error, so the app looks instrumented and no telemetry
+      arrives. That is the single most expensive misconfiguration this tooling has
+      had to diagnose, which is why it is normalized at the source instead of only
+      being warned about downstream (Test-IISInstrumentation.ps1's
+      OTLP_ENDPOINT_LOCALHOST).
+
+      Returns the input unchanged when it is empty, when the host is not localhost,
+      or when it will not parse as a URI. A malformed -OtlpEndpoint is the caller's
+      to report; silently rewriting it here would hide the real problem.
+    #>
+    [CmdletBinding()]
+    param([string] $Endpoint)
+
+    if (-not $Endpoint) { return $Endpoint }
+
+    try {
+        if (([uri]$Endpoint).Host -ne 'localhost') { return $Endpoint }
+
+        # Replace ONLY the host substring, keeping the caller's exact scheme, port
+        # and path text. A [UriBuilder] round-trip would normalize the string and
+        # append a trailing '/', which the doctor's literal endpoint comparison
+        # (Test-IISInstrumentation.ps1) would then report as a mismatch.
+        $i = $Endpoint.IndexOf('localhost', [System.StringComparison]::OrdinalIgnoreCase)
+        if ($i -lt 0) { return $Endpoint }
+        $fixed = $Endpoint.Remove($i, 'localhost'.Length).Insert($i, '127.0.0.1')
+    } catch {
+        return $Endpoint
+    }
+
+    Write-Warning "OTLP endpoint '$Endpoint' uses 'localhost', which resolves to ::1 first on a dual-stack host - the collector listens on IPv4 only and the export would be dropped silently. Using '$fixed' instead."
+    return $fixed
+}
 
 # Severity ordering, worst first. Used for sorting and for the exit-code grade.
 $script:CxSeverityRank = @{

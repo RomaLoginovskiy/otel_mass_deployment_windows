@@ -11,6 +11,8 @@
        before core files are in place).
     2. Set the OTLP endpoint host-wide via applicationPoolDefaults environment
        variables (so all pools inherit it) - the fleet-friendly "set once" pattern.
+       Pools that declare their own <environmentVariables> do NOT inherit and are
+       written explicitly in step 2b (see .NOTES).
     2b. Enumerate every IIS site + application and assign each a distinct
        OTEL_SERVICE_NAME derived from the site name + app path (see
        Resolve-IISServiceNames.ps1). Dedicated pools get the name on the pool; apps
@@ -25,7 +27,13 @@
   bump to the current release from the project's releases page).
 
 .PARAMETER OtlpEndpoint
-  Local collector OTLP HTTP endpoint. Default: http://localhost:4318
+  Local collector OTLP HTTP endpoint. Default: http://127.0.0.1:4318
+
+  Deliberately the IPv4 literal, not `localhost`. The collector's receivers bind
+  ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}, and on a dual-stack host `localhost`
+  resolves to ::1 first - nothing listens there and the export is dropped with no
+  exporter error to show for it. A `localhost` value passed here is rewritten (see
+  Resolve-CxOtlpEndpoint in Write-DeployLog.ps1) rather than honored.
 
 .PARAMETER NoReset
   Pass -NoReset to Register-OpenTelemetryForIIS and skip the final iisreset (recycle
@@ -40,13 +48,20 @@
 
 .NOTES
   Run elevated. The host-wide OTLP vars are set on <applicationPoolDefaults>, which
-  only reaches pools that do not declare their own <environmentVariables> collection.
-  Pools that need their own vars must list all of them (IIS inheritance rule).
+  only reaches pools that do not declare their own <environmentVariables> collection -
+  a pool's own block REPLACES the defaults, it does not merge with them. Every pool
+  that has (or gets) its own block is therefore written explicitly:
+
+    * dedicated pool  - gets a block the moment OTEL_SERVICE_NAME is written to it
+    * shared pool     - gets the OTLP vars only if it ALREADY had a block (e.g. a
+                        connection string added before install). Writing to a clean
+                        shared pool would create a block and break its inheritance,
+                        so those are deliberately left inheriting.
 #>
 [CmdletBinding()]
 param(
     [string]    $Version              = 'v1.16.0-beta.1',
-    [string]    $OtlpEndpoint          = 'http://localhost:4318',
+    [string]    $OtlpEndpoint          = 'http://127.0.0.1:4318',
     [switch]    $NoReset,
     # Pre-staged copies, for hosts that cannot reach GitHub: an outbound proxy, an
     # air-gapped network, or a TLS stack that cannot complete the download (Windows
@@ -90,6 +105,16 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::
 # Optional backup/manifest recording (shared session from the orchestrator).
 $backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
 if (Test-Path $backupHelper) { . $backupHelper }
+
+# Normalize a `localhost` endpoint to the IPv4 literal before it is written anywhere.
+# Guarded because the helper is optional in a hand-assembled deploy directory; the
+# param default is already correct, so a missing helper only loses the rewrite for an
+# operator who passed `localhost` explicitly (the doctor still warns in that case).
+$logHelper = Join-Path $PSScriptRoot 'Write-DeployLog.ps1'
+if (Test-Path $logHelper) { . $logHelper }
+if (Get-Command Resolve-CxOtlpEndpoint -ErrorAction SilentlyContinue) {
+    $OtlpEndpoint = Resolve-CxOtlpEndpoint -Endpoint $OtlpEndpoint
+}
 
 # ---- 1. Install the auto-instrumentation module (STRICT order) ----------------
 $module_url    = "https://github.com/open-telemetry/opentelemetry-dotnet-instrumentation/releases/download/$Version/OpenTelemetry.DotNet.Auto.psm1"
@@ -177,6 +202,34 @@ function Test-PoolEnvPresent {
     } catch { return $false }
 }
 
+function Test-PoolHasOwnEnvBlock {
+    <#
+      True if a pool declares its OWN <environmentVariables> collection - which
+      REPLACES applicationPoolDefaults rather than merging with it. Such a pool does
+      not see the OTLP vars set on the defaults above, no matter how correct they are.
+
+      This is the instrumenter-side twin of the doctor's HasOwnEnvBlock
+      (Test-IISInstrumentation.ps1), and it exists because a pool can acquire a block
+      WITHOUT this installer: any prior `appcmd set config .../+[name=...]
+      .environmentVariables...` creates one. A brownfield shared pool carrying, say, a
+      connection string (exactly what misc\wire-db.ps1 writes) is the common case. Its
+      block was materialised from whatever the defaults held at that time - i.e. no
+      OTLP entries - so it silently exports nowhere. The doctor reports this as
+      POOL_LOST_INHERITANCE; the caller below repairs it.
+
+      Note the XPath deliberately has no trailing add[@name=...] predicate: we are
+      asking whether the COLLECTION exists, not whether one entry does.
+    #>
+    param([string] $Pool)
+    try {
+        if (-not $Pool) { return $false }
+        if (-not (Test-Path $appHostConfig)) { return $false }
+        [xml]$c = Get-Content -LiteralPath $appHostConfig -Raw
+        return [bool]$c.SelectSingleNode(
+            "/configuration/system.applicationHost/applicationPools/add[@name='$Pool']/environmentVariables")
+    } catch { return $false }
+}
+
 function Set-PoolDefaultEnv {
     param([string] $Name, [string] $Value)
     # Back up applicationHost.config once + record whether this entry pre-existed,
@@ -251,6 +304,12 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
     # Only apps whose name assignment actually SUCCEEDED. CX_IIS_SERVICES is built
     # from this, not from $svcMap - see the comment at the label value below.
     $namedApps = New-Object System.Collections.ArrayList
+    # Shared pools already repaired this run. $svcMap iterates per APPLICATION, so a
+    # 3-app shared pool would otherwise be written three times: harmless on disk
+    # (Set-PoolEnv is idempotent) but it triples the Record-PoolEnv manifest entries
+    # and the console output, and Run-E2ELoop.ps1 asserts zero duplicate pool/varname
+    # entries. Ordinal-ignore-case because IIS pool names are case-insensitive.
+    $otlpPatchedPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($r in $svcMap) {
         Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}]" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope)
         if ($r.Scope -eq 'pool') {
@@ -261,7 +320,28 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
             [void]$namedApps.Add($r)
         } else {
-            # Shared pool: keep inheriting OTLP defaults, set only the per-app name in web.config.
+            # Shared pool: the per-app NAME can only go in web.config (one pool, many
+            # apps, one env block). The OTLP vars are a different matter.
+            #
+            # A shared pool normally inherits them from applicationPoolDefaults - but
+            # only while it has no <environmentVariables> block of its own, because a
+            # pool's own block REPLACES the defaults instead of merging. A pool that
+            # already had a block before this installer ran (a connection string, an
+            # app setting) therefore never receives the endpoint and exports nowhere,
+            # while the defaults read as perfectly correct. Stamp the OTLP vars
+            # explicitly on exactly those pools.
+            #
+            # Scoped to pools that already own a block on purpose: writing to a clean
+            # shared pool would CREATE one (IIS materialises the current defaults into
+            # it on first write), turning an inheriting pool into a snapshot that a
+            # later central endpoint change would never reach.
+            if (-not $otlpPatchedPools.Contains($r.Pool) -and (Test-PoolHasOwnEnvBlock -Pool $r.Pool)) {
+                Write-Host "  [pool] $($r.Pool) declares its own <environmentVariables> (defaults do not reach it) - setting OTLP vars on the pool" -ForegroundColor Yellow
+                Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
+                Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+                [void]$otlpPatchedPools.Add($r.Pool)
+            }
+
             # Set-WebConfigServiceName returns $false when it declines - no web.config,
             # or a classic ASP.NET Framework app with no <aspNetCore> node to write into.
             if (Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName -Session $Session) {
@@ -272,7 +352,7 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
 
     $unnamed = @($svcMap).Count - $namedApps.Count
     if ($unnamed -gt 0) {
-        Write-Warning "[iis-instr] $unnamed app(s) could not be given an OTEL_SERVICE_NAME (see the warnings above). They are EXCLUDED from CX_IIS_SERVICES so the host does not claim ownership of a service that emits nothing."
+        Write-Warning "[iis-instr] $unnamed app(s) could not be given an OTEL_SERVICE_NAME (see the warnings above). They are EXCLUDED from CX_IIS_SERVICES so the host does not claim ownership of a name this installer did not set. An ASP.NET Framework app in this group still REPORTS - the instrumentation auto-detects 'Site\AppPath' - so the host's Service-ownership list is a subset of what it emits. Give such an app a dedicated pool to bring it under management."
     }
 
     # Machine env var CX_IIS_SERVICES = comma-joined distinct IIS service name(s).
@@ -284,9 +364,14 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
     # Built from $namedApps, NOT $svcMap. Using the full map broke the guarantee for
     # any app whose name could not be written (shared pool + no web.config, or an
     # ASP.NET Framework app with no <aspNetCore> node): the host advertised ownership
-    # of a service nothing emits, and because the doctor compares the variable
-    # against the names actually present, CX_IIS_SERVICES_DRIFT was reported
+    # of a name that nothing reports under, and because the doctor compares the
+    # variable against the names actually present, CX_IIS_SERVICES_DRIFT was reported
     # PERMANENTLY - re-running could never clear it. Found by the E2E loop.
+    #
+    # The trade is deliberate and one-directional. A Framework app on a shared pool
+    # DOES report, under the auto-detected 'Site\AppPath', so this list can be a
+    # subset of the services the host actually emits. Under-claiming costs a missing
+    # ownership item; over-claiming costs permanent drift. Subset wins.
     $iisServices = Get-IISServiceLabelValue -Map @($namedApps.ToArray())
     if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
         $priorIisSvc = [Environment]::GetEnvironmentVariable('CX_IIS_SERVICES', 'Machine')

@@ -368,6 +368,41 @@ if (Use-Case 'P2') {
     Assert-Case -Name 'shape 8  virtual directory is not named as an app' -Result $d `
         -Reject @('shop/assets')
 
+    # 9. Brownfield shared pool: it owned an <environmentVariables> block before the
+    #    agent was installed, so applicationPoolDefaults never reached it. Regression
+    #    pin for a silent-export defect: the shared-pool branch used to skip pool env
+    #    entirely, so this pool got no endpoint while the defaults read as correct and
+    #    the doctor's own note called the case "rare".
+    #    NOTE: single-quoted here-string with NO nested double quotes and no XPath
+    #    predicate - a `[@name='...']` predicate needs an outer double quote, and
+    #    those do not survive `docker exec ... -Command`. Filter in PowerShell
+    #    instead, the same way the duplicate-entry check in P5 does.
+    $bf = Invoke-Exec (@'
+[xml]$x = Get-Content 'C:\Windows\System32\inetsrv\config\applicationHost.config' -Raw; $x.SelectNodes('//applicationPools/add/environmentVariables/add') | Where-Object { $_.ParentNode.ParentNode.GetAttribute('name') -eq 'BrownfieldPool' } | ForEach-Object { $_.GetAttribute('name') + '=' + $_.GetAttribute('value') }
+'@)
+    Assert-True 'shape 9  brownfield shared pool got the OTLP endpoint on the pool' `
+        ($bf.Out -match 'OTEL_EXPORTER_OTLP_ENDPOINT=http://127\.0\.0\.1:4318') $bf.Out.Trim()
+    Assert-True 'shape 9  brownfield shared pool got the OTLP protocol on the pool' `
+        ($bf.Out -match 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf') $bf.Out.Trim()
+    # Uninstall reverses only value-matched installer entries, so the customer's own
+    # variable has to still be here for that to be a meaningful guarantee.
+    Assert-True 'shape 9  the pre-existing non-OTEL pool variable survived' `
+        ($bf.Out -match 'CX_TEST_PREEXISTING=set-before-the-agent') $bf.Out.Trim()
+    # Both apps share the pool, so the write must be deduped: two OTEL_SERVICE_NAME
+    # entries cannot exist and the OTLP pair must appear once each. (The global
+    # duplicate check in P4 covers every pool; this one localises the failure.)
+    $bfDupes = @($bf.Out -split "`n" | Where-Object { $_ -match 'OTEL_EXPORTER_OTLP_ENDPOINT' }).Count
+    Assert-True 'shape 9  OTLP endpoint written once despite two apps on the pool' `
+        ($bfDupes -eq 1) "matched $bfDupes line(s)"
+    # And the doctor must now agree: no POOL_LOST_INHERITANCE for this pool.
+    $bfDoc = Invoke-Doctor -DoctorArgs @('-Only', 'iisInstrumentation')
+    Assert-Case -Name 'shape 9  doctor reports no lost inheritance for BrownfieldPool' -Result $bfDoc `
+        -Reject @('POOL_LOST_INHERITANCE')
+    # The pool value was stamped from the same $OtlpEndpoint the defaults carry, so it
+    # is not a stale snapshot either.
+    Assert-Case -Name 'shape 9  pool value matches the defaults (no stale snapshot)' -Result $bfDoc `
+        -Reject @('POOL_ENV_STALE')
+
     # The alignment guarantee in docs/iis-service-ownership.md: every item in
     # CX_IIS_SERVICES is supposed to equal some app's OTEL_SERVICE_NAME. Check it
     # against an app whose name assignment was SKIPPED.
@@ -386,7 +421,7 @@ if (Use-Case 'P2') {
     $legacy = ($d.Out -match 'legacy')
     Assert-True 'shape 5  Framework app is reported, not silently skipped' $legacy
     if ($legacy) {
-        Note 'ASP.NET Framework' 'A Framework app on a dedicated pool gets OTEL_SERVICE_NAME from the pool, but Set-WebConfigServiceName cannot name one on a SHARED pool: it requires an <aspNetCore> node. Framework apps sharing a pool need OTEL_SERVICE_NAME set another way (appSettings + code, or one pool per app).'
+        Note 'ASP.NET Framework' 'A Framework app on a dedicated pool gets OTEL_SERVICE_NAME from the pool, but Set-WebConfigServiceName cannot name one on a SHARED pool: it requires an <aspNetCore> node. appSettings is NOT a workaround there - on .NET Framework the OTEL_* values in web.config are promoted to process-level env vars and the SDK initialises once per worker process, so in a shared pool the first app to start decides for all of them. The only reliable per-app naming is one pool per app (or setting the name from application code). Left unnamed the app still reports, under the auto-detected Site\AppPath, and is excluded from CX_IIS_SERVICES so the host under-claims rather than claiming a name we did not set.'
     }
     $nocfg = ($d.Out -match 'nocfg')
     Assert-True 'shape 7  app with no web.config is reported' $nocfg
@@ -512,7 +547,7 @@ if ((Use-Case 'P4') -and -not $SkipTelemetry -and $collectorInstallable) {
         # not survive `docker exec ... -Command`.
         Write-Host '   generating load...'
         $null = Invoke-Exec (@'
-1..40 | ForEach-Object { foreach ($p in 8081,8082,8083,8084,80) { try { Invoke-WebRequest -Uri ('http://127.0.0.1:' + $p + '/') -UseBasicParsing -TimeoutSec 5 | Out-Null } catch {} } }
+1..40 | ForEach-Object { foreach ($p in 8081,8082,8083,8084,8085,80) { try { Invoke-WebRequest -Uri ('http://127.0.0.1:' + $p + '/') -UseBasicParsing -TimeoutSec 5 | Out-Null } catch {} } }
 '@)
 
         # On-host gate FIRST: it is instant and, when it fails, tells you the data

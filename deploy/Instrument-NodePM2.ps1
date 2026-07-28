@@ -29,7 +29,13 @@
   still separates workers by process.pid.
 
 .PARAMETER OtlpEndpoint
-  Local collector OTLP HTTP endpoint. Default: http://localhost:4318
+  Local collector OTLP HTTP endpoint. Default: http://127.0.0.1:4318
+
+  Deliberately the IPv4 literal, not `localhost`. The collector's receivers bind
+  ${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}, and on a dual-stack host `localhost`
+  resolves to ::1 first - nothing listens there and the export is dropped with no
+  exporter error to show for it. A `localhost` value passed here is rewritten (see
+  Resolve-CxOtlpEndpoint in Write-DeployLog.ps1) rather than honored.
 
 .PARAMETER InstallPrefix
   Directory the OTel Node package is installed under (its node_modules/). Default: C:\cx\otel-node
@@ -56,7 +62,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]    $OtlpEndpoint         = 'http://localhost:4318',
+    [string]    $OtlpEndpoint         = 'http://127.0.0.1:4318',
     [string]    $InstallPrefix        = 'C:\cx\otel-node',
     [string]    $Package              = '@opentelemetry/auto-instrumentations-node',
     [hashtable] $ServiceNameOverrides = @{},
@@ -83,6 +89,16 @@ Assert-Admin
 $backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
 if (Test-Path $backupHelper) { . $backupHelper }
 . (Join-Path $PSScriptRoot 'Resolve-NodeServiceNames.ps1')
+
+# Normalize a `localhost` endpoint to the IPv4 literal before it reaches NODE_OPTIONS.
+# Guarded because the helper is optional in a hand-assembled deploy directory; the
+# param default is already correct, so a missing helper only loses the rewrite for an
+# operator who passed `localhost` explicitly (the doctor still warns in that case).
+$logHelper = Join-Path $PSScriptRoot 'Write-DeployLog.ps1'
+if (Test-Path $logHelper) { . $logHelper }
+if (Get-Command Resolve-CxOtlpEndpoint -ErrorAction SilentlyContinue) {
+    $OtlpEndpoint = Resolve-CxOtlpEndpoint -Endpoint $OtlpEndpoint
+}
 
 # ---- 0. Prerequisites ---------------------------------------------------------
 foreach ($tool in 'node','npm','pm2') {

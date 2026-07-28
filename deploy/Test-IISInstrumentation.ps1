@@ -471,9 +471,16 @@ function Get-CxEffectivePoolEnv {
       OBSERVED BEHAVIOUR (verified in the ltsc2022 IIS container): when appcmd
       first writes ANY env var to a pool, IIS MATERIALISES the current
       applicationPoolDefaults entries into that pool's new block alongside it. So
-      in practice a freshly instrumented pool carries a full copy, not an empty
-      one - which is why "pool has a block but no endpoint" is rare and mostly
-      reachable only by hand-editing applicationHost.config.
+      a pool instrumented by THIS installer carries a full copy, not an empty one.
+
+      That is not the same as "pool has a block but no endpoint is rare". The copy
+      is taken from whatever the defaults held AT THE TIME OF THE FIRST WRITE, and
+      any earlier `appcmd .../+[name=...].environmentVariables...` counts - a
+      brownfield pool given a connection string before the agent was installed
+      (which is exactly what misc\wire-db.ps1 does) already owns a block that
+      predates the OTLP defaults, so it never sees them. On a SHARED pool that was
+      the live failure this check was hardened for; Instrument-IIS.ps1 now stamps
+      the OTLP vars directly onto such pools.
 
       The consequential case is that the copy is a SNAPSHOT: change
       applicationPoolDefaults afterwards and every pool that already has its own
@@ -693,7 +700,7 @@ function Test-IISInstrumentation {
             if ($pool.HasOwnEnvBlock -and $defEndpoint) {
                 # The trap, caught: defaults look fine, this pool silently opted out.
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_LOST_INHERITANCE' -Target $poolName `
-                    -Message "pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do" `
+                    -Message "pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do. Usually a pool that owned a block before the agent was installed. Re-run Instrument-IIS.ps1 and recycle the pool: it writes the OTLP vars straight onto pools that own a block." `
                     -Data @{ defaultsEndpoint = $defEndpoint; poolEnvKeys = @($pool.Env.Keys) })
             } else {
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target $poolName `
@@ -703,7 +710,10 @@ function Test-IISInstrumentation {
         }
 
         if ($endpoint -match 'localhost') {
-            # Real, documented silent-failure mode - and the shipped default.
+            # Real, documented silent-failure mode. No longer reachable from a stock
+            # deploy (Instrument-IIS.ps1 defaults to 127.0.0.1 and rewrites a
+            # `localhost` value), so a hit here came from a hand edit, a pool block
+            # that predates the agent, or an install from before that change.
             Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'OTLP_ENDPOINT_LOCALHOST' -Target $poolName `
                 -Message "endpoint uses 'localhost' ($endpoint). On a dual-stack host that resolves to ::1 first and OTLP export is silently dropped. Use $ExpectedOtlpEndpoint." `
                 -Data @{ endpoint = $endpoint; expected = $ExpectedOtlpEndpoint })

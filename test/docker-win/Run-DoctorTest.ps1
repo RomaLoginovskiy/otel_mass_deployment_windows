@@ -180,7 +180,7 @@ Assert-Case -Name 'full run detects the missing collector' -Result $r -ExpectExi
     'HEALTH_UNREACHABLE',          # 13133 down
     'PORT_4318_NOT_LISTENING',     # no OTLP receiver
     'PROFILER_NOT_REGISTERED',     # Register-OpenTelemetryForIIS never ran here
-    'OTLP_ENDPOINT_LOCALHOST'      # the shipped default is localhost, not 127.0.0.1
+    'OTLP_ENDPOINT_LOCALHOST'      # hand-planted by entrypoint.doctor.ps1 (NOT the shipped default any more)
 )
 
 # The stock "Default Web Site" omits applicationPool and inherits it from

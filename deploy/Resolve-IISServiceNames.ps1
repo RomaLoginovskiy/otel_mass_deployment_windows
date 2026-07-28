@@ -166,7 +166,18 @@ function Set-WebConfigServiceName {
     # element (the publish output wraps it in <location path="." ...>). Match anywhere.
     $aspNetCore = $xml.SelectSingleNode('//aspNetCore')
     if (-not $aspNetCore) {
-        Write-Warning "  [webconfig] no <aspNetCore> in '$webConfig' (classic ASP.NET Framework?) - skipping. For Framework apps set OTEL_SERVICE_NAME via <appSettings> instead."
+        # Classic ASP.NET Framework. <appSettings> is NOT a substitute here, and this
+        # function is only reached for pool-SHARING apps: on .NET Framework the OTEL_*
+        # values in web.config are promoted to PROCESS-level environment variables at
+        # startup and the SDK initialises once per worker process, so in a shared pool
+        # the first application to start decides the service name for every app in it.
+        # Writing appSettings would produce a name decided by a startup race, and
+        # counting the app as named would put that race result into CX_IIS_SERVICES.
+        #
+        # Declining is not the same as losing the app: with nothing configured the
+        # instrumentation auto-detects "SiteName\VirtualPath", so it still reports -
+        # just under a name this installer did not choose and must not claim.
+        Write-Warning "  [webconfig] no <aspNetCore> in '$webConfig' (classic ASP.NET Framework) - cannot name '$ServiceName'. On a shared pool, OTEL_* from web.config/appSettings is promoted process-wide and the first app to start wins, so per-app naming is not possible; the app still reports under the auto-detected 'Site\AppPath'. Give it a dedicated app pool to name it."
         return $false
     }
 
