@@ -8,7 +8,7 @@
   collector - because all of that is what Run-E2ELoop.ps1 drives through
   deploy.bat, and a harness that pre-did the work would be testing itself.
 
-  It builds eight IIS shapes. Each one exists because it is handled somewhere in
+  It builds nine IIS shapes. Each one exists because it is handled somewhere in
   the deploy code and has never been exercised end to end:
 
     1. Default Web Site   stock; omits applicationPool, so the pool resolves from
@@ -31,6 +31,13 @@
                           all. Must degrade cleanly, not crash the run
     8. shop/assets        a virtual DIRECTORY, not an application. Must NOT get its
                           own service name
+    9. brownfield         + /admin: two apps sharing a pool that ALREADY declares its
+                          own <environmentVariables> before the agent is installed.
+                          A pool's own block REPLACES applicationPoolDefaults, so this
+                          pool never sees the OTLP endpoint set there and exports
+                          nowhere while the defaults read as correct
+                          (POOL_LOST_INHERITANCE). Instrument-IIS.ps1 must stamp the
+                          OTLP vars directly onto it
 
   Logging variants are left at the IIS default here; Run-E2ELoop.ps1 mutates them
   through break-state.ps1 so each case is attributable to one change.
@@ -44,6 +51,11 @@ Import-Module WebAdministration -ErrorAction Stop
 
 $wwwroot = 'C:\sites'
 New-Item -ItemType Directory -Path $wwwroot -Force | Out-Null
+
+# WebAdministration cannot edit an app pool's environmentVariables collection, so the
+# one shape that needs a pre-existing entry (9, brownfield) uses appcmd - the same tool
+# the deploy scripts use. 64-bit container, so System32 needs no Sysnative dance.
+$appcmd = Join-Path $env:windir 'System32\inetsrv\appcmd.exe'
 
 function New-CoreWebConfig {
     <# The plain shape: <aspNetCore> directly under <system.webServer>. #>
@@ -175,6 +187,34 @@ if (-not (Test-Path 'IIS:\Sites\wrapped')) {
 New-Content "$wwwroot\nocfg" 'nocfg'
 if (-not (Get-WebApplication -Site 'shared' -Name 'nocfg' -ErrorAction SilentlyContinue)) {
     New-WebApplication -Site 'shared' -Name 'nocfg' -PhysicalPath "$wwwroot\nocfg" -ApplicationPool 'SharedPool' | Out-Null
+}
+
+# -- 9. brownfield + /admin: shared pool that ALREADY owns an env block --------
+# The pool is given a non-OTEL environment variable HERE, i.e. before the agent is
+# ever installed - the shape of a real host where someone set a connection string
+# on the pool (exactly what misc\wire-db.ps1 does). That first write makes IIS
+# materialise an <environmentVariables> block on the pool, and from then on the pool
+# REPLACES applicationPoolDefaults instead of merging with it. The OTLP endpoint the
+# installer later writes to the defaults therefore never reaches this pool: the
+# defaults read as perfectly correct and the apps export nowhere.
+#
+# Two apps on purpose, so the pool is SHARED and takes the web.config naming path -
+# the branch that used to skip pool env entirely. Run-E2ELoop.ps1 asserts the OTLP
+# vars land on the pool anyway, and that they are written ONCE despite two apps.
+New-CorePool 'BrownfieldPool'
+& $appcmd set config -section:system.applicationHost/applicationPools `
+    "/+[name='BrownfieldPool'].environmentVariables.[name='CX_TEST_PREEXISTING',value='set-before-the-agent']" `
+    /commit:apphost | Out-Null
+New-Content "$wwwroot\brownfield" 'brownfield'
+New-CoreWebConfig "$wwwroot\brownfield"
+if (-not (Test-Path 'IIS:\Sites\brownfield')) {
+    New-Website -Name 'brownfield' -Port 8085 -PhysicalPath "$wwwroot\brownfield" -ApplicationPool 'BrownfieldPool' | Out-Null
+}
+$bfAdmin = "$wwwroot\brownfield-admin"
+New-Content $bfAdmin 'brownfield admin'
+New-CoreWebConfig $bfAdmin
+if (-not (Get-WebApplication -Site 'brownfield' -Name 'admin' -ErrorAction SilentlyContinue)) {
+    New-WebApplication -Site 'brownfield' -Name 'admin' -PhysicalPath $bfAdmin -ApplicationPool 'BrownfieldPool' | Out-Null
 }
 
 # -- 1. Default Web Site: left exactly as the base image made it --------------

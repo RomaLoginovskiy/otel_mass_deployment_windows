@@ -1703,8 +1703,14 @@ function Test-CxReceiverFlow {
             [void] $out.Add((New-Finding -Check 'receiverFlow' -Severity 'unknown' -Code 'RECEIVER_NO_DATA_YET' -Target $r `
                 -Message ("nothing yet, but the collector has only been up {0:N0}s - re-run in {1:N0}s" -f $uptime, ($warmup - $uptime)) -Data $data))
         } else {
+            # This is where a scraper whose SOURCE is down lands. It does not reach
+            # RECEIVER_SCRAPE_FAILING: a connection-level failure returns zero data
+            # points, so otelcol_scraper_errored_metric_points stays 0 (measured
+            # against a rabbitmq receiver with no broker - the error appears only in
+            # the collector log). The counters therefore cannot say WHY, and
+            # -ProbeEndpoints is what turns this into a diagnosis.
             [void] $out.Add((New-Finding -Check 'receiverFlow' -Severity 'warn' -Code 'RECEIVER_NO_DATA' -Target $r `
-                -Message 'has produced nothing since the collector started, and nothing during the sample window' -Data $data))
+                -Message 'has produced nothing since the collector started, and nothing during the sample window. Run with -ProbeEndpoints to test whether its source is reachable - a scraper whose target is down reports exactly this, with no error counter to show for it.' -Data $data))
         }
     }
 
@@ -2306,6 +2312,11 @@ function Get-CxEffectivePoolEnv {
       A pool's own <environmentVariables> block REPLACES applicationPoolDefaults;
       it is not merged. Checking the defaults alone therefore reports a false pass
       for any pool that has its own block.
+
+      The block is a snapshot of the defaults as they were at its FIRST write, and a
+      pool can acquire one before the agent is ever installed (any earlier appcmd
+      write of any env var - a connection string, say). Such a pool predates the OTLP
+      defaults and never sees them.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Pool, [hashtable] $Defaults)
@@ -2487,7 +2498,7 @@ function Test-CxIis {
         if (-not $endpoint) {
             if ($pool.HasOwnEnvBlock -and $defEndpoint) {
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_LOST_INHERITANCE' -Target $poolName `
-                    -Message 'pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do' `
+                    -Message 'pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do. Usually a pool that owned a block before the agent was installed. Re-run Instrument-IIS.ps1 and recycle the pool: it writes the OTLP vars straight onto pools that own a block.' `
                     -Data @{ defaultsEndpoint = $defEndpoint; poolEnvKeys = @($pool.Env.Keys) })
             } else {
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target $poolName `

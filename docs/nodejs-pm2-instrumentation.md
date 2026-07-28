@@ -26,16 +26,18 @@ Per PM2 app (`deploy/Instrument-NodePM2.ps1`):
    | Env var | Value |
    |---|---|
    | `NODE_OPTIONS` | `--require <C:/cx/otel-node/.../register.js>` |
-   | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` |
+   | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://127.0.0.1:4318` |
    | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` |
    | `OTEL_SERVICE_NAME` | the PM2 app name (override-able) |
    | `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` / `OTEL_LOGS_EXPORTER` | `otlp` |
 
-   > ⚠️ **`localhost` vs `127.0.0.1`.** `http://localhost:4318` is the shipped default
-   > (`Instrument-NodePM2.ps1 -OtlpEndpoint`), but on a dual-stack host `localhost` resolves
-   > to `::1` first and OTLP export is **silently dropped**. `Test-NodeInstrumentation.ps1`
-   > flags every app with `OTLP_ENDPOINT_LOCALHOST` — a genuine finding, not a false
-   > positive. Pass `-OtlpEndpoint http://127.0.0.1:4318`.
+   > ⚠️ **`localhost` vs `127.0.0.1`.** The IPv4 literal is deliberate: on a dual-stack host
+   > `localhost` resolves to `::1` first, the collector listens on IPv4 only, and OTLP export
+   > is **silently dropped** — no exporter error, the app just looks instrumented and nothing
+   > arrives. `Instrument-NodePM2.ps1` defaults to `http://127.0.0.1:4318` and rewrites a
+   > `localhost` value passed to `-OtlpEndpoint` (`Resolve-CxOtlpEndpoint`).
+   > `Test-NodeInstrumentation.ps1` still flags `OTLP_ENDPOINT_LOCALHOST` if it finds one from
+   > another source — a genuine finding, not a false positive.
 
 3. `pm2 save` — persists the resolved env into the PM2 dump so it survives daemon restart / `pm2 resurrect`.
 4. Machine env `CX_NODE_SERVICES` = comma-joined distinct service names (Node analog of

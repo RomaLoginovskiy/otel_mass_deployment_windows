@@ -12,7 +12,7 @@ Infrastructure Explorer, and Database Monitoring light up.
 
 ```mermaid
 flowchart LR
-  A["IIS .NET app (auto-instrumented)"] -->|OTLP localhost:4318| C["OTel Collector (Windows service)"]
+  A["IIS .NET app (auto-instrumented)"] -->|OTLP 127.0.0.1:4318| C["OTel Collector (Windows service)"]
   H["Host + IIS metrics, Event Log, IIS logs"] --> C
   C -->|OTLP over HTTPS| X["Coralogix"]
 ```

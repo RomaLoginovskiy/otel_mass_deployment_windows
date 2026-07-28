@@ -99,9 +99,15 @@ Each host's **Service ownership** items are **exactly the per-app `OTEL_SERVICE_
 > **Succeeded, not merely attempted.** Some apps cannot be named at all: a shared-pool app
 > with no `web.config`, or a classic ASP.NET Framework app with no `<aspNetCore>` element to
 > write into. Those are **excluded** from `CX_IIS_SERVICES`. Including them (which the script
-> used to do) advertised ownership of a service that emits nothing and made the doctor report
+> used to do) advertised ownership of a name nothing reports under and made the doctor report
 > `CX_IIS_SERVICES_DRIFT` **permanently**, since re-running reproduced the same value. See
 > [`iis-e2e-matrix.md`](iis-e2e-matrix.md).
+>
+> **So the ownership list can be a subset.** An excluded ASP.NET Framework app still reports —
+> the instrumentation auto-detects `SiteName\VirtualPath` — so it appears in APM while the host
+> does not claim it. That is deliberate and one-directional: under-claiming costs one missing
+> ownership item, over-claiming costs permanent drift. To bring such an app under management,
+> give it a dedicated app pool so the pool variable can carry a name we chose.
 
 Result: an APM service (e.g. `SimpleWebApp`) always matches one of its host's Service-ownership
 items, so APM ↔ infrastructure resource correlation can select a single service.

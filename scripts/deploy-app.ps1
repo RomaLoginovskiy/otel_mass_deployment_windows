@@ -29,7 +29,10 @@ param(
     [string]$AppPool       = "SimpleWebAppPool",
     [int]   $Port          = 8080,
     [string]$ServiceName   = "SimpleWebApp",                    # feeds OTEL_SERVICE_NAME + both tags
-    [string]$OtlpEndpoint  = "http://localhost:4318",          # collector HTTP (http/protobuf default)
+    # IPv4 literal on purpose: the collector binds 127.0.0.1 only, and `localhost`
+    # resolves to ::1 first on a dual-stack host, which drops the export silently.
+    # A `localhost` value passed here is rewritten, not honored (see below).
+    [string]$OtlpEndpoint  = "http://127.0.0.1:4318",          # collector HTTP (http/protobuf default)
     [string]$Configuration = "Release",
     [int]   $LoadSweeps    = 40,
     [string]$Environment   = "",                               # deployment env (production/staging/dev); stamps cx_environment/cx_env + semconv, splits telemetry per env in Coralogix
@@ -49,6 +52,13 @@ $inetsrv = if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOpe
 }
 $appcmd = Join-Path $inetsrv "appcmd.exe"
 $csproj = Join-Path $SourceDir "SimpleWebApp.csproj"
+
+# Normalize a `localhost` endpoint to the IPv4 literal before it is written to any pool.
+$logHelper = Join-Path $PSScriptRoot "..\deploy\Write-DeployLog.ps1"
+if (Test-Path $logHelper) { . $logHelper }
+if (Get-Command Resolve-CxOtlpEndpoint -ErrorAction SilentlyContinue) {
+    $OtlpEndpoint = Resolve-CxOtlpEndpoint -Endpoint $OtlpEndpoint
+}
 
 # The requested OTEL resource attributes (literal Coralogix-visible tag keys).
 $resourceAttrs = "tags.CX_SERVICE_NAME=$ServiceName,tags.service=$ServiceName"

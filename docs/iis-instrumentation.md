@@ -13,7 +13,7 @@ Data flow:
 
 ```mermaid
 flowchart LR
-  A["IIS .NET app (auto-instrumented)"] -->|OTLP localhost:4318| C["OTel Collector (Windows service)"]
+  A["IIS .NET app (auto-instrumented)"] -->|OTLP 127.0.0.1:4318| C["OTel Collector (Windows service)"]
   H["Host + IIS metrics, Event Log, IIS logs"] --> C
   C -->|OTLP over HTTPS| X["Coralogix"]
 ```
@@ -253,7 +253,15 @@ There are three places to set these, in increasing order of scope.
 </configuration>
 ```
 
-**Per app, ASP.NET Framework.** Use `appSettings` in that app's `Web.config`, for example `<add key="OTEL_SERVICE_NAME" value="wallet-api" />`. If you do not set a service name, one is generated as `SiteName\VirtualDirectoryPath`, which is why some services showed up automatically during the session but were not named the way you want.
+**Per app, ASP.NET Framework — only on a dedicated pool.** Use `appSettings` in that app's `Web.config`, for example `<add key="OTEL_SERVICE_NAME" value="wallet-api" />`. Any `OTEL_*` setting works this way, and environment variables take precedence over it.
+
+⚠️ **This does not give you per-app names on a shared pool.** From the upstream configuration reference:
+
+> On .NET Framework, `OTEL_*` values from `Web.config` or `App.config` are promoted to process-level environment variables at startup, and the OTel SDK is initialized only once per process. In IIS, where multiple applications can share a single worker process (Application Pool), this means the first application to start determines the configuration for all applications in that pool.
+
+So on a shared pool the winner is a startup race, not the app you edited. The only reliable per-app naming for Framework is **one app pool per app** (then the pool environment variable carries the name and the automation below handles it, since scope selection is runtime-agnostic). This is tracked as a known gap in [`iis-e2e-matrix.md`](./iis-e2e-matrix.md) ("ASP.NET Framework app on a *shared* pool cannot be named").
+
+If you do not set a service name at all, one is auto-detected as `SiteName\VirtualDirectoryPath` — which is why some services showed up automatically during the session but were not named the way you want. Note the consequence: an unnamed Framework app **still reports**, so it is absent from `CX_IIS_SERVICES` while present in APM.
 
 **For all apps at once (host-wide).** Set the variables on the `W3SVC` and `WAS` Windows services in the registry. `Register-OpenTelemetryForIIS` already writes the profiler variables here, so you append the OTLP settings to the same multi-string value.
 
@@ -273,7 +281,7 @@ There is also a per app pool option: `Enable-OpenTelemetryForIISAppPool -AppPool
 - **Scope (dedicated pool vs shared pool).** An application that owns its app pool gets the name set on the pool — and the OTLP endpoint/protocol are re-set on that pool too, because a pool that declares its own `<environmentVariables>` stops inheriting `applicationPoolDefaults` (see Part 4). Applications that **share** a pool instead get the name written into each one's own `web.config`, since a single pool-level variable cannot distinguish co-hosted apps. Note: ASP.NET Core **in-process** hosting allows only one app per pool (a second in-process app in the same pool returns HTTP 500), so pool-sharing in practice means **out-of-process** or ASP.NET **Framework** apps — in-process apps each land on their own pool and take the pool-scoped path anyway.
 - **Overrides.** Rename specific apps with `-ServiceNameOverrides @{ 'Wallet/api' = 'wallet-api' }` or `-OverridesJson <file>` (keys are the auto-derived names).
 
-Classic ASP.NET **Framework** apps have no `<aspNetCore>` element, so the web.config writer skips them with a warning — set their name via `appSettings` as shown above. Because no app's name is stamped host-wide, host/infrastructure signals (hostmetrics, IIS receiver, event logs, access logs) no longer collapse under one app; they fall back to the collector's neutral `subsystem_name`.
+Classic ASP.NET **Framework** apps have no `<aspNetCore>` element, so the web.config writer skips them with a warning. `appSettings` is **not** a workaround here: the writer is only reached for pool-*sharing* apps, and on a shared pool `appSettings` is promoted process-wide and first-app-wins (see above). Give such an app its own pool to bring it under management. Until then it reports under the auto-detected `Site\AppPath` and is excluded from `CX_IIS_SERVICES` — the host under-claims rather than claiming a name it did not set. Because no app's name is stamped host-wide, host/infrastructure signals (hostmetrics, IIS receiver, event logs, access logs) no longer collapse under one app; they fall back to the collector's neutral `subsystem_name`.
 
 ### 4. Restart IIS or the pools
 

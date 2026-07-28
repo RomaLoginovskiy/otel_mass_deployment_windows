@@ -132,8 +132,14 @@ switch ($Case) {
         # IIS materialises the defaults into that block the first time appcmd writes
         # any var to the pool. The copy never refreshes - so changing the default
         # afterwards leaves every already-instrumented pool on the old value.
-        Set-DefaultEnv -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value 'http://127.0.0.1:4318'
-        Write-Host 'applicationPoolDefaults endpoint -> http://127.0.0.1:4318 (pools keep their old snapshot)'
+        #
+        # The value must DIFFER from what the installer wrote, or there is no drift to
+        # find. This used to set 127.0.0.1 because the shipped default was
+        # `localhost`; now the installer writes 127.0.0.1 itself, so that would be a
+        # no-op and F5 would silently assert nothing. Use a different port instead -
+        # nothing listens on 4319, which is also true to the failure being modelled.
+        Set-DefaultEnv -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value 'http://127.0.0.1:4319'
+        Write-Host 'applicationPoolDefaults endpoint -> http://127.0.0.1:4319 (pools keep their old snapshot)'
     }
 
     'profilerMalformed' {

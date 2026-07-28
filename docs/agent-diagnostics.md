@@ -93,9 +93,12 @@ Nothing in the repo read that back before.
 ### Two traps worth knowing
 
 **`localhost` silently drops OTLP.** On a dual-stack host `localhost` resolves to `::1`
-first, and export is dropped with no error. `127.0.0.1` is required. `Instrument-IIS.ps1`
-still defaults `-OtlpEndpoint` to `http://localhost:4318`, so a stock deploy will raise
-`OTLP_ENDPOINT_LOCALHOST` on every pool. That is a genuine finding, not a false positive.
+first, and export is dropped with no error. `127.0.0.1` is required. The instrumenters now
+default `-OtlpEndpoint` to `http://127.0.0.1:4318` **and** rewrite a `localhost` value passed
+explicitly (`Resolve-CxOtlpEndpoint`), so a stock deploy no longer trips this. Seeing
+`OTLP_ENDPOINT_LOCALHOST` now means the value came from somewhere else — a hand edit, a
+pre-existing pool block, or an older install — and it is a genuine finding, not a false
+positive.
 
 **A pool's environment block is a snapshot.** A pool that has its own
 `<environmentVariables>` **replaces** `applicationPoolDefaults` rather than merging with it.
@@ -104,6 +107,24 @@ the pool — and that copy never refreshes. So changing `applicationPoolDefaults
 leaves every already-instrumented pool on the old value. This is the mechanism behind "I
 fixed the endpoint centrally and half the fleet still exports nowhere", and it surfaces as
 `POOL_ENV_STALE`.
+
+The corollary bites earlier than that. A pool can acquire its own block *before* the agent is
+installed — any prior `appcmd` write of any variable creates one, a connection string being
+the usual culprit. That block was materialised from defaults that had no OTLP entries, so the
+pool never sees the ones the installer sets later, and the defaults still read as correct.
+`Instrument-IIS.ps1` therefore writes the OTLP variables directly onto every pool that owns a
+block — including *shared* pools, which are otherwise left inheriting. `POOL_LOST_INHERITANCE`
+is what an un-repaired pool looks like, and re-running the instrumenter is a real fix for it.
+
+### ASP.NET Framework apps are not in `CX_IIS_SERVICES`
+
+A classic Framework app that **shares** a pool cannot be given a name we choose: it has no
+`<aspNetCore>` element, and `appSettings` on a shared pool is promoted process-wide, so the
+first app to start would decide for all of them. Such apps are excluded from `CX_IIS_SERVICES`
+— but they still **report**, under the auto-detected `SiteName\VirtualPath`. So a Framework
+host's Service-ownership list is a legitimate subset of what it emits, and
+`IIS_SERVICE_NAME_MISSING` for such an app means "not named by us", not "not instrumented".
+Give the app a dedicated pool to bring it under management.
 
 ### `CX_NODE_SERVICES` has no consumer
 
