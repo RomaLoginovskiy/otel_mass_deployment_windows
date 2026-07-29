@@ -245,6 +245,37 @@ try {
         }
     }
 
+    # -- 3d. Publish CX_SERVICES: every service this host actually claims ---------
+    # The collector stamps host-ownership labels from ONE variable, but each instrumenter only ever
+    # publishes its own slice: CX_IIS_SERVICES, CX_NODE_SERVICES, CX_DOTNET_SERVICES. Without a union
+    # a Node or .NET service shows up in APM through its own spans while the HOST entity never claims
+    # it - so Infrastructure Explorer shows no Service ownership for it and APM<->host correlation is
+    # impossible. On a Node-only host the collector's guard was false and NO labels were stamped at
+    # all. Computed here because this is the first point at which every instrumenter has run; step 4
+    # restarts the collector, which is what makes the new value take effect.
+    $svcSeen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $svcUnion = New-Object System.Collections.Generic.List[string]
+    foreach ($varName in 'CX_IIS_SERVICES', 'CX_NODE_SERVICES', 'CX_DOTNET_SERVICES') {
+        $raw = [Environment]::GetEnvironmentVariable($varName, 'Machine')
+        if (-not $raw) { continue }
+        foreach ($n in ($raw -split ',')) {
+            $t = "$n".Trim()
+            # HashSet.Add returns false for a name another instrumenter already claimed, which is how
+            # an IIS app fronting a PM2 process is counted once rather than twice.
+            if ($t -and $svcSeen.Add($t)) { [void]$svcUnion.Add($t) }
+        }
+    }
+    if ($svcUnion.Count) {
+        $cxServices = ($svcUnion.ToArray() -join ',')
+        [Environment]::SetEnvironmentVariable('CX_SERVICES', $cxServices, 'Machine')
+        Write-Host "[agent] set machine CX_SERVICES=$cxServices ($($svcUnion.Count) service(s) claimed for host ownership)" -ForegroundColor Green
+    } elseif ([Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')) {
+        # Nothing instrumented, or everything was refused. Clear the stale value instead of leaving
+        # the host advertising ownership of services it no longer runs.
+        [Environment]::SetEnvironmentVariable('CX_SERVICES', $null, 'Machine')
+        Write-Host '[agent] no instrumented services on this host; cleared stale CX_SERVICES'
+    }
+
     # -- 4. Restart collector to pick up OTEL_RESOURCE_ATTRIBUTES ----------------
     # In Supervisor mode there is NO 'otelcol-contrib' service - the collector runs
     # as a CHILD process of 'opampsupervisor'. Restart the supervisor (which

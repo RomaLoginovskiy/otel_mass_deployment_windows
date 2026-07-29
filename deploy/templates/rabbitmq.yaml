@@ -330,13 +330,28 @@ processors:
   #     `CX_SERVICE_NAME` were IGNORED by ownership -> dropped from the set.
   # Wired into the LOGS-related pipelines only: `logs` (host/app logs) and
   # `logs/resource_catalog` (the Infra-Explorer host entity, which drives Service ownership).
-  # NOT in `traces`/`metrics` -> only log_statements is defined. Guarded on a non-empty
-  # CX_IIS_SERVICES so non-IIS hosts are left untouched.
+  # NOT in `traces`/`metrics` -> only log_statements is defined.
+  #
+  # NOT IIS-ONLY: CX_SERVICES is the union of the IIS, Node and .NET service names Install-Agent.ps1
+  # instrumented (step 3d). CX_IIS_SERVICES stays as a FALLBACK for hosts deployed by an older build.
+  # Both blocks are guarded, so a host with neither variable is left untouched.
   transform/iis_service_labels:
     error_mode: silent
     log_statements:
     - context: resource
       conditions:
+      - '"${env:CX_SERVICES:-}" != ""'
+      statements:
+      - set(resource.attributes["service"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["tags.service"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["tags.cx_svc"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["tags.CX_SERVICE_NAME"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.service"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.cx_svc"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.CX_SERVICE_NAME"], Split("${env:CX_SERVICES:-}", ","))
+    - context: resource
+      conditions:
+      - '"${env:CX_SERVICES:-}" == ""'
       - '"${env:CX_IIS_SERVICES:-}" != ""'
       statements:
       - set(resource.attributes["service"], Split("${env:CX_IIS_SERVICES:-}", ","))
