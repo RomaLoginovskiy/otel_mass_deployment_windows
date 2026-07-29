@@ -31,6 +31,10 @@
 [CmdletBinding()]
 param(
     [string]   $ApiUrl        = 'https://ng-api-http.coralogix.com/api/v1/dataprime/query',
+    # Which labelled key to use, and which regional endpoint. A US-cluster URL answers 403 for an
+    # eu1 account, and that 403 used to read as 'no data'.
+    [string]   $KeyLabel      = '',
+    [string]   $Region        = 'eu1',
     [string]   $QueryKeyFile  = (Join-Path $PSScriptRoot '..\querydata_key.txt'),
     [int]      $LookbackMinutes = 90,
     [string]   $ExpectedValue = $env:CX_IIS_SERVICES,   # the value the collector stamped
@@ -51,6 +55,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Region-aware endpoint: the default host is the US cluster, which is not where an eu1 account's
+# data lives.
+if ($Region -and $Region -ne 'us' -and $ApiUrl -notmatch [regex]::Escape(".$Region.")) {
+    $ApiUrl = "https://ng-api-http.$Region.coralogix.com/api/v1/dataprime/query"
+}
+
 # --- keys the final config emits (must match transform/iis_service_labels: 7 winners, arrays).
 # Bare cx_service / CX_SERVICE_NAME and the old *_list variants were dropped, so they are not
 # probed here.
@@ -62,7 +72,14 @@ $allKeys = @(
 
 # --- query key ---------------------------------------------------------------------------
 if (-not (Test-Path $QueryKeyFile)) { throw "Query key file not found: $QueryKeyFile (pass -QueryKeyFile)" }
-$key = (Get-Content -LiteralPath $QueryKeyFile -Raw).Trim()
+# Key extraction via the shared helper. Taking the whole file was silently fatal: a real key file
+# holds several LABELLED lines ('watcher - cxup_...'), so the Bearer token became a multi-line blob,
+# the API answered 403, and every query returned empty - which this script then reported as "no
+# telemetry". See scripts\CxQuery.Common.ps1.
+. (Join-Path $PSScriptRoot 'CxQuery.Common.ps1')
+$__cxKey = Get-CxQueryKey -Path $QueryKeyFile -Label $KeyLabel
+$key = $__cxKey.Token
+Write-Host ("  key    : {0}" -f $(if ($__cxKey.Label) { "'" + $__cxKey.Label + "'" } else { '<unlabelled>' }))
 if (-not $key) { throw "Query key file is empty: $QueryKeyFile" }
 
 $endUtc   = (Get-Date).ToUniversalTime()

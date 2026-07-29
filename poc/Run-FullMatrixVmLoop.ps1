@@ -513,8 +513,12 @@ try {
                     Marker   = $(if (Test-Path "$dir\cx-payload-id.txt") { (Get-Content "$dir\cx-payload-id.txt" -Raw).Trim() } else { '' })
                     HasBat   = (Test-Path "$dir\deploy.bat")
                     HasAgent = (Test-Path "$dir\Install-Agent.ps1")
-                    # Anything at the PARENT level would shadow us if deploy.bat were run from there.
-                    ParentPs1 = @(Get-ChildItem $stage -Filter '*.ps1' -ErrorAction SilentlyContinue).Count
+                    # Only the payload's own ENTRY POINTS can shadow: deploy.bat resolves
+                    # Install-Agent.ps1 / Uninstall-Agent.ps1 next to itself. The harness's own
+                    # transport step scripts also live at this level (step-N.ps1, wrap-N.ps1) and are
+                    # harmless - counting them turned a correct staging into a failure.
+                    ParentPs1 = @(Get-ChildItem $stage -Filter '*.ps1' -ErrorAction SilentlyContinue |
+                                  Where-Object { $_.Name -in @('Install-Agent.ps1','Uninstall-Agent.ps1') }).Count
                 } | ConvertTo-Json -Compress
             } -ArgumentList @($GuestStage) -TimeoutSeconds 300
             if ($payload) {
@@ -761,6 +765,29 @@ try {
                 Note 'Verify-CoralogixInfraLabels.ps1 missing' 'host-telemetry gate skipped'
             }
 
+            # PER-APPLICATION gate. This is the one that makes the matrix mean something: every
+            # instrumented shape must be visible in Coralogix under its own service name, and every
+            # shape the classification rules declined must be visible NOWHERE. Local state cannot
+            # distinguish "claimed and reporting" from "claimed and silent" - only the backend can,
+            # and a silent claimed Service reads as an outage.
+            $svcVerifier = Join-Path $RepoRoot 'scripts\Verify-CoralogixServiceTelemetry.ps1'
+            if (Test-Path $svcVerifier) {
+                Write-Host '  (per-application spans: every instrumented shape, and every refusal case)'
+                $expectReporting = @($svcNames.Net8, $svcNames.Net8Oop, $svcNames.Net6, $svcNames.Fw48,
+                                     $svcNames.NodeSvc, $svcNames.DotnetSvc, 'shape-user-fork')
+                # The refusal cases: a CLR-2 app the profiler cannot instrument, an ARR proxy whose
+                # backend reports instead, a static site, a config-less app, and the deliberately
+                # ambiguous bin-only app.
+                $expectSilent = @($svcNames.Clr2, 'arrproxy', 'staticwc', 'nocfg', 'binonly')
+                $sArgs = @('-QueryKeyFile', $QueryKeyFile, '-HostName', $HostRename,
+                           '-Services', ($expectReporting -join ','),
+                           '-MustBeSilent', ($expectSilent -join ','))
+                $r = Invoke-HostScript -Path $svcVerifier -Arguments $sArgs -Tail 24
+                Assert-True 'every instrumented shape reports spans, every refusal case is silent' ($r.Code -eq 0) $r.Out
+            } else {
+                Note 'Verify-CoralogixServiceTelemetry.ps1 missing' 'per-application telemetry was NOT verified - this run proves nothing about individual shapes'
+            }
+
             $nodeVerifier = Join-Path $RepoRoot 'scripts\Verify-CoralogixNodeSpans.ps1'
             if (Test-Path $nodeVerifier) {
                 Write-Host '  (Node spans + logs)'
@@ -773,6 +800,19 @@ try {
                 # (single value, so no join needed here - but keep the shape identical if more are added)
                 $r = Invoke-HostScript -Path $nodeVerifier -Arguments $nArgs
                 Assert-True 'Node telemetry verified in Coralogix' ($r.Code -eq 0) $r.Out
+            }
+
+            # The Coralogix APPLICATION name. CX_APPLICATION is deliberately unset by this matrix, so
+            # the exporter must fall through to host.name - and that fallback is the only mechanism
+            # that works (cx.application.name alone is dead code), which makes it worth gating rather
+            # than assuming. It also proves nothing from this host is still reporting under a stale
+            # application name.
+            $appVerifier = Join-Path $RepoRoot 'scripts\Verify-CoralogixAppName.ps1'
+            if (Test-Path $appVerifier) {
+                Write-Host '  (application name = host.name fallback)'
+                $r = Invoke-HostScript -Path $appVerifier `
+                        -Arguments @('-QueryKeyFile', $QueryKeyFile, '-ExpectedApplication', $HostRename)
+                Assert-True 'Coralogix application name resolves to the host name' ($r.Code -eq 0) $r.Out
             }
         }
     }
