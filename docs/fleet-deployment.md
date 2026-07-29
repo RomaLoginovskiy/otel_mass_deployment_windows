@@ -894,8 +894,8 @@ The supervisor parses its `config.yaml`, then **re-serializes** the AgentDescrip
 the merged config text without escaping backslashes, and parses that text again. One level of
 backslash escaping is consumed per pass, so the quoting that looks right is the one that fails.
 
-Measured against a real `opampsupervisor` on a Windows VM (`poc\Run-SupervisorVmLoop.ps1`, guest
-`cx-fleet-test`) for `workload.pm2.home = C:\ProgramData\pm2` and
+Measured against a real `opampsupervisor` on a Windows VM for
+`workload.pm2.home = C:\ProgramData\pm2` and
 `workload.pm2.owner = NT AUTHORITY\LocalService`:
 
 | In `config.yaml` | What the 2nd parse sees | Outcome |
