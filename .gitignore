@@ -78,8 +78,25 @@ misc/*.log
 test/*
 # Fixture-only unit suites: no baked binaries, no keys, run from a clean clone.
 !test/Test-SupervisorConfigWriter.ps1
+!test/Test-ServiceInstrumenters.ps1
 !test/docker-win
 test/docker-win/*
+
+# E2E app fixtures: SOURCE is tracked (a few KB of .cs / .aspx / .csproj), build output is not.
+# test/fixtures/out is produced by Build-Fixtures.ps1 on the host and pushed into a guest, so it is
+# regenerable and would otherwise add tens of MB of published binaries to the repo.
+!test/fixtures
+test/fixtures/*
+!test/fixtures/Build-Fixtures.ps1
+!test/fixtures/apps
+test/fixtures/apps/*
+!test/fixtures/apps/coreweb
+!test/fixtures/apps/fw48
+!test/fixtures/apps/clr2
+!test/fixtures/apps/workersvc
+# Never track intermediate build state even under a re-included directory.
+test/fixtures/apps/*/bin/
+test/fixtures/apps/*/obj/
 
 # Runtime-classification unit tests. Fixture-only: no Docker, no IIS, no elevation, no keys,
 # about a second to run - the fastest gate on the detection rules, and the only thing that
