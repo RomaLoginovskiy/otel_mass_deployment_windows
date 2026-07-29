@@ -51,6 +51,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# $PSScriptRoot is not populated while the param block's DEFAULTS are being evaluated, so every
+# default above built with Join-Path $PSScriptRoot throws
+# "ParameterArgumentValidationErrorEmptyStringNotAllowed" before the script body ever runs -
+# `-Action Unattended` could only be used by passing -IsoPath explicitly. Repair the paths here,
+# the same way the other scripts in this repo do, so the documented invocations work.
+$here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $IsoPath)      { $IsoPath      = Join-Path $here '..\vm_images\26100.32230.260111-0550.lt_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso' }
+if (-not $PackagePath)  { $PackagePath  = Join-Path $here '..\coralogix-agent-deploy.zip' }
+if (-not $AdditionsIso) { $AdditionsIso = Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxGuestAdditions.iso' }
+
 $vbox = Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxManage.exe'
 if (-not (Test-Path $vbox)) { $vbox = 'VBoxManage.exe' }  # rely on PATH
 function VBox { & $vbox @args; if ($LASTEXITCODE -ne 0) { throw "VBoxManage failed: $($args -join ' ')" } }

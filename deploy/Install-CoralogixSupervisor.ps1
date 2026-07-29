@@ -149,94 +149,117 @@ function Assert-Admin {
 
 function ConvertTo-SupervisorAttrScalar {
     <#
-      A value as the ONE scalar form the OpAMP Supervisor round-trips correctly:
-      single-quoted, with every backslash in the value DOUBLED.
+      Render one AgentDescription value as the YAML scalar text that survives the supervisor.
 
-      The doubling looks wrong and is not. The supervisor does not merely parse its config.yaml
-      once: it re-serializes AgentDescription values into the merged config text WITHOUT
-      escaping backslashes, then parses that text again. One level of backslash escaping is
-      consumed per pass, so what the first parse yields has to still be valid YAML on the
-      second. Measured on a real supervisor (Windows VM, poc\Run-SupervisorVmLoop.ps1), for
-      workload.pm2.home = C:\ProgramData\pm2:
+      The supervisor does not parse config.yaml once. It re-serializes
+      agent.description.non_identifying_attributes into the config text it composes for the
+      collector WITHOUT escaping backslashes, and parses that text again - so one level of
+      backslash escaping is consumed per pass. Measured against the real binary on a Windows VM
+      (poc\Run-SupervisorVmLoop.ps1), for the value C:\ProgramData\pm2:
 
-        file: "C:\\ProgramData\\pm2"    1st parse -> C:\ProgramData\pm2
-                                        2nd parse -> \p is not an escape
-                                        => SERVICE DEAD: 'could not compose initial merged
-                                           config: yaml: line 49: found unknown escape character'
+        "C:\ProgramData\pm2"        DEAD  - "load config: retrieved value (type=string) cannot be
+                                    used as a Conf ... found unknown escape character". This is
+                                    the reported OTIOMWQA01 failure.
+        'C:\ProgramData\pm2'        DEAD  - "could not compose initial merged config ... found
+                                    unknown escape character". Quoting style alone is NOT the fix.
+        "C:\\ProgramData\\pm2"      DEAD  - valid YAML, still re-emitted unescaped.
+        "NT AUTHORITY\\LocalService" STARTS but the value is SILENTLY CORRUPTED: on the second
+                                    pass \L is a legal escape (U+2028), giving
+                                    NT AUTHORITY<U+2028>ocalService. "Service is Running" is
+                                    therefore not a sufficient check.
+        'C:/ProgramData/pm2'        STARTS, but the value is lossy - it is no longer the path.
+        'C:\\ProgramData\\pm2'      STARTS and the value arrives EXACT. <- canonical form.
 
-        file: "NT AUTHORITY\\LocalService"  2nd parse -> \L IS an escape (U+2028 LINE SEP)
-                                        => service starts, value SILENTLY CORRUPTED to
-                                           'NT AUTHORITY<U+2028>       ocalService'
-
-        file: 'C:\\ProgramData\\pm2'    1st parse -> C:\\ProgramData\\pm2
-                                        2nd parse -> C:\ProgramData\pm2
-                                        => service starts AND the value is exact. <-- this form
-
-      Single quotes are preferred over the equivalent "C:\\\\ProgramData\\\\pm2" purely for
-      legibility: inside single quotes the only other escape is '' for an apostrophe.
+      So: double every backslash, then wrap in single quotes (doubling any apostrophe) so a quote
+      in a value cannot break the document either.
     #>
     param([string] $Value)
+    $v = ([string]$Value).Replace('\', '\\')
+    return "'" + ($v -replace "'", "''") + "'"
+}
 
-    $doubled = ([string]$Value) -replace '\\', '\\'
-    return "'" + ($doubled -replace "'", "''") + "'"
+function Expand-CxBackslashEscapes {
+    <#
+      One lenient backslash-unescaping pass, modelling what the supervisor's SECOND parse does to
+      a value. Escapes we honour are collapsed; anything else keeps its backslash, because an
+      escape the parser would reject is a backslash the writer meant literally.
+    #>
+    param([string] $Text)
+
+    $s = [string]$Text
+    if (-not $s.Contains('\')) { return $s }
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $s.Length; $i++) {
+        if ($s[$i] -ne '\' -or $i -eq $s.Length - 1) { [void]$sb.Append($s[$i]); continue }
+        switch -CaseSensitive ("$($s[$i + 1])") {
+            '\' { [void]$sb.Append('\');      $i++ }
+            '"' { [void]$sb.Append('"');      $i++ }
+            '/' { [void]$sb.Append('/');      $i++ }
+            't' { [void]$sb.Append([char]9);  $i++ }
+            'n' { [void]$sb.Append([char]10); $i++ }
+            'r' { [void]$sb.Append([char]13); $i++ }
+            default { [void]$sb.Append('\') }
+        }
+    }
+    return $sb.ToString()
 }
 
 function Get-SupervisorAttrValue {
     <#
-      The YAML value a scalar already on disk denotes, so a line can be re-canonicalized
-      without changing what it means. Only the two quotings we ever encounter are decoded:
-      double (escapes processed) and single (literal, '' -> '). An unquoted scalar is literal.
+      Best-effort recovery of the value the collector would ACTUALLY end up with, given an
+      existing scalar's raw text - so a non-canonical line can be rewritten without changing what
+      it meant.
+
+      Two passes, because the supervisor parses this field twice:
+        1. YAML: a single-quoted scalar is literal apart from '' for an apostrophe; a
+           double-quoted scalar gets its escapes decoded.
+        2. The supervisor re-emits that text unescaped and parses it again - modelled by
+           Expand-CxBackslashEscapes.
+
+      So 'C:\\ProgramData\\pm2' decodes to C:\ProgramData\pm2 (the canonical form round-trips),
+      while both 'C:\ProgramData\pm2' and "C:\ProgramData\pm2" also decode to C:\ProgramData\pm2 -
+      they carry the same intent but do not survive the second pass.
+    #>
+    param([string] $Raw)
+    return (Expand-CxBackslashEscapes -Text (Get-SupervisorAttrFirstPass -Raw $Raw))
+}
+
+function Get-SupervisorAttrFirstPass {
+    <# The value after YAML parses this scalar once - i.e. the text the supervisor then re-emits. #>
+    param([string] $Raw)
+
+    $t = ([string]$Raw).Trim()
+    if ($t.Length -ge 2 -and $t.StartsWith("'") -and $t.EndsWith("'")) {
+        return $t.Substring(1, $t.Length - 2).Replace("''", "'")
+    }
+    if ($t.Length -ge 2 -and $t.StartsWith('"') -and $t.EndsWith('"')) {
+        return (Expand-CxBackslashEscapes -Text $t.Substring(1, $t.Length - 2))
+    }
+    return $t   # a plain scalar carries no escapes at all
+}
+
+function Test-SupervisorAttrScalarNeedsFix {
+    <#
+      Must this existing scalar be rewritten? Yes only when a backslash SURVIVES the first parse
+      and the scalar is not already canonical - because that is precisely the case the supervisor's
+      second parse either rejects (dead service) or silently rewrites (corrupted value).
+
+      A value like "col1\tcol2" is deliberately left alone: its backslash is consumed by the first
+      parse, so the second parse sees a tab and cannot damage it. Rewriting it would be churn on a
+      line we did not author.
     #>
     param([string] $Raw)
 
-    $r = ([string]$Raw).Trim()
-    if ($r.Length -ge 2 -and $r.StartsWith('"') -and $r.EndsWith('"')) {
-        # Scanned character by character rather than with a chain of -replace calls: a
-        # sequential replace has to hide already-decoded backslashes behind a sentinel, and any
-        # sentinel is also a regex pattern (PS 5.1 has no `u{...} escape, so `u{0001} becomes
-        # the quantifier u{1} and silently eats a literal 'U' - which is exactly the bug this
-        # decoder is meant to prevent elsewhere).
-        $inner = $r.Substring(1, $r.Length - 2)
-        $sb = New-Object System.Text.StringBuilder
-        for ($i = 0; $i -lt $inner.Length; $i++) {
-            if ($inner[$i] -ne '\' -or $i -eq $inner.Length - 1) { [void]$sb.Append($inner[$i]); continue }
-            $i++
-            switch ($inner[$i]) {
-                '\'     { [void]$sb.Append('\') }
-                '"'     { [void]$sb.Append('"') }
-                '/'     { [void]$sb.Append('/') }
-                't'     { [void]$sb.Append("`t") }
-                'n'     { [void]$sb.Append("`n") }
-                'r'     { [void]$sb.Append("`r") }
-                '0'     { [void]$sb.Append([char]0) }
-                default { [void]$sb.Append($inner[$i]) }   # unknown escape: keep the character
-            }
-        }
-        return $sb.ToString()
-    }
-    if ($r.Length -ge 2 -and $r.StartsWith("'") -and $r.EndsWith("'")) {
-        return ($r.Substring(1, $r.Length - 2) -replace "''", "'")
-    }
-    return $r
+    if (-not ([string]$Raw).Contains('\')) { return $false }
+    if (-not (Get-SupervisorAttrFirstPass -Raw $Raw).Contains('\')) { return $false }
+    return (-not (Test-SupervisorAttrScalarCanonical -Raw $Raw))
 }
 
 function Test-SupervisorAttrScalarCanonical {
-    <#
-      Whether a line's scalar is already the round-trip-safe form: every backslash in the YAML
-      value doubled. Anything else is rewritten - including forms that are perfectly valid YAML
-      but do not survive the supervisor's second parse, which is the whole trap.
-    #>
+    <# Is this raw scalar text already exactly what ConvertTo-SupervisorAttrScalar would write? #>
     param([string] $Raw)
-
-    $v = Get-SupervisorAttrValue -Raw $Raw
-    if ($v -notmatch '\\') { return $true }
-    # Walk the value: every backslash must come in a pair.
-    for ($i = 0; $i -lt $v.Length; $i++) {
-        if ($v[$i] -ne '\') { continue }
-        if ($i + 1 -ge $v.Length -or $v[$i + 1] -ne '\') { return $false }
-        $i++
-    }
-    return $true
+    $decoded = Get-SupervisorAttrValue -Raw $Raw
+    return (([string]$Raw).Trim() -ceq (ConvertTo-SupervisorAttrScalar $decoded))
 }
 
 function Set-SupervisorDescriptionAttributes {
@@ -245,9 +268,6 @@ function Set-SupervisorDescriptionAttributes {
       Supervisor's config.yaml `agent.description.non_identifying_attributes`, so they show
       up in the Coralogix Fleet Management AgentDescription. The vendor installer writes
       only static service.name/cx.agent.type there. Best-effort: never fails the install.
-
-      Values go through ConvertTo-SupervisorAttrScalar - read its notes before changing the
-      quoting, because the obvious choices are the broken ones.
     #>
     param([string] $ConfigPath, [string] $Attributes)
 
@@ -282,86 +302,248 @@ function Set-SupervisorDescriptionAttributes {
 
     # Keys already present in the block (child lines indented under the anchor).
     #
-    # The same pass RE-CANONICALIZES any existing value whose backslashes are not doubled. Two
-    # reasons it has to happen here rather than only for keys we add:
-    #   * a host written by an earlier version of this function is already broken - its
-    #     supervisor will not start - and a key that is present is skipped below, so without
-    #     this a re-deploy would "succeed" and leave the host dead
-    #   * a value can be valid YAML, start the service, and still be wrong (\L decodes to
-    #     U+2028 on the supervisor's second parse), which no service-status check would catch
-    $existing = @{}; $repaired = @()
+    # The same pass CANONICALIZES any value CONTAINING A BACKSLASH that is not already in the form
+    # ConvertTo-SupervisorAttrScalar would write. Neither half is cosmetic:
+    #
+    #   * un-doubled backslashes kill the service on the supervisor's second parse, and a key that
+    #     is already present is otherwise skipped below - so without this pass a re-deploy is a
+    #     no-op on an already-broken host, which is exactly what happened on OTIOMWQA01.
+    #   * a value whose second-pass escape happens to be LEGAL (\L, \b, \t, \n) starts fine and
+    #     silently rewrites itself, so "the service is Running" cannot be the test. Only "the
+    #     scalar is already exactly canonical" can be.
+    #
+    # Only backslash-bearing values are touched. A value without one cannot be hurt by the second
+    # parse, so the vendor's own double-quoted service.name / cx.agent.type lines are left exactly
+    # as the installer wrote them rather than churned into our quoting style.
+    $existing = @{}; $fixed = @()
     for ($j = $anchor + 1; $j -lt $lines.Count; $j++) {
         if ($lines[$j] -match '^\s*#') { continue }
         if ($lines[$j] -notmatch ("^" + [regex]::Escape($itemIndent) + "\S")) { break }
         if ($lines[$j] -match '^(\s*)([^:\s]+)\s*:\s*(\S.*?)\s*$') {
-            $ind = $Matches[1]; $key = $Matches[2]; $raw = $Matches[3]
-            if (-not (Test-SupervisorAttrScalarCanonical -Raw $raw)) {
-                $trueVal = Get-SupervisorAttrValue -Raw $raw
-                $lines[$j] = '{0}{1}: {2}' -f $ind, $key, (ConvertTo-SupervisorAttrScalar -Value $trueVal)
-                $repaired += $key
+            $indent0 = $Matches[1]; $key0 = $Matches[2]; $raw = $Matches[3]
+            if (Test-SupervisorAttrScalarNeedsFix -Raw $raw) {
+                $intended  = Get-SupervisorAttrValue -Raw $raw
+                $lines[$j] = "{0}{1}: {2}" -f $indent0, $key0, (ConvertTo-SupervisorAttrScalar $intended)
+                $fixed += $key0
             }
         }
         if ($lines[$j] -match '^\s*([^:\s]+)\s*:') { $existing[$Matches[1]] = $true }
     }
+    if ($fixed.Count -gt 0) {
+        Write-Warning "[supervisor] canonicalized AgentDescription values whose backslashes would not survive the supervisor's second parse: $($fixed -join ', ')"
+    }
 
-    $insert = @(); $added = @()
+    $insert = @(); $added = @(); $doubled = @()
     foreach ($k in $pairs.Keys) {
         if ($existing.ContainsKey($k)) { continue }
-        $insert += ('{0}{1}: {2}' -f $itemIndent, $k, (ConvertTo-SupervisorAttrScalar -Value $pairs[$k]))
-        $added += $k
+        $v = [string]$pairs[$k]
+        if ($v.Contains('\')) { $doubled += $k }
+        $insert += ("{0}{1}: {2}" -f $itemIndent, $k, (ConvertTo-SupervisorAttrScalar $v)); $added += $k
     }
-    if ($repaired.Count -gt 0) {
-        Write-Warning "[supervisor] re-quoted AgentDescription values that the supervisor cannot round-trip (backslashes were not doubled): $($repaired -join ', ')"
+    if ($doubled.Count -gt 0) {
+        Write-Host "[supervisor] backslashes doubled in AgentDescription values (the supervisor parses this field twice): $($doubled -join ', ')"
     }
-    if ($insert.Count -eq 0 -and $repaired.Count -eq 0) {
+    if ($insert.Count -eq 0 -and $fixed.Count -eq 0) {
         Write-Host "[supervisor] AgentDescription already carries the selector attributes"; return
     }
 
     $new = @($lines[0..$anchor]) + $insert
     if (($anchor + 1) -le ($lines.Count - 1)) { $new += $lines[($anchor + 1)..($lines.Count - 1)] }
     Set-Content -Path $ConfigPath -Value $new -Encoding utf8
-    Write-Host "[supervisor] published selector attributes to AgentDescription ($($insert.Count) added, $($repaired.Count) re-quoted): $($added -join ', ')"
+    Write-Host "[supervisor] published selector attributes to AgentDescription ($($insert.Count) added, $($fixed.Count) canonicalized): $($added -join ', ')"
+}
+
+function Publish-SupervisorAgentDescription {
+    <#
+      Inject the selector attributes into the supervisor's config.yaml and leave the service
+      RUNNING - or leave the config as it was.
+
+      This is a function rather than inline install steps for one reason: it is the only
+      place in the deploy that can take a working agent off the air, and the rollback branch
+      is the part most likely to rot. Inline, it could only be exercised by a full vendor
+      reinstall on a real host, which no harness does; as a function, both
+      test\Test-SupervisorConfigWriter.ps1 and poc\Run-SupervisorVmLoop.ps1 can drive it -
+      the latter against the real supervisor binary, which is the only thing that can prove
+      go-yaml accepts what we write.
+
+      Returns a result object ($_.Applied / $_.RolledBack / $_.Reason) so a caller - or the
+      VM loop - can assert on the outcome instead of parsing host output.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $ConfigPath,
+        [string] $Attributes
+    )
+
+    $result = [pscustomobject]@{ Applied = $false; RolledBack = $false; Reason = $null; ServiceRunning = $false }
+
+    # A rollback copy taken immediately before OUR edit, independent of the -Session
+    # (uninstall-time) backup: the edit is the last thing between a working supervisor and a
+    # dead one, so the undo has to exist even on a plain install with no session.
+    $preEditCopy = "$ConfigPath.pre-agentdesc"
+    if (Test-Path $ConfigPath) { Copy-Item $ConfigPath $preEditCopy -Force -ErrorAction SilentlyContinue }
+
+    Set-SupervisorDescriptionAttributes -ConfigPath $ConfigPath -Attributes $Attributes
+
+    try {
+        if (-not (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue)) {
+            $result.Reason = 'no opampsupervisor service on this host'
+            return $result
+        }
+
+        # The vendor installer registers the service with StartType=Manual. After a reboot the
+        # supervisor stays Stopped -> the agent silently drops off Fleet Management and no
+        # telemetry ships until someone starts it by hand. Automatic + delayed start + failure
+        # actions together are what actually make it come back (see Set-SupervisorServiceResilience:
+        # Automatic alone was measured to be insufficient).
+        Set-Service -Name 'opampsupervisor' -StartupType Automatic -ErrorAction SilentlyContinue
+        Write-Host "[supervisor] set opampsupervisor StartType=Automatic"
+        Set-SupervisorServiceResilience
+
+        # The restart is VERIFIED, not fire-and-forget. It used to run with -ErrorAction
+        # SilentlyContinue followed by an unconditional "restarted" message, so an edit that
+        # made config.yaml unparseable left the service dead while the install still reported
+        # success - the failure only surfaced the next time an operator ran Restart-Service by
+        # hand. A config we just wrote that the supervisor will not load is our bug, so roll it
+        # back rather than leave the host with no agent.
+        if (Restart-SupervisorVerified) {
+            Write-Host "[supervisor] restarted opampsupervisor and confirmed Running (AgentDescription attributes applied)"
+            Remove-Item $preEditCopy -Force -ErrorAction SilentlyContinue
+            $result.Applied = $true; $result.ServiceRunning = $true
+            return $result
+        }
+
+        $result.Reason = Get-SupervisorStartError
+        Write-Warning "[supervisor] opampsupervisor did not start after the AgentDescription edit$(if ($result.Reason) { ": $($result.Reason)" })"
+        if (Test-Path $preEditCopy) {
+            Copy-Item $preEditCopy $ConfigPath -Force
+            $result.RolledBack = $true
+            if (Restart-SupervisorVerified) {
+                $result.ServiceRunning = $true
+                Write-Warning "[supervisor] rolled back $ConfigPath to the pre-edit copy; service is running WITHOUT the selector attributes (Fleet Management grouping by cx.host.role/workload.* will not work on this host)"
+            } else {
+                Write-Warning "[supervisor] rollback did not start the service either - the failure predates our edit. Inspect: Get-EventLog -LogName Application -Source opampsupervisor -Newest 20"
+            }
+        }
+        return $result
+    } catch {
+        Write-Warning "[supervisor] could not configure/restart opampsupervisor: $_"
+        $result.Reason = "$_"
+        return $result
+    }
+}
+
+function Set-SupervisorServiceResilience {
+    <#
+      Make the supervisor service survive a reboot on its own.
+
+      StartType=Automatic is not enough, and that was measured rather than assumed: on a rebooted
+      Server 2025 test host the service started at boot and exited 27 seconds later, and because
+      the vendor installer configures no recovery actions (sc qfailure shows RESET_PERIOD 0 and no
+      COMMAND_LINE), nothing retried. The host sat with no agent, reporting nothing, until someone
+      ran Start-Service by hand - the exact silent-gap this deploy is supposed to close. Starting it
+      manually a minute later worked, so the boot-time exit is a race with something that is not
+      ready yet, not a bad config.
+
+      Two standard service settings fix it:
+        * delayed auto-start - start after the boot-critical services, once networking has settled
+        * failure actions - let the SCM restart the process if it exits unexpectedly, with backoff
+
+      Both are idempotent, and both are applied through sc.exe because Set-Service in PowerShell 5.1
+      can express neither. Never fatal: a host with a running agent and no recovery actions is worse
+      off than one with them, but still better off than a failed install.
+    #>
+    try {
+        # `start= delayed-auto` - the space after each '=' is required by sc.exe.
+        $null = & sc.exe config opampsupervisor start= delayed-auto
+        if ($LASTEXITCODE -eq 0) { Write-Host "[supervisor] start type = delayed auto-start (starts after networking settles)" }
+        else { Write-Warning "[supervisor] could not set delayed auto-start (sc.exe exit $LASTEXITCODE)" }
+
+        # Restart after 30s, then 60s, then every 2 min; forget the failure count after a day.
+        $null = & sc.exe failure opampsupervisor reset= 86400 actions= restart/30000/restart/60000/restart/120000
+        if ($LASTEXITCODE -eq 0) { Write-Host "[supervisor] failure actions = restart after 30s / 60s / 120s (a boot-time exit no longer leaves the host unmonitored)" }
+        else { Write-Warning "[supervisor] could not set failure actions (sc.exe exit $LASTEXITCODE)" }
+
+        # By default the SCM runs those actions only when a service dies with a failure code. The
+        # supervisor exits cleanly when it gives up, which counts as a NON-crash failure and would
+        # skip recovery entirely - so the flag has to be set as well, or the actions above are
+        # decoration on exactly the case that matters.
+        $null = & sc.exe failureflag opampsupervisor 1
+        if ($LASTEXITCODE -eq 0) { Write-Host "[supervisor] recovery also applies to a clean exit (failureflag=1)" }
+        else { Write-Warning "[supervisor] could not set failureflag (sc.exe exit $LASTEXITCODE)" }
+    } catch {
+        Write-Warning "[supervisor] could not configure service resilience: $_"
+    }
 }
 
 function Restart-SupervisorVerified {
     <#
-      Restart opampsupervisor and answer whether it is actually Running afterwards.
+      Restart opampsupervisor and answer whether it is actually RUNNING afterwards.
       Restart-Service reports success as soon as the SCM accepts the start, and a config the
-      supervisor cannot load makes the process exit immediately after that - so the status is
-      re-read, twice, with a settle gap.
+      supervisor cannot load makes the process exit right after that - so the status is re-read
+      and confirmed to still be Running a moment later.
+
+      Two details are deliberate:
+
+      * stop-then-start instead of Restart-Service. Observed on a Server 2025 test host: a start
+        that races the previous process's shutdown intermittently fails with "could not compose
+        initial merged config", on a config that loads fine when the binary is run by hand a
+        moment later. Waiting for Stopped before starting removes that race.
+      * one retry before reporting failure. The caller's response to a failure is to ROLL BACK,
+        so a transient start failure would throw away a perfectly good config (and with it this
+        host's Fleet Management grouping). Only a second consecutive failure is treated as a
+        verdict about the config.
     #>
-    param([int] $TimeoutSeconds = 25)
+    param([int] $TimeoutSeconds = 25, [int] $Attempts = 2)
 
-    try { Restart-Service -Name 'opampsupervisor' -Force -ErrorAction Stop }
-    catch { return $false }
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Stop-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
+            $stopBy = (Get-Date).AddSeconds(15)
+            do {
+                $s = Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue
+                if (-not $s -or $s.Status -eq 'Stopped') { break }
+                Start-Sleep -Milliseconds 500
+            } while ((Get-Date) -lt $stopBy)
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        $svc = Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status -eq 'Running') {
-            Start-Sleep -Seconds 3
-            $svc.Refresh()
-            if ($svc.Status -eq 'Running') { return $true }
+            Start-Sleep -Seconds 2   # let the old process finish writing its state directory
+            Start-Service -Name 'opampsupervisor' -ErrorAction Stop
+        } catch {
+            if ($attempt -lt $Attempts) { Write-Host "[supervisor] start attempt $attempt failed ($($_.Exception.Message.Trim())); retrying once"; Start-Sleep -Seconds 5; continue }
+            return $false
         }
-        Start-Sleep -Milliseconds 700
-    } while ((Get-Date) -lt $deadline)
+
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        $running  = $false
+        do {
+            $svc = Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') {
+                Start-Sleep -Seconds 3; $svc.Refresh()
+                if ($svc.Status -eq 'Running') { $running = $true; break }
+            }
+            Start-Sleep -Milliseconds 500
+        } while ((Get-Date) -lt $deadline)
+
+        if ($running) { return $true }
+        if ($attempt -lt $Attempts) { Write-Host "[supervisor] service did not stay Running on attempt $attempt; retrying once"; Start-Sleep -Seconds 5 }
+    }
     return $false
 }
 
 function Get-SupervisorStartError {
     <#
       The one line from the supervisor's own event-log entries that says WHY it refused to
-      start. Without it an operator sees only StartServiceFailed from the SCM; the actual cause
-      ('yaml: line 49: found unknown escape character') is written nowhere else.
+      start. Without this the operator sees only StartServiceFailed from the SCM and has to
+      go digging - the actual cause (e.g. 'yaml: line 33: found unknown escape character')
+      is only ever written here.
     #>
     try {
-        $e = Get-EventLog -LogName Application -Source 'opampsupervisor' -EntryType Error -Newest 15 -ErrorAction Stop |
+        $e = Get-EventLog -LogName Application -Source 'opampsupervisor' -EntryType Error -Newest 10 -ErrorAction Stop |
                 Where-Object { $_.Message -match 'failed to start service' } |
                 Select-Object -First 1
         if (-not $e) { return $null }
-        $m = [regex]::Match([string]$e.Message, 'failed to start service:[^''"]*')
+        $m = [regex]::Match($e.Message, 'failed to start service:[^''"]*')
         if ($m.Success) { return $m.Value.Trim() }
-        return ([string]$e.Message -split "`n" | Select-Object -First 1).Trim()
+        return ($e.Message -split "`n" | Select-Object -First 1).Trim()
     } catch { return $null }
 }
 
@@ -586,45 +768,7 @@ if ($NoSupervisor) {
     # Fleet Management can group / assign config by them, then restart to apply.
     $supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Supervisor\config.yaml'
     if ($Session) { Backup-DeployFile -Session $Session -Path $supervisorConfig | Out-Null }
-
-    # A rollback copy taken immediately before OUR edit, independent of -Session (which exists
-    # only to reverse an uninstall): this edit is the last thing standing between a working
-    # supervisor and a dead one, so the undo has to exist on a plain install too.
-    $preEditCopy = "$supervisorConfig.pre-agentdesc"
-    if (Test-Path $supervisorConfig) { Copy-Item $supervisorConfig $preEditCopy -Force -ErrorAction SilentlyContinue }
-
-    Set-SupervisorDescriptionAttributes -ConfigPath $supervisorConfig -Attributes $ResourceAttributes
-    try {
-        if (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue) {
-            # The vendor installer registers the service with StartType=Manual. After a reboot the
-            # supervisor stays Stopped -> the agent silently drops off Fleet Management and no
-            # telemetry ships until someone starts it by hand. Force Automatic so it survives reboots.
-            Set-Service -Name 'opampsupervisor' -StartupType Automatic -ErrorAction SilentlyContinue
-            Write-Host "[supervisor] set opampsupervisor StartType=Automatic (survives reboot)"
-
-            # VERIFIED, not fire-and-forget. This used to be Restart-Service with
-            # -ErrorAction SilentlyContinue followed by an unconditional "restarted" message, so
-            # an edit that made config.yaml unloadable left the service dead while the install
-            # reported success - the failure surfaced only when an operator next ran
-            # Restart-Service by hand. A config we just wrote that the supervisor refuses is our
-            # bug, so put the old one back rather than leave the host with no agent.
-            if (-not (Restart-SupervisorVerified)) {
-                $reason = Get-SupervisorStartError
-                Write-Warning "[supervisor] opampsupervisor did not start after the AgentDescription edit$(if ($reason) { ": $reason" })"
-                if (Test-Path $preEditCopy) {
-                    Copy-Item $preEditCopy $supervisorConfig -Force
-                    if (Restart-SupervisorVerified) {
-                        Write-Warning "[supervisor] rolled back $supervisorConfig; service is Running WITHOUT the selector attributes (Fleet Management grouping by cx.host.role/workload.* will not work on this host)"
-                    } else {
-                        Write-Warning "[supervisor] rollback did not start the service either - the failure predates our edit. Inspect: Get-EventLog -LogName Application -Source opampsupervisor -Newest 20"
-                    }
-                }
-            } else {
-                Write-Host "[supervisor] restarted opampsupervisor and confirmed Running (AgentDescription attributes applied)"
-                Remove-Item $preEditCopy -Force -ErrorAction SilentlyContinue
-            }
-        }
-    } catch { Write-Warning "[supervisor] could not configure/restart opampsupervisor: $_" }
+    Publish-SupervisorAgentDescription -ConfigPath $supervisorConfig -Attributes $ResourceAttributes | Out-Null
 }
 
 # ---- Verify -------------------------------------------------------------------

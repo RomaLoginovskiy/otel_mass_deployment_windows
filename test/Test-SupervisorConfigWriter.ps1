@@ -1,54 +1,38 @@
 <#
 .SYNOPSIS
   Unit tests for the OpAMP Supervisor AgentDescription writer in
-  deploy\Install-CoralogixSupervisor.ps1.
+  deploy\Install-CoralogixSupervisor.ps1 - the scalar encoder, the value decoder, the
+  canonicalize pass, and the insert/idempotency behaviour.
 
 .DESCRIPTION
   Fixture-only. Writes throwaway config.yaml files under the user's TEMP, touches no service, no
-  machine environment and no network, and needs no elevation - so unlike the docker-win
-  harnesses this one runs anywhere in about a second.
+  machine environment and no network, and needs no elevation - so unlike the docker-win harnesses
+  this one runs anywhere in about a second.
 
-  WHAT IS BEING PINNED, and why it is not the obvious thing:
+  WHAT THESE TESTS ENCODE. The supervisor does not parse config.yaml once: it re-serializes
+  agent.description.non_identifying_attributes into the config text it composes for the collector
+  WITHOUT escaping backslashes, then parses that text again. One level of backslash escaping is
+  consumed per pass. Measured against the real binary on a Windows VM
+  (poc\Run-SupervisorVmLoop.ps1) for the value C:\ProgramData\pm2:
 
-  The supervisor does not parse its config.yaml once. It re-serializes AgentDescription values
-  into the merged config text WITHOUT escaping backslashes, then parses that text again. One
-  level of backslash escaping is consumed per pass. Measured against a real supervisor on a
-  Windows VM for workload.pm2.home = C:\ProgramData\pm2 and
-  workload.pm2.owner = NT AUTHORITY\LocalService:
+    "C:\ProgramData\pm2"          DEAD   - the reported OTIOMWQA01 failure ("retrieved value
+                                  (type=string) cannot be used as a Conf ... found unknown escape
+                                  character")
+    'C:\ProgramData\pm2'          DEAD   - quoting style alone is NOT the fix
+    "C:\\ProgramData\\pm2"        DEAD   - valid YAML, still re-emitted unescaped
+    "NT AUTHORITY\\LocalService"  STARTS - and silently corrupts the value, because \L is a legal
+                                  second-pass escape (U+2028). This is why "the service is
+                                  Running" is not a sufficient check anywhere in this code.
+    'C:/ProgramData/pm2'          STARTS - but lossy, it is no longer the path
+    'C:\\ProgramData\\pm2'        STARTS and arrives EXACT  <- canonical
 
-    on disk                            2nd parse sees   outcome
-    ---------------------------------- ---------------- ------------------------------------
-    "C:\\ProgramData\\pm2"             C:\ProgramData\  SERVICE DEAD - 'could not compose
-                                       pm2  -> \p       initial merged config: yaml: line 49:
-                                                        found unknown escape character'
-    'C:\ProgramData\pm2'               same             SERVICE DEAD - identical error; the
-                                                        quoting style is not what saves you
-    "NT AUTHORITY\\LocalService"       \L is a valid    STARTS, VALUE CORRUPTED to
-                                       escape (U+2028)  'NT AUTHORITY<U+2028>     ocalService'
-    'C:\\ProgramData\\pm2'             C:\\ProgramData  STARTS, value exact  <-- the only
-                                       \\pm2            correct form
-    "C:/ProgramData/pm2"               no backslash     starts, value slash-ified (lossy)
-
-  So the invariant is NOT "avoid double quotes" and NOT "it parses as YAML" - both are
-  satisfied by forms that kill the service or silently mangle the value. It is: every backslash
-  in the YAML VALUE must be doubled. That is what these tests assert.
-
-  This file exists because no container harness can catch any of it: every test\docker-win
-  runner installs with CX_NO_SUPERVISOR=1 (the vendor installer cannot fetch the collector MSI
-  in a Server Core container), so the supervisor branch never executes there. The end-to-end
-  proof lives in poc\Run-SupervisorVmLoop.ps1 against a real VM; this suite pins the string
-  rules so a regression is caught in a second rather than on a fleet host.
-
-  Covers:
-    * a Windows path and a DOMAIN\user are emitted with doubled backslashes, single-quoted
-    * apostrophes are doubled; values with no backslash are left plain
-    * a re-run adds nothing and re-quotes nothing (idempotent - the canonical form is a
-      fixed point, which is what makes the repair pass safe to run on every deploy)
-    * BOTH field-observed broken forms are repaired: the service-killing one and the
-      valid-YAML-but-corrupting one
-    * a correctly doubled value is NOT touched (the repair must not double it again)
-    * decode/encode round-trips for double-quoted, single-quoted and unquoted scalars
-    * a missing anchor / empty attribute string / missing file writes nothing
+  WHY A UNIT TEST AT ALL. Every test\docker-win harness installs with CX_NO_SUPERVISOR=1 (the
+  vendor installer cannot fetch the collector MSI in a Server Core container), so the supervisor
+  branch never runs there. Run-NodeShapesTest.ps1 asserts workload.pm2.home=C:\ProgramData\pm2
+  where it is PRODUCED, never where it is SERIALIZED. And Coralogix-side checks see the
+  collector's own resourcedetection attributes, which say nothing about supervisor config.yaml.
+  The VM loop covers the runtime half; this file pins the string rules, which is the half that
+  can be checked in a second on any machine.
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File test\Test-SupervisorConfigWriter.ps1
@@ -66,19 +50,19 @@ $installer = Join-Path $here '..\deploy\Install-CoralogixSupervisor.ps1'
 if (-not (Test-Path -LiteralPath $installer)) { throw "not found: $installer" }
 
 # The installer is a SCRIPT, not a module: dot-sourcing it would run Assert-Admin, resolve a
-# region and start installing. The functions under test are lifted out by AST instead. The
-# trade-off is deliberate - it keeps the suite elevation-free and side-effect free, at the cost
-# of failing loudly if one of them is renamed.
-$wanted = @('ConvertTo-SupervisorAttrScalar','Get-SupervisorAttrValue',
-            'Test-SupervisorAttrScalarCanonical','Set-SupervisorDescriptionAttributes')
-$ast = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
-foreach ($name in $wanted) {
-    $fn = $ast.FindAll({ param($n)
-            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-            $n.Name -eq $name }, $true) | Select-Object -First 1
-    if (-not $fn) { throw "$name not found in $installer (renamed?)" }
-    Invoke-Expression $fn.Extent.Text
+# region and start installing. So the functions under test are lifted out by AST. The trade-off is
+# deliberate - it keeps the test elevation-free and side-effect free, at the cost of failing
+# loudly if a function is renamed.
+$wanted = @('ConvertTo-SupervisorAttrScalar','Expand-CxBackslashEscapes','Get-SupervisorAttrValue',
+            'Get-SupervisorAttrFirstPass','Test-SupervisorAttrScalarCanonical',
+            'Test-SupervisorAttrScalarNeedsFix','Set-SupervisorDescriptionAttributes')
+$ast   = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
+$found = @()
+foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    if ($wanted -contains $f.Name) { Invoke-Expression $f.Extent.Text; $found += $f.Name }
 }
+$missing = @($wanted | Where-Object { $found -notcontains $_ })
+if ($missing.Count) { throw "not found in ${installer}: $($missing -join ', ') (renamed?)" }
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-True {
@@ -88,7 +72,7 @@ function Assert-True {
 }
 function Assert-Equal {
     param([string] $Name, $Expected, $Actual)
-    Assert-True $Name ($Expected -eq $Actual) "expected [$Expected], got [$Actual]"
+    Assert-True $Name ($Expected -ceq $Actual) "expected [$Expected], got [$Actual]"
 }
 
 $root = Join-Path ([System.IO.Path]::GetTempPath()) ("cx-supcfg-fx-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
@@ -114,37 +98,53 @@ function New-Fixture {
 }
 function Get-AttrLine {
     param([string] $Path, [string] $Key)
-    $l = @(Get-Content -Path $Path | Where-Object { $_ -match ('^\s*' + [regex]::Escape($Key) + '\s*:') })
-    if ($l.Count -ne 1) { return "<$($l.Count) matches>" }
-    return $l[0].Trim()
+    $l = @(Get-Content -Path $Path | Where-Object { $_ -match ("^\s*" + [regex]::Escape($Key) + ":") })
+    if ($l.Count) { return $l[0].Trim() }
+    return ''
+}
+# The invariant: no ATTRIBUTE value may carry a backslash that survives the first parse in
+# non-canonical form. Scoped to the 6-space attribute indent on purpose - agent.executable also
+# contains backslashes and is not an attribute, so judging it would make this helper lie.
+function Get-NonCanonicalLines {
+    param([string] $Path)
+    @(Get-Content -Path $Path |
+        Where-Object { $_ -match '^      [\w\.]+:\s*\S' } |
+        Where-Object { Test-SupervisorAttrScalarNeedsFix -Raw (($_ -replace '^\s*[^:]+:\s*', '').Trim()) })
 }
 
-Write-Host "`n== scalar encoding ==" -ForegroundColor Cyan
-Assert-Equal 'Windows path -> doubled, single-quoted' `
-    "'C:\\ProgramData\\pm2'" (ConvertTo-SupervisorAttrScalar -Value 'C:\ProgramData\pm2')
-Assert-Equal 'DOMAIN\user -> doubled, single-quoted' `
-    "'NT AUTHORITY\\LocalService'" (ConvertTo-SupervisorAttrScalar -Value 'NT AUTHORITY\LocalService')
-Assert-Equal 'no backslash -> plain single-quoted' "'iis'" (ConvertTo-SupervisorAttrScalar -Value 'iis')
-Assert-Equal 'apostrophe doubled' "'it''s'" (ConvertTo-SupervisorAttrScalar -Value "it's")
+Write-Host "`n== the scalar encoder ==" -ForegroundColor Cyan
+Assert-Equal 'Windows path: every backslash doubled, single-quoted' `
+    "'C:\\ProgramData\\pm2'" (ConvertTo-SupervisorAttrScalar 'C:\ProgramData\pm2')
+Assert-Equal 'DOMAIN\user: doubled too (\L would otherwise become U+2028)' `
+    "'NT AUTHORITY\\LocalService'" (ConvertTo-SupervisorAttrScalar 'NT AUTHORITY\LocalService')
+Assert-Equal 'apostrophe doubled' "'it''s here'" (ConvertTo-SupervisorAttrScalar "it's here")
+Assert-Equal 'plain value untouched apart from quoting' "'iis'" (ConvertTo-SupervisorAttrScalar 'iis')
+Assert-Equal 'UNC path: leading pair doubled as well' `
+    "'\\\\srv\\share'" (ConvertTo-SupervisorAttrScalar '\\srv\share')
+Assert-Equal 'empty value is still a valid scalar' "''" (ConvertTo-SupervisorAttrScalar '')
 
-Write-Host "`n== scalar decoding (so a repair cannot change meaning) ==" -ForegroundColor Cyan
-Assert-Equal 'double-quoted escapes processed' 'C:\ProgramData\pm2' (Get-SupervisorAttrValue -Raw '"C:\\ProgramData\\pm2"')
-Assert-Equal 'single-quoted is literal'        'C:\\ProgramData\\pm2' (Get-SupervisorAttrValue -Raw "'C:\\ProgramData\\pm2'")
-Assert-Equal 'single-quoted apostrophe'        "it's" (Get-SupervisorAttrValue -Raw "'it''s'")
-Assert-Equal 'unquoted is literal'             'C:\ProgramData\pm2' (Get-SupervisorAttrValue -Raw 'C:\ProgramData\pm2')
+Write-Host "`n== the value decoder (what the collector would ACTUALLY get) ==" -ForegroundColor Cyan
+# Two passes, because the supervisor parses this field twice. In a single-quoted YAML scalar `\\`
+# is two LITERAL backslashes after pass one; pass two is what collapses them to one.
+Assert-Equal 'canonical round trip' 'C:\ProgramData\pm2' (Get-SupervisorAttrValue -Raw "'C:\\ProgramData\\pm2'")
+Assert-Equal 'single-quoted, un-doubled: literal' 'C:\ProgramData\pm2' (Get-SupervisorAttrValue -Raw "'C:\ProgramData\pm2'")
+Assert-Equal 'double-quoted, escaped: unescaped once' 'C:\ProgramData\pm2' (Get-SupervisorAttrValue -Raw '"C:\\ProgramData\\pm2"')
+# The old writer emitted values verbatim inside double quotes, so an escape go-yaml would reject
+# (\p) is what that writer meant literally - recovering it as literal is what lets the
+# canonicalize pass rewrite an OTIOMWQA01-style line without changing its meaning.
+Assert-Equal 'double-quoted, unknown escape: backslash kept literal' 'C:\ProgramData\pm2' (Get-SupervisorAttrValue -Raw '"C:\ProgramData\pm2"')
+Assert-Equal 'apostrophe unescaped' "it's here" (Get-SupervisorAttrValue -Raw "'it''s here'")
+Assert-Equal 'plain scalar carries no escapes' 'C:\ProgramData\pm2' (Get-SupervisorAttrValue -Raw 'C:\ProgramData\pm2')
+Assert-Equal 'real \t escape honoured in a double-quoted value' "a$([char]9)b" (Get-SupervisorAttrValue -Raw '"a\tb"')
 
-Write-Host "`n== canonical predicate: the field-observed forms ==" -ForegroundColor Cyan
-Assert-True  'service-killing form is NOT canonical' `
-    (-not (Test-SupervisorAttrScalarCanonical -Raw '"C:\\ProgramData\\pm2"'))
-Assert-True  'silently-corrupting form is NOT canonical' `
+Write-Host "`n== canonical detection ==" -ForegroundColor Cyan
+Assert-True  'canonical scalar recognised'      (Test-SupervisorAttrScalarCanonical -Raw "'C:\\ProgramData\\pm2'")
+Assert-True  'un-doubled is NOT canonical'      (-not (Test-SupervisorAttrScalarCanonical -Raw "'C:\ProgramData\pm2'"))
+Assert-True  'double-quoted is NOT canonical'   (-not (Test-SupervisorAttrScalarCanonical -Raw '"C:\\ProgramData\\pm2"'))
+Assert-True  'legal-but-corrupting \L form is NOT canonical' `
     (-not (Test-SupervisorAttrScalarCanonical -Raw '"NT AUTHORITY\\LocalService"'))
-Assert-True  'single-quoted single backslash is NOT canonical (valid YAML, still dead)' `
-    (-not (Test-SupervisorAttrScalarCanonical -Raw "'C:\ProgramData\pm2'"))
-Assert-True  'doubled single-quoted IS canonical' `
-    (Test-SupervisorAttrScalarCanonical -Raw "'C:\\ProgramData\\pm2'")
-Assert-True  'backslash-free value IS canonical' (Test-SupervisorAttrScalarCanonical -Raw '"iis"')
 
-# The real attributes this host reports, plus values carrying YAML-significant characters.
+Write-Host "`n== fresh insert with hostile values ==" -ForegroundColor Cyan
 $hostileAttrs = @(
     'cx.host.role=iis'
     'workload.pm2.home=C:\ProgramData\pm2'
@@ -153,79 +153,71 @@ $hostileAttrs = @(
     'workload.note=it''s a "quoted" value: with colon # and hash'
 ) -join ','
 
-Write-Host "`n== fresh insert ==" -ForegroundColor Cyan
 $f = New-Fixture 'fresh'
 Set-SupervisorDescriptionAttributes -ConfigPath $f -Attributes $hostileAttrs 3>$null
-Assert-Equal 'PM2_HOME doubled + single-quoted' "workload.pm2.home: 'C:\\ProgramData\\pm2'"      (Get-AttrLine $f 'workload.pm2.home')
-Assert-Equal 'owner doubled + single-quoted'    "workload.pm2.owner: 'NT AUTHORITY\\LocalService'" (Get-AttrLine $f 'workload.pm2.owner')
-Assert-Equal 'plain value untouched'            "cx.host.role: 'iis'"                            (Get-AttrLine $f 'cx.host.role')
-Assert-True  'apostrophe doubled in file' ((Get-AttrLine $f 'workload.note') -match "it''s")
-Assert-Equal 'vendor line left alone' 'service.name: "coralogix-collector"' (Get-AttrLine $f 'service.name')
-Assert-True  'inserted under the anchor at child indent' `
-    ((Get-Content $f -Raw) -match "(?m)^    non_identifying_attributes:\r?\n      cx\.host\.role: 'iis'")
-Assert-True  "agent.executable is not a quoted scalar and is untouched" `
+Assert-Equal 'PM2_HOME written in canonical form' "workload.pm2.home: 'C:\\ProgramData\\pm2'" (Get-AttrLine $f 'workload.pm2.home')
+Assert-Equal 'daemon owner written in canonical form' "workload.pm2.owner: 'NT AUTHORITY\\LocalService'" (Get-AttrLine $f 'workload.pm2.owner')
+Assert-Equal 'no backslash left un-doubled anywhere' 0 (Get-NonCanonicalLines $f).Count
+Assert-True  'embedded apostrophe doubled' ((Get-AttrLine $f 'workload.note') -match "^workload\.note: 'it''s a ")
+Assert-True  'vendor value without a backslash left exactly as the installer wrote it' `
+    ((Get-AttrLine $f 'service.name') -ceq 'service.name: "coralogix-collector"')
+Assert-True  "agent.executable's own backslashes untouched (not an attribute)" `
     ((Get-Content $f -Raw) -match [regex]::Escape('executable: C:\Program Files\OpenTelemetry Collector\otelcol-contrib.exe'))
 
-Write-Host "`n== idempotent: the canonical form is a fixed point ==" -ForegroundColor Cyan
+Write-Host "`n== re-run is idempotent ==" -ForegroundColor Cyan
 $before = Get-Content $f -Raw
 Set-SupervisorDescriptionAttributes -ConfigPath $f -Attributes $hostileAttrs 3>$null
 Assert-Equal 'file unchanged on re-run' $before (Get-Content $f -Raw)
-Set-SupervisorDescriptionAttributes -ConfigPath $f -Attributes $hostileAttrs 3>$null
-Assert-Equal 'still unchanged on a third run (no runaway doubling)' $before (Get-Content $f -Raw)
 Assert-Equal 'no duplicate key' 1 (@(Get-Content $f | Where-Object { $_ -match '^\s*workload\.pm2\.home:' }).Count)
 
-Write-Host "`n== repair of both field-observed broken forms ==" -ForegroundColor Cyan
-# Exactly what was found on OTIOMWQA01 and on the VM. Both keys are already PRESENT, so without
-# a repair pass the writer skips them, writes nothing, and the host stays broken across
-# re-deploys. workload.pm2.owner is the nastier case: that config STARTS.
+Write-Host "`n== canonicalize a host poisoned by the old writer ==" -ForegroundColor Cyan
+# Exactly what shipped to OTIOMWQA01. Both keys are already PRESENT, so without a canonicalize
+# pass the writer skips them, writes nothing, and a re-deploy leaves the host dead.
 $broken = New-Fixture 'broken' @'
 agent:
   description:
     non_identifying_attributes:
       service.name: "coralogix-collector"
       cx.host.role: "iis"
-      workload.pm2.home: "C:\\ProgramData\\pm2"
-      workload.pm2.owner: "NT AUTHORITY\\LocalService"
+      workload.pm2.home: "C:\ProgramData\pm2"
+      workload.pm2.owner: "NT AUTHORITY\LocalService"
 '@
-Set-SupervisorDescriptionAttributes -ConfigPath $broken -Attributes $hostileAttrs 3>$null
-Assert-Equal 'killer form repaired, value preserved' `
-    "workload.pm2.home: 'C:\\ProgramData\\pm2'" (Get-AttrLine $broken 'workload.pm2.home')
-Assert-Equal 'corrupting form repaired, value preserved' `
-    "workload.pm2.owner: 'NT AUTHORITY\\LocalService'" (Get-AttrLine $broken 'workload.pm2.owner')
-Assert-Equal 'backslash-free double-quoted value not rewritten' `
-    'service.name: "coralogix-collector"' (Get-AttrLine $broken 'service.name')
-Assert-True  'new keys still added alongside the repair' ((Get-AttrLine $broken 'workload.pm2.apps') -match "'28'")
-Assert-Equal 'repair did not duplicate a key' 1 (@(Get-Content $broken | Where-Object { $_ -match '^\s*workload\.pm2\.home:' }).Count)
+Assert-Equal 'fixture starts non-canonical' 2 (Get-NonCanonicalLines $broken).Count
+$warn = (Set-SupervisorDescriptionAttributes -ConfigPath $broken -Attributes $hostileAttrs 3>&1) -join "`n"
+Assert-Equal 'canonicalized, nothing left un-doubled' 0 (Get-NonCanonicalLines $broken).Count
+Assert-Equal 'the dead line is now canonical, same value' "workload.pm2.home: 'C:\\ProgramData\\pm2'" (Get-AttrLine $broken 'workload.pm2.home')
+Assert-Equal 'the silently-corrupting line is fixed too' "workload.pm2.owner: 'NT AUTHORITY\\LocalService'" (Get-AttrLine $broken 'workload.pm2.owner')
+Assert-True  'operator told the values were canonicalized' ([bool]($warn -match 'canonicaliz')) "warnings: $warn"
+Assert-Equal 'no duplicate key after canonicalize' 1 (@(Get-Content $broken | Where-Object { $_ -match '^\s*workload\.pm2\.home:' }).Count)
+Assert-True  'new keys still added alongside' ((Get-AttrLine $broken 'workload.pm2.apps') -ceq "workload.pm2.apps: '28'")
 
-Write-Host "`n== an already-correct config is left byte-identical ==" -ForegroundColor Cyan
-$good = New-Fixture 'good' @'
+Write-Host "`n== an already-canonical host is not churned ==" -ForegroundColor Cyan
+$canon = New-Fixture 'canon' @'
 agent:
   description:
     non_identifying_attributes:
+      service.name: "coralogix-collector"
       workload.pm2.home: 'C:\\ProgramData\\pm2'
-      workload.pm2.owner: 'NT AUTHORITY\\LocalService'
-      cx.host.role: 'iis'
-      workload.pm2.apps: '28'
-      workload.note: 'it''s a "quoted" value: with colon # and hash'
+      workload.tab: "col1\tcol2"
 '@
-$goodBefore = Get-Content $good -Raw
-Set-SupervisorDescriptionAttributes -ConfigPath $good -Attributes $hostileAttrs 3>$null
-Assert-Equal 'no rewrite, no re-doubling' $goodBefore (Get-Content $good -Raw)
+$canonBefore = Get-Content $canon -Raw
+Set-SupervisorDescriptionAttributes -ConfigPath $canon -Attributes 'workload.pm2.home=C:\ProgramData\pm2' 3>$null
+Assert-Equal 'canonical file untouched' $canonBefore (Get-Content $canon -Raw)
 
-Write-Host "`n== best-effort contract ==" -ForegroundColor Cyan
+Write-Host "`n== best-effort contract: nothing to do, nothing written ==" -ForegroundColor Cyan
 $noAnchor = New-Fixture 'noanchor' "server:`n  endpoint: wss://example/opamp/v1`n"
-$snap = Get-Content $noAnchor -Raw
+$snapshot = Get-Content $noAnchor -Raw
 Set-SupervisorDescriptionAttributes -ConfigPath $noAnchor -Attributes $hostileAttrs 3>$null
-Assert-Equal 'missing anchor -> untouched' $snap (Get-Content $noAnchor -Raw)
+Assert-Equal 'missing anchor -> file untouched' $snapshot (Get-Content $noAnchor -Raw)
 
 $empty = New-Fixture 'emptyattrs'
-$snap2 = Get-Content $empty -Raw
+$snapshot2 = Get-Content $empty -Raw
 Set-SupervisorDescriptionAttributes -ConfigPath $empty -Attributes '' 3>$null
-Assert-Equal 'empty attribute string -> untouched' $snap2 (Get-Content $empty -Raw)
+Assert-Equal 'empty attribute string -> file untouched' $snapshot2 (Get-Content $empty -Raw)
 
-$missing = Join-Path $root 'does-not-exist.yaml'
-Set-SupervisorDescriptionAttributes -ConfigPath $missing -Attributes $hostileAttrs 3>$null
-Assert-True 'missing config -> nothing created, no throw' (-not (Test-Path $missing))
+$missingCfg = Join-Path $root 'does-not-exist.yaml'
+Set-SupervisorDescriptionAttributes -ConfigPath $missingCfg -Attributes $hostileAttrs 3>$null
+Assert-True 'missing config -> no file created, no throw' (-not (Test-Path $missingCfg))
 
 Write-Host ''
 Write-Host ("{0} passed, {1} failed" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
