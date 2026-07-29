@@ -455,10 +455,25 @@ function Invoke-GuestFile {
             "ECHO $marker=%ERRORLEVEL%"
         )
     } else {
+        # For a POWERSHELL script, success is "it did not throw" - NOT $LASTEXITCODE. That variable
+        # holds the exit code of the last NATIVE command the script happened to run, so
+        # entrypoint.e2e.ps1 reported 13 from an internal appcmd call and a perfectly good
+        # provisioning step was failed. Seeding it to 0 beforehand does not help either: the inner
+        # native call overwrites it during execution (measured both ways). So the wrapper reports
+        # the throw/no-throw outcome, and passes the native code through separately as information
+        # rather than as a verdict.
         Set-Content -LiteralPath $wrapLoc -Encoding utf8 -Value @(
             '$ErrorActionPreference = ''Continue''',
-            "& '$GuestPath' $argLine",
-            "Write-Output ""$marker=`$LASTEXITCODE"""
+            '$global:LASTEXITCODE = 0',
+            '$__cxOk = 1',
+            'try {',
+            "    & '$GuestPath' $argLine",
+            '} catch {',
+            '    $__cxOk = 0',
+            '    Write-Output "CX_GUEST_ERROR=$($_.Exception.Message)"',
+            '}',
+            "Write-Output ""CX_GUEST_NATIVE=`$LASTEXITCODE""",
+            "Write-Output ""$marker=`$(if (`$__cxOk) { 0 } else { 1 })"""
         )
     }
     Copy-ToGuest -LocalPath $wrapLoc -GuestPath $wrapGst
