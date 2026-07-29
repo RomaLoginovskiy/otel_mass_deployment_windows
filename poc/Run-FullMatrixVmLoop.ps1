@@ -670,6 +670,7 @@ try {
                 IisServices    = (M 'CX_IIS_SERVICES')
                 NodeServices   = (M 'CX_NODE_SERVICES')
                 DotnetServices = (M 'CX_DOTNET_SERVICES')
+                AllServices    = (M 'CX_SERVICES')
                 Environment    = (M 'CX_ENVIRONMENT')
                 ResourceAttrs  = (M 'OTEL_RESOURCE_ATTRIBUTES')
                 Pools          = $pools
@@ -684,9 +685,21 @@ try {
             # value of CX_IIS_SERVICES on this controller machine (the verifier's default), which
             # would silently verify the wrong host.
             $script:GuestIisServices = [string]$naming.IisServices
+            $script:GuestAllServices = [string]$naming.AllServices
             Write-Host "  CX_IIS_SERVICES    = $($naming.IisServices)"
             Write-Host "  CX_NODE_SERVICES   = $($naming.NodeServices)"
             Write-Host "  CX_DOTNET_SERVICES = $($naming.DotnetServices)"
+            Write-Host "  CX_SERVICES        = $($naming.AllServices)"
+
+            # CX_SERVICES is what the collector stamps for host ownership, and it must cover the
+            # NON-IIS services too - that is exactly what was missing when an APM service had spans
+            # but no host correlation. Asserted as a superset of the three per-technology lists.
+            $claimedAll = @(([string]$naming.AllServices) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $perTech    = @(@(([string]$naming.IisServices) -split ','), @(([string]$naming.NodeServices) -split ','),
+                            @(([string]$naming.DotnetServices) -split ',')) |
+                          ForEach-Object { $_ } | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Sort-Object -Unique
+            Assert-True 'CX_SERVICES is set (host ownership covers every instrumented service)' ($claimedAll.Count -gt 0)
+            Assert-SetEqual 'CX_SERVICES equals the union of IIS + Node + .NET service names' $perTech $claimedAll
             Assert-True 'CX_IIS_SERVICES is set' ($claimed.Count -gt 0)
             Assert-Equal 'CX_ENVIRONMENT carries the deploy environment' $Environment ([string]$naming.Environment)
 
@@ -746,14 +759,17 @@ try {
                 # -MustNotContain turns the refusal cases into a backend assertion rather than a
                 # claim about the installer: a name that was never claimed must never show up as a
                 # Service either.
-                $expected = if ($script:GuestIisServices) { $script:GuestIisServices } else { '' }
+                # CX_SERVICES, not CX_IIS_SERVICES: the stamp now covers Node and .NET services as well,
+                # and checking the narrower value would pass while ownership was incomplete.
+                $expected = if ($script:GuestAllServices) { $script:GuestAllServices }
+                            elseif ($script:GuestIisServices) { $script:GuestIisServices } else { '' }
                 $mustNot  = @($svcNames.Clr2, 'arrproxy', 'staticwc', 'nocfg', 'binonly')
                 # A [string[]] parameter reached through `powershell -File` must be ONE
                 # comma-separated token. Spreading the array instead binds only its first element and
                 # shoves the rest onto whatever positional parameters follow - here 'staticwc' landed
                 # on -LookbackMinutes and the verifier died with "Cannot convert value 'staticwc' to
                 # type System.Int32" before running a single query.
-                $vArgs = @('-QueryKeyFile', $QueryKeyFile, '-HostName', $HostRename,
+                $vArgs = @('-QueryKeyFile', $QueryKeyFile, '-Region', $Region, '-HostName', $HostRename,
                            '-MustNotContain', ($mustNot -join ','))
                 if ($expected) { $vArgs += @('-ExpectedValue', $expected) }
                 # Through Invoke-HostScript, not a bare call: the verifier writes to stderr, and under
@@ -779,7 +795,7 @@ try {
                 # backend reports instead, a static site, a config-less app, and the deliberately
                 # ambiguous bin-only app.
                 $expectSilent = @($svcNames.Clr2, 'arrproxy', 'staticwc', 'nocfg', 'binonly')
-                $sArgs = @('-QueryKeyFile', $QueryKeyFile, '-HostName', $HostRename,
+                $sArgs = @('-QueryKeyFile', $QueryKeyFile, '-Region', $Region, '-HostName', $HostRename,
                            '-Services', ($expectReporting -join ','),
                            '-MustBeSilent', ($expectSilent -join ','))
                 $r = Invoke-HostScript -Path $svcVerifier -Arguments $sArgs -Tail 24
@@ -795,7 +811,7 @@ try {
                 # (env applies, no telemetry), so gating on it here would fail for a reason that is
                 # already documented rather than for anything this run changed.
                 # -Services is [string[]]: one comma-separated token, for the same reason as above.
-                $nArgs = @('-QueryKeyFile', $QueryKeyFile, '-Services', 'shape-user-fork',
+                $nArgs = @('-QueryKeyFile', $QueryKeyFile, '-Region', $Region, '-Services', 'shape-user-fork',
                            '-ClusterService', 'shape-user-fork', '-MinClusterWorkers', '1')
                 # (single value, so no join needed here - but keep the shape identical if more are added)
                 $r = Invoke-HostScript -Path $nodeVerifier -Arguments $nArgs
@@ -811,7 +827,7 @@ try {
             if (Test-Path $appVerifier) {
                 Write-Host '  (application name = host.name fallback)'
                 $r = Invoke-HostScript -Path $appVerifier `
-                        -Arguments @('-QueryKeyFile', $QueryKeyFile, '-ExpectedApplication', $HostRename)
+                        -Arguments @('-QueryKeyFile', $QueryKeyFile, '-Region', $Region, '-ExpectedApplication', $HostRename)
                 Assert-True 'Coralogix application name resolves to the host name' ($r.Code -eq 0) $r.Out
             }
         }
