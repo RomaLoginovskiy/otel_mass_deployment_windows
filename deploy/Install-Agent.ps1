@@ -245,37 +245,6 @@ try {
         }
     }
 
-    # -- 3d. Publish the host's COMPLETE service list for ownership --------------
-    # The collector's service-ownership transform stamps these names onto host/entity telemetry,
-    # which is what lets Coralogix correlate an APM Service with the host running it. It used to
-    # read CX_IIS_SERVICES alone, so a Node app under PM2 - or a Node/.NET Windows service - showed
-    # up in APM through its own spans while the host entity claimed nothing: measured on the VM
-    # matrix, the service 'shape-user-fork' had spans and no host correlation, because
-    # CX_NODE_SERVICES was published here and consumed by nobody.
-    #
-    # The union is published as CX_SERVICES. Sorted and de-duplicated so the value is stable across
-    # re-runs (an unstable ownership list shows up as churn in the Infra Explorer entity), and only
-    # names this installer actually instrumented are included - claiming a name that never reports
-    # reads as an outage.
-    $allServices = @()
-    foreach ($v in @('CX_IIS_SERVICES', 'CX_NODE_SERVICES', 'CX_DOTNET_SERVICES')) {
-        $cur = [Environment]::GetEnvironmentVariable($v, 'Machine')
-        if ($cur) { $allServices += @(($cur -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    }
-    $allServices = @($allServices | Sort-Object -Unique)
-    $priorAll    = [Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')
-    $newAll      = ($allServices -join ',')
-    if ($newAll -ne $priorAll) {
-        if ($session) { Record-EnvChange -Session $session -Name 'CX_SERVICES' -PriorValue $priorAll }
-        [Environment]::SetEnvironmentVariable('CX_SERVICES', $newAll, 'Machine')
-    }
-    if ($allServices.Count) {
-        Write-Host "[agent] CX_SERVICES = $newAll  ($($allServices.Count) service(s) claimed for host ownership)"
-    } else {
-        Write-Host '[agent] no instrumented services to claim - CX_SERVICES left empty'
-    }
-    $status.servicesClaimed = $allServices
-
     # -- 4. Restart collector to pick up OTEL_RESOURCE_ATTRIBUTES ----------------
     # In Supervisor mode there is NO 'otelcol-contrib' service - the collector runs
     # as a CHILD process of 'opampsupervisor'. Restart the supervisor (which
