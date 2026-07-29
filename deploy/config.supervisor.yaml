@@ -363,11 +363,36 @@ processors:
   # `logs/resource_catalog` (the Infra-Explorer host entity, which drives Service ownership).
   # NOT in `traces`/`metrics` -> only log_statements is defined. Guarded on a non-empty
   # CX_IIS_SERVICES so non-IIS hosts are left untouched.
+  # NOT IIS-ONLY ANY MORE. The value read here used to be CX_IIS_SERVICES alone, which meant a
+  # Node app under PM2 (or a Node/.NET Windows service) appeared in APM through its own spans while
+  # the HOST entity never claimed it - so Infrastructure Explorer showed no Service ownership for it
+  # and APM<->host correlation was impossible. Measured on the VM matrix: the APM service
+  # `shape-user-fork` had 283 spans and no host correlation, because CX_NODE_SERVICES was published
+  # by the instrumenter and consumed by nothing. On a Node-only host the old guard was false and NO
+  # labels were stamped at all.
+  #
+  # Install-Agent.ps1 now publishes CX_SERVICES: the union of the IIS, Node and .NET service names
+  # it actually instrumented. CX_IIS_SERVICES is still honoured as a FALLBACK so a host deployed by
+  # an older build keeps its ownership until it is re-deployed.
   transform/iis_service_labels:
     error_mode: silent
     log_statements:
     - context: resource
       conditions:
+      - '"${env:CX_SERVICES:-}" != ""'
+      statements:
+      - set(resource.attributes["service"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["tags.service"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["tags.cx_svc"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["tags.CX_SERVICE_NAME"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.service"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.cx_svc"], Split("${env:CX_SERVICES:-}", ","))
+      - set(resource.attributes["cx.infra.labels.CX_SERVICE_NAME"], Split("${env:CX_SERVICES:-}", ","))
+    # Fallback for a host whose deploy predates CX_SERVICES: same keys, IIS names only. Both
+    # conditions must hold, so this block and the one above are mutually exclusive.
+    - context: resource
+      conditions:
+      - '"${env:CX_SERVICES:-}" == ""'
       - '"${env:CX_IIS_SERVICES:-}" != ""'
       statements:
       - set(resource.attributes["service"], Split("${env:CX_IIS_SERVICES:-}", ","))
