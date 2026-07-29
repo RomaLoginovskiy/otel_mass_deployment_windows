@@ -239,6 +239,12 @@ try {
             # their bootstrap out of this prefix.
             @{ Local = (Join-Path $AssetRoot 'otel-node');       Guest = 'C:\cx\otel-node';        Kind = 'dir'  }
             @{ Local = (Join-Path $RepoRoot 'test\docker-win\nodeshapes\apps');        Guest = 'C:\cx\nodeshapes\apps';        Kind = 'dir' }
+            # The app fixtures require pino, so they need node_modules or every Node shape dies with
+            # MODULE_NOT_FOUND - which is exactly how the node-as-a-service shape first failed here,
+            # with the service installed and immediately Stopped. Dockerfile.nodeshapes solves it by
+            # copying nodeapp/node_modules to the PARENT of the app directories (Node resolves
+            # upward, so one copy serves cjs/esm/mjs); this mirrors that placement deliberately.
+            @{ Local = (Join-Path $AssetRoot 'nodeapp\node_modules');                  Guest = 'C:\cx\nodeshapes\apps\node_modules'; Kind = 'dir' }
             @{ Local = (Join-Path $RepoRoot 'test\docker-win\nodeshapes\pm2-service'); Guest = 'C:\cx\nodeshapes\pm2-service'; Kind = 'dir' }
             @{ Local = (Join-Path $RepoRoot 'test\fixtures\out');               Guest = $GuestFixtures;           Kind = 'dir'  }
         )
