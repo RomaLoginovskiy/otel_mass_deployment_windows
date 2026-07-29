@@ -74,6 +74,47 @@ function VBoxSoft {
     return @($out)
 }
 
+function Invoke-HostScript {
+    <#
+      Run a PowerShell script ON THE HOST (a Verify-* gate, say) and return its exit code and
+      output, without letting its stderr kill the caller.
+
+      This exists because of the same PS 5.1 trap VBoxSoft guards against, hit again in a place it
+      was not expected: under $ErrorActionPreference='Stop', ANY stderr write by a native command -
+      here powershell.exe running the verifier - is turned into a terminating NativeCommandError. So
+      the telemetry phase aborted the whole try block on the verifier's first warning line, and P7,
+      P9 and P10 never ran while the summary still printed as if the run had simply ended.
+
+      Returns Code and Out (tail-limited), never throws.
+    #>
+    param([Parameter(Mandatory)] [string] $Path,
+          [string[]] $Arguments = @(),
+          [int] $Tail = 12)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Code = -1; Out = "script not found: $Path" }
+    }
+
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = & powershell -NoProfile -ExecutionPolicy Bypass -File $Path @Arguments 2>&1 |
+                    ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } catch {
+        $lines = @("$_")
+        $code  = -1
+    } finally {
+        $ErrorActionPreference = $old
+    }
+
+    return [pscustomobject]@{
+        Code = $code
+        Out  = ((@($lines) | Select-Object -Last $Tail) -join ' | ')
+        All  = @($lines).Count
+    }
+}
+
 function Initialize-VmLoop {
     <#
       Bind the transport to one VM. The password reaches VBoxManage through a FILE, never on a
