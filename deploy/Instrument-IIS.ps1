@@ -162,18 +162,84 @@ if ($LocalModule -and (Test-Path -LiteralPath $LocalModule)) {
 }
 
 Import-Module $download_path -Force
-Write-Host "[iis-instr] Install-OpenTelemetryCore ..."
-if ($LocalArchive) {
-    # -LocalPath makes the vendor module install from a pre-staged archive instead
-    # of downloading it. Fail loudly on a bad path rather than silently falling
-    # back to the download an air-gapped host cannot do.
-    if (-not (Test-Path -LiteralPath $LocalArchive)) {
-        throw "LocalArchive not found: $LocalArchive (from -LocalArchive or CX_OTEL_DOTNET_ARCHIVE)"
+
+# RE-DEPLOY ON A LIVE HOST. Install-OpenTelemetryCore REPLACES the files under
+# 'C:\Program Files\OpenTelemetry .NET AutoInstrumentation', and once apps are instrumented those
+# DLLs are LOADED by w3wp (and by any dotnet.exe child of an out-of-process app), so Windows refuses
+# to delete them:
+#
+#   Could not setup OpenTelemetry .NET Automatic Instrumentation. Cannot remove item
+#   ...\net\net8.0\OpenTelemetry.Api.dll: Access to the path 'OpenTelemetry.Api.dll' is denied.
+#
+# Install-Agent.ps1 treats that as fatal, so re-running deploy.bat against any host whose apps are
+# up failed the whole install - measured on the VM matrix, where the collector was already installed
+# and healthy at the time. Two defences, cheapest first:
+#
+#   1. If the requested version is already installed, do not reinstall. Nothing needs replacing, so
+#      no lock can bite. This is the common fleet case (a re-deploy to refresh env vars or names).
+#   2. Otherwise stop the IIS services so the DLLs are released, install, and start them again. A
+#      version CHANGE is a genuine binary swap and cannot be done under load either way.
+$otelHome        = Join-Path ${env:ProgramFiles} 'OpenTelemetry .NET AutoInstrumentation'
+$installedVer = $null
+# The vendor install writes a marker named VERSION (no extension) holding e.g. '1.16.0-beta.1',
+# while -Version is given as 'v1.16.0-beta.1' - verified on the guest. version.txt is checked too in
+# case a future build renames it; guessing the wrong filename would silently disable the skip and
+# make every deploy take the stop-IIS path.
+foreach ($candidate in @('VERSION', 'version.txt')) {
+    $marker = Join-Path $otelHome $candidate
+    if (Test-Path -LiteralPath $marker) {
+        try { $installedVer = (Get-Content -LiteralPath $marker -Raw).Trim() } catch { }
+        if ($installedVer) { break }
     }
-    Write-Host "[iis-instr] installing from pre-staged archive: $LocalArchive"
-    Install-OpenTelemetryCore -LocalPath $LocalArchive
+}
+$wantVer  = ($Version -replace '^v', '')
+$haveSame = $installedVer -and (($installedVer -replace '^v', '') -eq $wantVer)
+
+if ($haveSame) {
+    Write-Host "[iis-instr] auto-instrumentation $installedVer already installed - skipping Install-OpenTelemetryCore (nothing to replace, so no locked-DLL failure)"
 } else {
-    Install-OpenTelemetryCore
+    $stoppedForInstall = @()
+    if (Test-Path -LiteralPath $otelHome) {
+        # Only needed for an actual upgrade/repair over an existing install: that is when files get
+        # replaced and the locks matter.
+        Write-Host "[iis-instr] replacing an existing auto-instrumentation install ($(if ($installedVer) { $installedVer } else { 'unknown version' }) -> $Version); stopping IIS so the profiler DLLs are released"
+        foreach ($svc in @('W3SVC', 'WAS')) {
+            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($s -and $s.Status -eq 'Running') {
+                try { Stop-Service -Name $svc -Force -ErrorAction Stop; $stoppedForInstall += $svc }
+                catch { Write-Warning "[iis-instr] could not stop $svc ($($_.Exception.Message)) - the install may fail on a locked DLL" }
+            }
+        }
+        # An out-of-process ASP.NET Core app keeps its own dotnet.exe, which also holds the DLLs and
+        # does not always exit with the pool.
+        foreach ($p in @(Get-Process dotnet -ErrorAction SilentlyContinue)) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { }
+        }
+        Start-Sleep -Seconds 3
+    }
+
+    try {
+        Write-Host "[iis-instr] Install-OpenTelemetryCore ..."
+        if ($LocalArchive) {
+            # -LocalPath makes the vendor module install from a pre-staged archive instead
+            # of downloading it. Fail loudly on a bad path rather than silently falling
+            # back to the download an air-gapped host cannot do.
+            if (-not (Test-Path -LiteralPath $LocalArchive)) {
+                throw "LocalArchive not found: $LocalArchive (from -LocalArchive or CX_OTEL_DOTNET_ARCHIVE)"
+            }
+            Write-Host "[iis-instr] installing from pre-staged archive: $LocalArchive"
+            Install-OpenTelemetryCore -LocalPath $LocalArchive
+        } else {
+            Install-OpenTelemetryCore
+        }
+    } finally {
+        # Always bring IIS back, including when the install threw - leaving a host with IIS stopped
+        # is far worse than a failed instrumentation step.
+        foreach ($svc in ($stoppedForInstall | Sort-Object -Descending)) {
+            try { Start-Service -Name $svc -ErrorAction Stop; Write-Host "[iis-instr] restarted $svc" }
+            catch { Write-Warning "[iis-instr] could not restart $svc - $($_.Exception.Message)" }
+        }
+    }
 }
 
 # Snapshot the CLR-profiler registry (REG_MULTI_SZ Environment) BEFORE the vendor
