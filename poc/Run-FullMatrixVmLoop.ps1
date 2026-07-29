@@ -746,19 +746,60 @@ try {
     if ((Want 'P9') -and -not $SkipReboot) {
         Write-PhaseHeader 'P9' 'reboot survival'
         Assert-True 'guest came back after reboot' (Restart-Guest -ReadyTimeoutSeconds 1200)
-        # Recovery actions are allowed to take a couple of minutes on a delayed-auto service.
-        Start-Sleep -Seconds 90
-        $after = Invoke-GuestJson -Script {
-            [pscustomobject]@{
-                Supervisor = [string](Get-Service opampsupervisor -ErrorAction SilentlyContinue).Status
-                Collector  = [string](Get-Service otelcol-contrib -ErrorAction SilentlyContinue).Status
-                OtelChild  = @(Get-Process otelcol* -ErrorAction SilentlyContinue).Count
-            } | ConvertTo-Json -Compress
-        } -TimeoutSeconds 600
+
+        # POLL, do not sleep-then-peek. The installer deliberately configures the supervisor as
+        # delayed auto-start (so it comes up after networking has settled), and a delayed-auto
+        # service starts roughly two minutes after boot - while guestcontrol answers much sooner.
+        # A fixed 90s wait therefore measured a service that had not been asked to start yet and
+        # reported a reboot-survival failure that was not one. What matters is that it comes back
+        # WITHOUT intervention inside a bounded window, and how long that window was: that gap is
+        # the host's blind period, so it is printed rather than hidden.
+        $svcName  = if ($Mode -eq 'supervisor') { 'opampsupervisor' } else { 'otelcol-contrib' }
+        $deadline = (Get-Date).AddSeconds(420)
+        $sw       = [System.Diagnostics.Stopwatch]::StartNew()
+        $after    = $null
+        do {
+            $after = Invoke-GuestJson -Script {
+                [pscustomobject]@{
+                    Supervisor = [string](Get-Service opampsupervisor -ErrorAction SilentlyContinue).Status
+                    Collector  = [string](Get-Service otelcol-contrib -ErrorAction SilentlyContinue).Status
+                    OtelChild  = @(Get-Process otelcol* -ErrorAction SilentlyContinue).Count
+                } | ConvertTo-Json -Compress
+            } -TimeoutSeconds 600
+            $up = if ($Mode -eq 'supervisor') { [string]$after.Supervisor -eq 'Running' } else { [string]$after.Collector -eq 'Running' }
+            if ($up) { break }
+            Start-Sleep -Seconds 20
+        } while ((Get-Date) -lt $deadline)
+        $sw.Stop()
+        Write-Host ("  $svcName came back after {0:N0}s of polling (delayed auto-start is expected to take ~2 min)" -f $sw.Elapsed.TotalSeconds)
         if ($after) {
             if ($Mode -eq 'supervisor') {
                 Assert-Equal 'opampsupervisor Running after reboot with no intervention' 'Running' ([string]$after.Supervisor)
                 Assert-True  'collector child back after reboot' ([int]$after.OtelChild -ge 1) "otelcol processes=$($after.OtelChild)"
+
+                # The three settings that make the above true are asserted directly, because a
+                # reboot that happens to work is weaker evidence than the configuration being right:
+                # StartType=Automatic alone was measured to leave the service dead (it starts, exits
+                # ~27s later, and with no recovery actions nothing retries). failureflag matters
+                # because the supervisor exits CLEANLY, and the SCM skips recovery for a non-crash
+                # exit unless it is set.
+                $res = Invoke-GuestJson -Script {
+                    $qc = (& sc.exe qc opampsupervisor) -join ' '
+                    $qf = (& sc.exe qfailure opampsupervisor) -join ' '
+                    $ff = (& sc.exe qfailureflag opampsupervisor) -join ' '
+                    [pscustomobject]@{
+                        Delayed     = [bool]($qc -match 'AUTO_START\s*\(DELAYED\)')
+                        HasActions  = [bool]($qf -match 'RESTART')
+                        ResetPeriod = [bool]($qf -match 'RESET_PERIOD[^:]*:\s*8640')
+                        FailureFlag = [bool]($ff -match 'FAILURE_ACTIONS_ON_NONCRASH_FAILURES:\s*TRUE')
+                    } | ConvertTo-Json -Compress
+                } -TimeoutSeconds 300
+                if ($res) {
+                    Assert-True 'start type is delayed auto-start' ([bool]$res.Delayed)
+                    Assert-True 'SCM recovery actions are configured' ([bool]$res.HasActions)
+                    Assert-True 'recovery applies to a CLEAN exit (failureflag=1)' ([bool]$res.FailureFlag) `
+                        'without this the SCM skips recovery for the supervisor''s clean exit, and the host sits unmonitored'
+                }
             } else {
                 Assert-Equal 'otelcol-contrib Running after reboot with no intervention' 'Running' ([string]$after.Collector)
             }
