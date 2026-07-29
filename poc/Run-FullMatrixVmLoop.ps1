@@ -245,7 +245,10 @@ try {
         foreach ($a in $assets) {
             if (-not (Test-Path $a.Local)) { Note "asset missing: $(Split-Path -Leaf $a.Local)" "expected at $($a.Local) - the shapes that need it will be skipped"; continue }
             Write-Host "  staging $(Split-Path -Leaf $a.Local) -> $($a.Guest)"
-            if ($a.Kind -eq 'dir') { [void](Copy-DirToGuest -LocalDir $a.Local -GuestDir $a.Guest) }
+            # Directories go in as ONE archive: guestcontrol copies file by file, and otel-node alone
+            # is ~71 MB of thousands of tiny node_modules files. It also removes the partial-copy
+            # failure mode, where a tree arrives a few files short and only fails much later.
+            if ($a.Kind -eq 'dir') { [void](Copy-DirToGuestAsZip -LocalDir $a.Local -GuestDir $a.Guest) }
             else { Copy-ToGuest -LocalPath $a.Local -GuestPath $a.Guest }
         }
 
