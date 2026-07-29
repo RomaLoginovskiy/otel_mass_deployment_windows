@@ -245,7 +245,7 @@ otherwise any `warn` → `2`, otherwise `0`. `info` / `skip` / `unknown` never m
 
 | Code | Meaning |
 | --- | --- |
-| `DOMAIN_MISSING` | `CORALOGIX_DOMAIN` unset; the config default applies and this host ships to **eu1**. Re-deploy with `-Region <code>` / `CX_REGION` if that is not the account. |
+| `DOMAIN_MISSING` | `CORALOGIX_DOMAIN` unset; the config default applies and this host ships to **eu1**. Re-deploy with `-Region <code>` / `CX_REGION`, or `-Domain` / `CX_DOMAIN` for a private ingress, if that is not the account. |
 | `DOMAIN_NOT_A_KNOWN_REGION` | `CORALOGIX_DOMAIN` is not one of the published region domains (`<region>.coralogix.com` or a legacy per-region domain), so data goes to `ingress.<that domain>`. Expected for a private ingress; a typo otherwise — the collector reports healthy either way. |
 | `CX_ENVIRONMENT_MISSING` | `CX_ENVIRONMENT` unset; all telemetry from this host is labelled `unspecified`. |
 | `RESOURCE_ATTRS_MISSING` | `OTEL_RESOURCE_ATTRIBUTES` unset; Fleet Management selector attributes will be absent. |

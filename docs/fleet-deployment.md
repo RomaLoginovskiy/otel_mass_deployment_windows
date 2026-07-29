@@ -117,7 +117,8 @@ BatchPatch has no atomic "copy + run" object, so we ship one folder and one
      writes `region.txt` and the remote command stays a bare `deploy.bat`.
      The region must match the account the key belongs to: a key from another region
      authenticates nowhere, and the host still reports healthy while sending nothing.
-     For a private ingress domain use `set CORALOGIX_DOMAIN=<domain>` instead.
+     For a private / non-standard ingress domain prepend `set CX_DOMAIN=<domain> &&`
+     instead — it is taken verbatim (no region-table check) and wins over `CX_REGION`.
    - **Environment label (optional, combine with either):** prepend
      `set CX_ENVIRONMENT=<production|staging|dev> &&` to tag this host's telemetry
      for the Coralogix per-environment split (see *Environment labeling* below), e.g.
@@ -641,7 +642,8 @@ Set either/both/neither before the call; each is independent.
 | --- | --- | --- |
 | `CORALOGIX_PRIVATE_KEY` | `-PrivateKey` | Send-Your-Data key at deploy time (overrides a baked-in `SendDataKey.txt`). |
 | `CX_REGION` | `-Region` | Coralogix region: `eu1`, `eu2`, `us1`, `us2`, `us3`, `ap1`, `ap2`, `ap3` → domain `<region>.coralogix.com`, which becomes both the exporters' ingress and the OpAMP endpoint. Must match the account the key belongs to. An unknown code **fails** the install. |
-| `CORALOGIX_DOMAIN` | *(read directly, not flagged)* | Full ingress domain for a private / non-standard endpoint. `Install-CoralogixSupervisor.ps1` reads the variable itself and compares it with the machine-scope value, because a previous install persists this variable machine-wide: a value exported for this run is a decision, the identical inherited value is only a leftover. Forwarded as a flag it would look explicit either way and would outrank a baked-in `region.txt` forever. Same pattern as `CX_RUNTIME_OVERRIDES_JSON`. |
+| `CX_DOMAIN` | `-Domain` | Full ingress domain for a private / non-standard endpoint, e.g. `set CX_DOMAIN=my-ingress.example.com && deploy.bat`. Taken **verbatim** (a scheme and trailing slash are stripped, nothing else is validated) and **wins over `CX_REGION`** when both are set, mirroring `-Domain` > `-Region`. A domain outside the published region list only warns — that is a private ingress and a typo seen from the same place. Whitespace-only is ignored rather than honoured as the domain `''`. |
+| `CORALOGIX_DOMAIN` | *(read directly, not flagged)* | The same thing, but *not* forwarded as a flag: `Install-CoralogixSupervisor.ps1` reads it itself and compares it with the machine-scope value, because a previous install persists this variable machine-wide — a value exported for this run is a decision, the identical inherited value is only a leftover. Forwarded as a flag it would look explicit either way and would outrank a baked-in `region.txt` forever. Same pattern as `CX_RUNTIME_OVERRIDES_JSON`. **Use `CX_DOMAIN` instead**: nothing we install persists it, so it works even on a host already installed against another domain. |
 | `CX_ENVIRONMENT` | `-Environment` | Stamps the deployment environment on all of this host's telemetry. |
 | `CX_APPLICATION` | `-Application` | Coralogix **application** name for this host. **Leave unset** to get the default: the application name falls back to the host's own name (`host.name`). Set it only to group several hosts under one application. |
 | `CX_NO_SUPERVISOR=1` | `-NoSupervisor` | Install the collector **without** the OpAMP Supervisor — the plain `otelcol-contrib` service, config authoritative on disk, no Fleet Management registration. See [Collector modes](#collector-modes-supervisor-or-not) below. |
@@ -747,7 +749,7 @@ The single entry point `deploy.bat` invokes; runnable directly when not using Ba
 | Flag | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `-Region` | string | `$null` | Coralogix region code (`eu1`/`eu2`/`us1`/`us2`/`us3`/`ap1`/`ap2`/`ap3`) → `<region>.coralogix.com`. Unknown code = hard error. |
-| `-Domain` | string | `$null` → see fallback chain | Full ingress domain, for a private endpoint. Wins over `-Region`. With neither flag: `CX_REGION` env → `CORALOGIX_DOMAIN` exported for this run → `region.txt` next to the scripts → the `CORALOGIX_DOMAIN` a previous install persisted → `eu1.coralogix.com`. |
+| `-Domain` | string | `$null` → see fallback chain | Full ingress domain, for a private endpoint. Wins over `-Region`. With neither flag: `CX_DOMAIN` env → `CX_REGION` env → `CORALOGIX_DOMAIN` exported for this run → `region.txt` next to the scripts → the `CORALOGIX_DOMAIN` a previous install persisted → `eu1.coralogix.com`. |
 | `-KeyFile` | string | `$null` → `<scriptdir>\SendDataKey.txt` | File holding the Send-Your-Data key. |
 | `-PrivateKey` | string | `$null` | Key value; overrides `-KeyFile`. Prefer a secured file / BatchPatch env var. |
 | `-Environment` | string | `$null` | `deployment.environment.name` resource attribute (e.g. `production`). |
@@ -818,7 +820,7 @@ Invoked by the orchestrator; documented for standalone supervisor installs.
 | Flag | Type | Default | Purpose |
 | --- | --- | --- | --- |
 | `-Region` | string | `$null` | Region code → domain. Persisted as machine env var `CORALOGIX_DOMAIN`, which the base config's `coralogix` exporters read as `${env:CORALOGIX_DOMAIN:-eu1.coralogix.com}` and the vendor installer turns into the OpAMP endpoint. |
-| `-Domain` | string | `$null` → see fallback chain | Full ingress domain; wins over `-Region`. Fallbacks: `CX_REGION` env → `CORALOGIX_DOMAIN` exported for this run → `region.txt` → the persisted `CORALOGIX_DOMAIN` → `eu1.coralogix.com`. |
+| `-Domain` | string | `$null` → see fallback chain | Full ingress domain; wins over `-Region`. Fallbacks: `CX_DOMAIN` env → `CX_REGION` env → `CORALOGIX_DOMAIN` exported for this run → `region.txt` → the persisted `CORALOGIX_DOMAIN` → `eu1.coralogix.com`. Taken verbatim — a scheme and trailing slash are stripped, nothing else is validated, so an unrecognised domain only warns. |
 | `-PrivateKey` | string | `$null` | Send-Your-Data key; if omitted, read from `-KeyFile`. |
 | `-KeyFile` | string | `<scriptdir>\SendDataKey.txt` | Key file (falls back to `..\SimpleWebApp\coralogix\SendDataKey.txt`). |
 | `-BaseConfig` | string | `<scriptdir>\config.supervisor.yaml` | Base config passed as `-SupervisorCollectorBaseConfig` (must have **no** `opamp` extension). |

@@ -77,6 +77,26 @@ function Normalize-CxDomainString {
     return $v.TrimEnd('.')
 }
 
+function Assert-CxDomainNotEmpty {
+    <#
+      Guard for the explicit-domain inputs (-Domain and CX_DOMAIN), which bypass the
+      region table on purpose and so have no other validation.
+
+      A whitespace-only value must fail rather than be honoured: `set CX_DOMAIN= `
+      satisfies cmd.exe's `if defined`, deploy.bat then forwards -Domain "   ", and
+      normalizing that yields ''. An empty CORALOGIX_DOMAIN makes the exporters ship to
+      'ingress.' while the collector still reports healthy - the exact silent-misroute
+      failure Resolve-CxDomain refuses to allow for an empty region.
+    #>
+    param([string] $Normalized, [string] $Source)
+
+    if ([string]::IsNullOrWhiteSpace($Normalized)) {
+        throw ("$Source is set but empty. Pass a full ingress domain (e.g. eu2.coralogix.com " +
+               "or a private ingress host), or unset it to fall back to the region.")
+    }
+    return $Normalized
+}
+
 function Resolve-CxDomain {
     <#
     .SYNOPSIS

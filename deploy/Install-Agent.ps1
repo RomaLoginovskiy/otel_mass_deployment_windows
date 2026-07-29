@@ -19,12 +19,14 @@
   Coralogix region code: eu1, eu2, us1, us2, us3, ap1, ap2, ap3 (see
   Resolve-CxRegion.ps1). Forwarded to Install-CoralogixSupervisor.ps1, which resolves
   it to <region>.coralogix.com and publishes it as CORALOGIX_DOMAIN. An unknown code
-  fails the install rather than defaulting.
+  fails the install rather than defaulting. Outranked by -Domain and by the CX_DOMAIN
+  environment variable.
 
 .PARAMETER Domain
   Full Coralogix ingress domain, for a private / non-standard endpoint. Wins over
-  -Region. With neither given the region falls back to CX_REGION in the environment,
-  then a CORALOGIX_DOMAIN exported for this run, then region.txt in this folder, then
+  -Region. With neither given the domain falls back to CX_DOMAIN in the environment
+  (the domain-shaped equivalent, which deploy.bat forwards here), then CX_REGION, then
+  a CORALOGIX_DOMAIN exported for this run, then region.txt in this folder, then
   whatever a previous install persisted, then eu1.coralogix.com - resolved by
   Install-CoralogixSupervisor.ps1, which documents the order.
 

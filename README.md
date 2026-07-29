@@ -65,6 +65,7 @@ Follow [`docs/fleet-deployment.md`](docs/fleet-deployment.md).
 .\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx-send-your-data.key -Region eu2
 #    -> coralogix-agent-deploy.zip
 #    Region can also be chosen per host at deploy time: set CX_REGION=eu2 && deploy.bat
+#    Private / non-standard ingress: set CX_DOMAIN=my-ingress.example.com && deploy.bat
 
 # 2. Push with BatchPatch to a 2-3 host pilot, then the full fleet.
 #    Each host runs deploy.bat -> Install-Agent.ps1:
@@ -175,6 +176,9 @@ IIS zero-code instrumentation configured.
   `<region>.coralogix.com`). Pass it as `-Region` / `CX_REGION`, or bake it into the
   package with `Build-DeploymentPackage.ps1 -Region`. Default is `eu1`; a key used
   against the wrong region authenticates nowhere while the host still reports healthy.
+  For a private / non-standard ingress domain the region table does not cover, pass the
+  domain itself as `-Domain` / `CX_DOMAIN` instead — it wins over the region and is taken
+  verbatim, so it cannot be baked into the package and must be set per host.
 - IIS role installed if using the IIS receivers.
 
 > **Security:** never commit the Send-Your-Data key. The collector reads it from

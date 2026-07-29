@@ -300,7 +300,7 @@ if (Use-Check 'env') {
     $domain = Get-MachineVar 'CORALOGIX_DOMAIN'
     if (-not $domain) {
         Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'DOMAIN_MISSING' -Target 'CORALOGIX_DOMAIN' `
-            -Message 'not set - the config default applies and this host ships to eu1. Re-deploy with -Region <code> (or CX_REGION) if that is not the account.')
+            -Message 'not set - the config default applies and this host ships to eu1. Re-deploy with -Region <code> (or CX_REGION), or -Domain / CX_DOMAIN for a private ingress, if that is not the account.')
     } else {
         # Name the region when the domain is one Coralogix publishes; flag it when it is
         # not, because a typo'd domain and a private ingress look identical from here and
@@ -311,7 +311,7 @@ if (Use-Check 'env') {
                 -Message "$domain (region $regionCode)" -Data @{ domain = $domain; region = $regionCode })
         } else {
             Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'DOMAIN_NOT_A_KNOWN_REGION' -Target 'CORALOGIX_DOMAIN' `
-                -Message "$domain is not a published Coralogix region domain - data goes to ingress.$domain. Expected for a private ingress; a typo otherwise." `
+                -Message "$domain is not a published Coralogix region domain - data goes to ingress.$domain. Expected for a private ingress (-Domain / CX_DOMAIN); a typo in that value otherwise." `
                 -Data @{ domain = $domain })
         }
     }

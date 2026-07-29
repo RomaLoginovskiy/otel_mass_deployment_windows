@@ -137,3 +137,10 @@ deploy/install-agent*.log
 deploy/uninstall-agent*.log
 deploy/install-agent-status.json
 deploy/detect-workloads.json
+
+# Artifacts collected FROM a host and pulled back here for analysis (doctor.json,
+# cx-inst.json, detect output) plus any report written about them. Host-specific and
+# often carrying real site/app names - never committed. Both spellings, so a rename
+# of the misspelled folder stays ignored.
+artifacs/
+artifacts/
