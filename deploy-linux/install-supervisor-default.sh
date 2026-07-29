@@ -145,9 +145,19 @@ def upsert_attr(text: str, key: str, value: str) -> str:
     attr_re = re.compile(rf'(?m)^(\s*)(?:{re.escape(key)}|"{re.escape(key)}"):\s*.*$')
     m = re.search(r'(?m)^(\s*)non_identifying_attributes:\s*$', text)
     indent = (m.group(1) + "  ") if m else "      "
-    new_line = f'{indent}{key}: "{value}"'
+    # Single-quoted with every backslash DOUBLED. The supervisor re-serializes description
+    # values into the merged config without escaping them and parses that text again, so one
+    # level of backslash escaping is consumed per pass: a value that survives the first parse
+    # as a single backslash either kills the service ("yaml: found unknown escape character")
+    # or is silently corrupted when the trailing character happens to be a valid escape.
+    # Measured on Windows, where the values are paths - but the writer is shared, and an
+    # APP_TYPE or ENV_TYPE carrying a backslash would hit exactly the same parser.
+    new_line = "{}{}: '{}'".format(indent, key, value.replace("\\", "\\\\").replace("'", "''"))
     if attr_re.search(text):
-        return attr_re.sub(new_line, text, count=1)
+        # lambda, not the string: re.sub() reads a string replacement as a TEMPLATE, so a value
+        # containing '\' raises re.PatternError ("bad escape \\P"). A callable's return value
+        # is used verbatim.
+        return attr_re.sub(lambda _: new_line, text, count=1)
     if m:
         return re.sub(
             r'(?m)^(\s*)non_identifying_attributes:\s*$',

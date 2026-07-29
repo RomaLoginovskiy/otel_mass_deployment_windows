@@ -4,9 +4,21 @@
 | --- | --- | --- | --- |
 | **Diagnostics** | **Offline, self-asserting** — no keys, no network | `Run-DoctorTest.ps1` | ✅ |
 | **Full deploy loop** | Drives `deploy.bat` / `doctor.bat` over an 8-shape IIS host, injects faults | `Run-E2ELoop.ps1` | ✅ |
+| **Supervisor AgentDescription writer** | Fixture-only unit tests for the YAML the installer injects into the supervisor's `config.yaml` — no Docker, no service, no elevation, ~1s | `test/Test-SupervisorConfigWriter.ps1` | ✅ |
 | **IIS + supervisor E2E** (below) | Ships telemetry to Coralogix; human reads the verdict | `Run-DockerWinTest.ps1` | — |
 | **Node.js + PM2 variant** | Same image, PM2 apps added | `Run-DockerWinTest.ps1` + `scripts/Verify-CoralogixNodeSpans.ps1` | — |
 | **RabbitMQ variant** | Ships RabbitMQ metrics/logs | `Run-RabbitmqTest.ps1` | — |
+
+> **Known blind spot: supervisor mode.** Every container harness here installs with
+> `CX_NO_SUPERVISOR=1`, because the vendor installer cannot fetch the collector MSI in a Server
+> Core container. Nothing in `test/docker-win/` therefore executes the supervisor branch of
+> `Install-CoralogixSupervisor.ps1`. That is how a writer emitting single-escaped backslashes
+> reached production and killed `opampsupervisor` on a host whose `workload.pm2.home` was
+> `C:\ProgramData\pm2`, with the install still reporting success. Anything in that branch that is
+> a **pure function** needs a fixture-only unit test (`test/Test-SupervisorConfigWriter.ps1`);
+> anything that is not gets verified against a real host — the installer now confirms the service
+> is actually `Running` after its edit and rolls the config back if it is not. The measured
+> quoting rules are in [`docs/fleet-deployment.md`](../../docs/fleet-deployment.md#backslashes-in-agentdescription-values-measured).
 
 **Only the two asserting harnesses are committed.** They have expected results, exit
 non-zero on failure, and run from a clean clone. The three telemetry-shipping harnesses
