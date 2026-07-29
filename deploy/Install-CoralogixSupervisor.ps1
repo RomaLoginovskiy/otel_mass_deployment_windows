@@ -41,10 +41,11 @@
   Full Coralogix ingress domain, for a private / non-standard endpoint the region
   table does not cover. Wins over -Region when both are given.
 
-  When NEITHER is given the domain is resolved, in order, from: the CX_REGION
-  environment variable, a CORALOGIX_DOMAIN exported for this run, a region.txt file next
-  to this script, the CORALOGIX_DOMAIN a previous install persisted on this host, and
-  finally eu1.coralogix.com. See the block above the resolution for why the same
+  When NEITHER is given the domain is resolved, in order, from: the CX_DOMAIN environment
+  variable (the domain-shaped equivalent of this parameter, which deploy.bat forwards), the
+  CX_REGION environment variable, a CORALOGIX_DOMAIN exported for this run, a region.txt
+  file next to this script, the CORALOGIX_DOMAIN a previous install persisted on this host,
+  and finally eu1.coralogix.com. See the block above the resolution for why the same
   environment variable appears in two different places in that order.
 
 .PARAMETER PrivateKey
@@ -218,16 +219,22 @@ Assert-Admin
 # Precedence, most explicit first:
 #   1. -Domain              a private or non-standard ingress domain, verbatim.
 #   2. -Region              region code -> <region>.coralogix.com.
-#   3. CX_REGION env        the region-shaped equivalent, e.g. BatchPatch's
+#   3. CX_DOMAIN env        the domain-shaped equivalent of -Domain, e.g. BatchPatch's
+#                           `set CX_DOMAIN=my-ingress.example.com && deploy.bat`. Unlike
+#                           CORALOGIX_DOMAIN this variable is never persisted by us, so
+#                           its presence is always a decision made for this run - which
+#                           is why deploy.bat CAN forward it as a flag. It outranks
+#                           CX_REGION for the same reason -Domain outranks -Region.
+#   4. CX_REGION env        the region-shaped equivalent, e.g. BatchPatch's
 #                           `set CX_REGION=eu2 && deploy.bat`.
-#   4. CORALOGIX_DOMAIN env when it DIFFERS from the machine value, i.e. exported for
+#   5. CORALOGIX_DOMAIN env when it DIFFERS from the machine value, i.e. exported for
 #                           this run: a private ingress chosen at deploy time.
-#   5. region.txt           next to this script - Build-DeploymentPackage.ps1 -Region
+#   6. region.txt           next to this script - Build-DeploymentPackage.ps1 -Region
 #                           bakes it in so the remote command stays a bare 'deploy.bat'.
-#   6. CORALOGIX_DOMAIN env matching the machine value: no new decision anywhere, so a
+#   7. CORALOGIX_DOMAIN env matching the machine value: no new decision anywhere, so a
 #                           re-run keeps the region this host was installed with instead
 #                           of dropping back to the eu1 default.
-#   7. eu1.coralogix.com    historical default.
+#   8. eu1.coralogix.com    historical default.
 $machineDomain = [Environment]::GetEnvironmentVariable('CORALOGIX_DOMAIN', 'Machine')
 $envDomain     = Normalize-CxDomainString $env:CORALOGIX_DOMAIN
 $envDomainIsNew = $envDomain -and ($envDomain -ne (Normalize-CxDomainString $machineDomain))
@@ -235,11 +242,17 @@ $envDomainIsNew = $envDomain -and ($envDomain -ne (Normalize-CxDomainString $mac
 $regionSource = $null
 if ($Domain) {
     if ($Region) { Write-Warning "[collector] both -Domain and -Region given; -Domain '$Domain' wins" }
-    $Domain = Normalize-CxDomainString $Domain
+    $Domain = Assert-CxDomainNotEmpty (Normalize-CxDomainString $Domain) '-Domain'
     $regionSource = '-Domain'
 } elseif ($Region) {
     $Domain = Resolve-CxDomain -Region $Region
     $regionSource = "-Region $Region"
+} elseif ($env:CX_DOMAIN) {
+    # Deliberately NOT run through Resolve-CxDomain: that validates against the published
+    # region table and throws, which is the opposite of what this variable is for.
+    if ($env:CX_REGION) { Write-Warning "[collector] both CX_DOMAIN and CX_REGION set; CX_DOMAIN '$env:CX_DOMAIN' wins" }
+    $Domain = Assert-CxDomainNotEmpty (Normalize-CxDomainString $env:CX_DOMAIN) 'CX_DOMAIN'
+    $regionSource = 'CX_DOMAIN env'
 } elseif ($env:CX_REGION) {
     $Domain = Resolve-CxDomain -Region $env:CX_REGION
     $regionSource = "CX_REGION env ($env:CX_REGION)"
