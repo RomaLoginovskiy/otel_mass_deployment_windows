@@ -711,10 +711,11 @@ try {
                 $mustNot  = @($svcNames.Clr2, 'arrproxy', 'staticwc', 'nocfg', 'binonly')
                 $vArgs = @('-QueryKeyFile', $QueryKeyFile, '-HostName', $HostRename, '-MustNotContain') + $mustNot
                 if ($expected) { $vArgs += @('-ExpectedValue', $expected) }
-                $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $verifier @vArgs 2>&1 |
-                        ForEach-Object { "$_" }
-                $code = $LASTEXITCODE
-                Assert-True 'infra labels verified in Coralogix' ($code -eq 0) (($out | Select-Object -Last 6) -join ' | ')
+                # Through Invoke-HostScript, not a bare call: the verifier writes to stderr, and under
+                # $ErrorActionPreference='Stop' that becomes a terminating NativeCommandError which
+                # aborted this phase (and P9/P10 with it) while the summary still printed normally.
+                $r = Invoke-HostScript -Path $verifier -Arguments $vArgs
+                Assert-True 'infra labels verified in Coralogix' ($r.Code -eq 0) $r.Out
             } else {
                 Note 'Verify-CoralogixInfraLabels.ps1 missing' 'host-telemetry gate skipped'
             }
@@ -722,9 +723,13 @@ try {
             $nodeVerifier = Join-Path $RepoRoot 'scripts\Verify-CoralogixNodeSpans.ps1'
             if (Test-Path $nodeVerifier) {
                 Write-Host '  (Node spans + logs)'
-                $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $nodeVerifier -QueryKeyFile $QueryKeyFile 2>&1 |
-                        ForEach-Object { "$_" }
-                Assert-True 'Node telemetry verified in Coralogix' ($LASTEXITCODE -eq 0) (($out | Select-Object -Last 6) -join ' | ')
+                # The PM2 shape this matrix provisions is the fork app; cluster is a known-open
+                # (env applies, no telemetry), so gating on it here would fail for a reason that is
+                # already documented rather than for anything this run changed.
+                $nArgs = @('-QueryKeyFile', $QueryKeyFile, '-Services', 'shape-user-fork',
+                           '-ClusterService', 'shape-user-fork', '-MinClusterWorkers', '1')
+                $r = Invoke-HostScript -Path $nodeVerifier -Arguments $nArgs
+                Assert-True 'Node telemetry verified in Coralogix' ($r.Code -eq 0) $r.Out
             }
         }
     }
