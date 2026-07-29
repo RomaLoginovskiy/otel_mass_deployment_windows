@@ -108,6 +108,21 @@ try {
     $report['net35'] = [bool](Get-WindowsFeature -Name 'NET-Framework-Core').Installed
 } catch { $report['net35'] = "error: $($_.Exception.Message)" }
 
+# Installing .NET 3.5 gives the box a CLR 2 runtime, but it does NOT map *.aspx to ASP.NET 2.0 in
+# IIS. Without that mapping a v2.0 app pool serves an .aspx file as a static request that has no
+# handler, and IIS answers 404 - which looks like a missing file rather than an unregistered
+# framework. aspnet_regiis is what creates the handler mapping, and it only exists once 3.5 is in.
+try {
+    $regiis = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v2.0.50727\aspnet_regiis.exe'
+    if (Test-Path $regiis) {
+        Say 'registering ASP.NET 2.0 handler mappings (aspnet_regiis -i -enable)'
+        & $regiis -i -enable 2>&1 | Out-Null
+        $report['aspnet20'] = if ($LASTEXITCODE -eq 0) { 'registered' } else { "aspnet_regiis exit $LASTEXITCODE" }
+    } else {
+        $report['aspnet20'] = 'aspnet_regiis not present (no CLR 2 on this host)'
+    }
+} catch { $report['aspnet20'] = "error: $($_.Exception.Message)" }
+
 # ---- 2. WinRM / firewall (so the loop can also use WinRM if guestcontrol misbehaves) ----
 try {
     Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction SilentlyContinue | Out-Null
