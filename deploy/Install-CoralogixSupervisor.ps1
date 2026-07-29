@@ -154,8 +154,8 @@ function ConvertTo-SupervisorAttrScalar {
       The supervisor does not parse config.yaml once. It re-serializes
       agent.description.non_identifying_attributes into the config text it composes for the
       collector WITHOUT escaping backslashes, and parses that text again - so one level of
-      backslash escaping is consumed per pass. Measured against the real binary on a Windows VM
-      (poc\Run-SupervisorVmLoop.ps1), for the value C:\ProgramData\pm2:
+      backslash escaping is consumed per pass. Measured against the real binary on a Windows VM,
+      for the value C:\ProgramData\pm2:
 
         "C:\ProgramData\pm2"        DEAD  - "load config: retrieved value (type=string) cannot be
                                     used as a Conf ... found unknown escape character". This is
@@ -361,10 +361,10 @@ function Publish-SupervisorAgentDescription {
       This is a function rather than inline install steps for one reason: it is the only
       place in the deploy that can take a working agent off the air, and the rollback branch
       is the part most likely to rot. Inline, it could only be exercised by a full vendor
-      reinstall on a real host, which no harness does; as a function, both
-      test\Test-SupervisorConfigWriter.ps1 and poc\Run-SupervisorVmLoop.ps1 can drive it -
-      the latter against the real supervisor binary, which is the only thing that can prove
-      go-yaml accepts what we write.
+      reinstall on a real host, which no harness does; as a function,
+      test\Test-SupervisorConfigWriter.ps1 drives it offline, and a VM loop can drive it
+      against the real supervisor binary - the only thing that can prove go-yaml accepts
+      what we write.
 
       Returns a result object ($_.Applied / $_.RolledBack / $_.Reason) so a caller - or the
       VM loop - can assert on the outcome instead of parsing host output.

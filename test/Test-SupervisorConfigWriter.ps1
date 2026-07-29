@@ -13,7 +13,7 @@
   agent.description.non_identifying_attributes into the config text it composes for the collector
   WITHOUT escaping backslashes, then parses that text again. One level of backslash escaping is
   consumed per pass. Measured against the real binary on a Windows VM
-  (poc\Run-SupervisorVmLoop.ps1) for the value C:\ProgramData\pm2:
+  for the value C:\ProgramData\pm2:
 
     "C:\ProgramData\pm2"          DEAD   - the reported OTIOMWQA01 failure ("retrieved value
                                   (type=string) cannot be used as a Conf ... found unknown escape
