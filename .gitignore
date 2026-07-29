@@ -78,6 +78,7 @@ misc/*.log
 test/*
 # Fixture-only unit suites: no baked binaries, no keys, run from a clean clone.
 !test/Test-SupervisorConfigWriter.ps1
+!test/Test-ServiceInstrumenters.ps1
 !test/docker-win
 test/docker-win/*
 
