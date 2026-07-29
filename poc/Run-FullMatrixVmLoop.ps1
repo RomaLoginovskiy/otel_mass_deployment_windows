@@ -64,6 +64,12 @@ param(
     [string]   $User          = 'Administrator',
     [string]   $Password      = 'Otel!Passw0rd2026',
     [string]   $RepoRoot      = $null,
+    # Where the BAKED guest assets live (node.zip, npm-global, otel-dotnet.zip, otel-node). They are
+    # gitignored - multi-GB binaries and host-installed node_modules - so they are not in a fresh
+    # clone or a worktree, and the machine that has them is not necessarily the one holding the
+    # branch under test. Defaults to this repo's test\docker-win; point it elsewhere when the assets
+    # were baked in another checkout. Missing assets skip the shapes that need them, with a note.
+    [string]   $AssetRoot     = $null,
     [string]   $GuestStage    = 'C:\cx-deploy',
     [string]   $GuestFixtures = 'C:\cx-fixtures',
     [string]   $PrivateKey    = $env:CORALOGIX_PRIVATE_KEY,
@@ -81,6 +87,7 @@ $ErrorActionPreference = 'Stop'
 
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if (-not $RepoRoot) { $RepoRoot = Split-Path -Parent $here }
+if (-not $AssetRoot) { $AssetRoot = Join-Path $RepoRoot 'test\docker-win' }
 . (Join-Path $here 'VmLoop.Common.ps1')
 
 # `-Phase P4,P7` through `powershell -File` arrives as a single "P4,P7" string. Re-split, or the
@@ -210,10 +217,16 @@ try {
         # Stage everything the guest needs. node.zip / npm-global / otel-dotnet.zip are only present
         # on a machine that has built the container harnesses; each is reported rather than assumed.
         $stage = 'C:\cx-stage'
+        # Baked binaries come from -AssetRoot; text fixtures come from the branch under test, so the
+        # shapes are always the ones in this checkout even when the assets were baked elsewhere.
         $assets = @(
-            @{ Local = (Join-Path $RepoRoot 'test\docker-win\node.zip');        Guest = "$stage\node.zip";        Kind = 'file' }
-            @{ Local = (Join-Path $RepoRoot 'test\docker-win\otel-dotnet.zip'); Guest = "$stage\otel-dotnet.zip"; Kind = 'file' }
-            @{ Local = (Join-Path $RepoRoot 'test\docker-win\npm-global');      Guest = "$stage\npm-global";      Kind = 'dir'  }
+            @{ Local = (Join-Path $AssetRoot 'node.zip');        Guest = "$stage\node.zip";        Kind = 'file' }
+            @{ Local = (Join-Path $AssetRoot 'otel-dotnet.zip'); Guest = "$stage\otel-dotnet.zip"; Kind = 'file' }
+            @{ Local = (Join-Path $AssetRoot 'npm-global');      Guest = "$stage\npm-global";      Kind = 'dir'  }
+            # The OTel Node package, staged rather than npm-installed in the guest: npm on a Server
+            # SKU hits an intermittent OpenSSL AES-GCM fault, and both Node instrumenters resolve
+            # their bootstrap out of this prefix.
+            @{ Local = (Join-Path $AssetRoot 'otel-node');       Guest = 'C:\cx\otel-node';        Kind = 'dir'  }
             @{ Local = (Join-Path $RepoRoot 'test\docker-win\nodeshapes\apps');        Guest = 'C:\cx\nodeshapes\apps';        Kind = 'dir' }
             @{ Local = (Join-Path $RepoRoot 'test\docker-win\nodeshapes\pm2-service'); Guest = 'C:\cx\nodeshapes\pm2-service'; Kind = 'dir' }
             @{ Local = (Join-Path $RepoRoot 'test\fixtures\out');               Guest = $GuestFixtures;           Kind = 'dir'  }
@@ -598,6 +611,10 @@ try {
             Assert-True 'naming report parsed' $false 'no JSON from the guest'
         } else {
             $claimed = @(([string]$naming.IisServices) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            # Carried into P7: the telemetry gate must check the value the GUEST stamped, not the
+            # value of CX_IIS_SERVICES on this controller machine (the verifier's default), which
+            # would silently verify the wrong host.
+            $script:GuestIisServices = [string]$naming.IisServices
             Write-Host "  CX_IIS_SERVICES    = $($naming.IisServices)"
             Write-Host "  CX_NODE_SERVICES   = $($naming.NodeServices)"
             Write-Host "  CX_DOTNET_SERVICES = $($naming.DotnetServices)"
@@ -655,7 +672,16 @@ try {
             $verifier = Join-Path $RepoRoot 'scripts\Verify-CoralogixInfraLabels.ps1'
             if (Test-Path $verifier) {
                 Write-Host '  (host telemetry / IIS service labels)'
-                $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $verifier -QueryKeyFile $QueryKeyFile -HostName $HostRename 2>&1 |
+                # -ExpectedValue is passed explicitly: its default is CX_IIS_SERVICES on THIS
+                # machine, which would verify the controller's value against the guest's telemetry.
+                # -MustNotContain turns the refusal cases into a backend assertion rather than a
+                # claim about the installer: a name that was never claimed must never show up as a
+                # Service either.
+                $expected = if ($script:GuestIisServices) { $script:GuestIisServices } else { '' }
+                $mustNot  = @($svcNames.Clr2, 'arrproxy', 'staticwc', 'nocfg', 'binonly')
+                $vArgs = @('-QueryKeyFile', $QueryKeyFile, '-HostName', $HostRename, '-MustNotContain') + $mustNot
+                if ($expected) { $vArgs += @('-ExpectedValue', $expected) }
+                $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $verifier @vArgs 2>&1 |
                         ForEach-Object { "$_" }
                 $code = $LASTEXITCODE
                 Assert-True 'infra labels verified in Coralogix' ($code -eq 0) (($out | Select-Object -Last 6) -join ' | ')

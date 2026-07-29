@@ -34,14 +34,14 @@
 #>
 
 # ---- transport state ----------------------------------------------------------
-$script:VmName      = $null
-$script:VmUser      = $null
-$script:PwFile      = $null
-$script:HostStage   = $null
-$script:GuestStage  = $null
-$script:GcBase      = @()
-$script:StepSeq     = 0
-$script:VBoxPath    = $null
+$script:VmlName      = $null
+$script:VmlUser      = $null
+$script:VmlPwFile      = $null
+$script:VmlHostStage   = $null
+$script:VmlGuestStage  = $null
+$script:VmlGcBase      = @()
+$script:VmlStepSeq     = 0
+$script:VmlVBoxPath    = $null
 
 # ---- assertion state ----------------------------------------------------------
 $script:Pass = 0
@@ -52,10 +52,10 @@ $script:Results = @()      # ordered record of every assertion, for the summary 
 $script:CurrentPhase = ''
 
 function Get-VBoxManagePath {
-    if ($script:VBoxPath) { return $script:VBoxPath }
+    if ($script:VmlVBoxPath) { return $script:VmlVBoxPath }
     $p = Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxManage.exe'
     if (-not (Test-Path $p)) { $p = 'VBoxManage.exe' }   # rely on PATH
-    $script:VBoxPath = $p
+    $script:VmlVBoxPath = $p
     return $p
 }
 
@@ -92,38 +92,38 @@ function Initialize-VmLoop {
     }
     if (-not (Test-Path $HostStage)) { New-Item -ItemType Directory -Path $HostStage -Force | Out-Null }
 
-    $script:VmName     = $VmName
-    $script:VmUser     = $User
-    $script:HostStage  = $HostStage
-    $script:GuestStage = $GuestStage
-    $script:PwFile     = Join-Path $HostStage 'gc.pw'
-    Set-Content -LiteralPath $script:PwFile -Value $Password -Encoding Ascii -NoNewline
-    $script:GcBase = @('guestcontrol', $VmName, '--username', $User, '--passwordfile', $script:PwFile)
+    $script:VmlName     = $VmName
+    $script:VmlUser     = $User
+    $script:VmlHostStage  = $HostStage
+    $script:VmlGuestStage = $GuestStage
+    $script:VmlPwFile     = Join-Path $HostStage 'gc.pw'
+    Set-Content -LiteralPath $script:VmlPwFile -Value $Password -Encoding Ascii -NoNewline
+    $script:VmlGcBase = @('guestcontrol', $VmName, '--username', $User, '--passwordfile', $script:VmlPwFile)
 
     return [pscustomobject]@{ VmName = $VmName; HostStage = $HostStage; GuestStage = $GuestStage }
 }
 
 function Remove-VmLoopTemp {
     # The password file is the only thing here that matters; the rest is step scripts.
-    if ($script:PwFile -and (Test-Path $script:PwFile)) {
-        try { [System.IO.File]::Delete($script:PwFile) } catch { }
+    if ($script:VmlPwFile -and (Test-Path $script:VmlPwFile)) {
+        try { [System.IO.File]::Delete($script:VmlPwFile) } catch { }
     }
 }
 
 # ---- VM lifecycle -------------------------------------------------------------
 
 function Test-VmExists {
-    param([string] $Name = $script:VmName)
+    param([string] $Name = $script:VmlName)
     return [bool](@(VBoxSoft list vms) -match ('^"' + [regex]::Escape($Name) + '"'))
 }
 
 function Test-VmRunning {
-    param([string] $Name = $script:VmName)
+    param([string] $Name = $script:VmlName)
     return [bool](@(VBoxSoft list runningvms) -match ('^"' + [regex]::Escape($Name) + '"'))
 }
 
 function Start-VmHeadless {
-    param([string] $Name = $script:VmName)
+    param([string] $Name = $script:VmlName)
     if (Test-VmRunning -Name $Name) { return $true }
     VBoxSoft startvm $Name --type headless | Out-Null
     return (Test-VmRunning -Name $Name)
@@ -142,7 +142,7 @@ function Wait-GuestReady {
         $old = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            & $exe @script:GcBase run --exe 'C:\Windows\System32\cmd.exe' --wait-stdout --wait-stderr `
+            & $exe @script:VmlGcBase run --exe 'C:\Windows\System32\cmd.exe' --wait-stdout --wait-stderr `
                 '--' cmd /c 'echo READY' 2>&1 | Out-Null
             $ok = ($LASTEXITCODE -eq 0)
         } catch { $ok = $false }
@@ -156,12 +156,12 @@ function Wait-GuestReady {
 function New-VmSnapshot {
     param([string] $SnapshotName, [switch] $IfMissing)
 
-    $existing = @(VBoxSoft snapshot $script:VmName list --machinereadable) -join "`n"
+    $existing = @(VBoxSoft snapshot $script:VmlName list --machinereadable) -join "`n"
     if ($IfMissing -and $existing -match ('SnapshotName[^=]*="' + [regex]::Escape($SnapshotName) + '"')) {
         return $false    # already there, nothing taken
     }
     # A live snapshot of a running VM is fine for our purposes and avoids a stop/start cycle.
-    VBoxSoft snapshot $script:VmName take $SnapshotName --live | Out-Null
+    VBoxSoft snapshot $script:VmlName take $SnapshotName --live | Out-Null
     return $true
 }
 
@@ -172,10 +172,10 @@ function Restore-VmSnapshot {
     #>
     param([string] $SnapshotName, [int] $ReadyTimeoutSeconds = 900)
 
-    VBoxSoft controlvm $script:VmName poweroff | Out-Null
+    VBoxSoft controlvm $script:VmlName poweroff | Out-Null
     Start-Sleep -Seconds 4
-    VBoxSoft snapshot $script:VmName restore $SnapshotName | Out-Null
-    VBoxSoft startvm $script:VmName --type headless | Out-Null
+    VBoxSoft snapshot $script:VmlName restore $SnapshotName | Out-Null
+    VBoxSoft startvm $script:VmlName --type headless | Out-Null
     return (Wait-GuestReady -TimeoutSeconds $ReadyTimeoutSeconds)
 }
 
@@ -194,8 +194,8 @@ function Copy-ToGuest {
           [Parameter(Mandatory)] [string] $GuestPath)
 
     $dir = Split-Path -Parent $GuestPath
-    if ($dir) { VBoxSoft @script:GcBase mkdir $dir --parents | Out-Null }
-    $out = VBoxSoft @script:GcBase copyto $LocalPath $GuestPath
+    if ($dir) { VBoxSoft @script:VmlGcBase mkdir $dir --parents | Out-Null }
+    $out = VBoxSoft @script:VmlGcBase copyto $LocalPath $GuestPath
     if ($LASTEXITCODE -ne 0) { throw "copyto failed ($LocalPath -> $GuestPath): $($out -join ' ')" }
 }
 
@@ -208,8 +208,8 @@ function Copy-DirToGuest {
     param([Parameter(Mandatory)] [string] $LocalDir,
           [Parameter(Mandatory)] [string] $GuestDir)
 
-    VBoxSoft @script:GcBase mkdir $GuestDir --parents | Out-Null
-    $out = VBoxSoft @script:GcBase copyto $LocalDir $GuestDir --recursive
+    VBoxSoft @script:VmlGcBase mkdir $GuestDir --parents | Out-Null
+    $out = VBoxSoft @script:VmlGcBase copyto $LocalDir $GuestDir --recursive
     if ($LASTEXITCODE -eq 0) { return $true }
 
     Write-Host "  [transport] recursive copy of $LocalDir reported failure; falling back to per-file" -ForegroundColor DarkYellow
@@ -241,10 +241,10 @@ function Invoke-Guest {
           [int] $Tail = 0,
           [int] $TimeoutSeconds = 0)
 
-    $script:StepSeq++
-    $stepName = "step-$($script:StepSeq)"
-    $argsFile = Join-Path $script:HostStage "$stepName.args.json"
-    $ps1File  = Join-Path $script:HostStage "$stepName.ps1"
+    $script:VmlStepSeq++
+    $stepName = "step-$($script:VmlStepSeq)"
+    $argsFile = Join-Path $script:VmlHostStage "$stepName.args.json"
+    $ps1File  = Join-Path $script:VmlHostStage "$stepName.ps1"
 
     @{ args = @($ArgumentList) } | ConvertTo-Json -Depth 8 -Compress |
         Set-Content -LiteralPath $argsFile -Encoding utf8
@@ -253,7 +253,7 @@ function Invoke-Guest {
     # expanded by the wrapper. It is rebuilt into a scriptblock in the guest and splatted.
     $wrapper = @"
 `$ErrorActionPreference = 'Continue'
-`$__json = Get-Content -LiteralPath '$($script:GuestStage)\$stepName.args.json' -Raw
+`$__json = Get-Content -LiteralPath '$($script:VmlGuestStage)\$stepName.args.json' -Raw
 `$__a = @((ConvertFrom-Json `$__json).args)
 `$__sb = [scriptblock]::Create(@'
 $($Script.ToString())
@@ -262,14 +262,14 @@ $($Script.ToString())
 "@
     Set-Content -LiteralPath $ps1File -Value $wrapper -Encoding utf8
 
-    Copy-ToGuest -LocalPath $argsFile -GuestPath "$($script:GuestStage)\$stepName.args.json"
-    Copy-ToGuest -LocalPath $ps1File  -GuestPath "$($script:GuestStage)\$stepName.ps1"
+    Copy-ToGuest -LocalPath $argsFile -GuestPath "$($script:VmlGuestStage)\$stepName.args.json"
+    Copy-ToGuest -LocalPath $ps1File  -GuestPath "$($script:VmlGuestStage)\$stepName.ps1"
 
-    $gcArgs = @($script:GcBase) + @('run')
+    $gcArgs = @($script:VmlGcBase) + @('run')
     if ($TimeoutSeconds -gt 0) { $gcArgs += @('--timeout', ($TimeoutSeconds * 1000)) }
     $gcArgs += @('--exe', 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
                  '--wait-stdout', '--wait-stderr', '--',
-                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$($script:GuestStage)\$stepName.ps1")
+                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$($script:VmlGuestStage)\$stepName.ps1")
 
     $out = VBoxSoft @gcArgs
     $lines = @($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() })
@@ -310,11 +310,11 @@ function Invoke-GuestFile {
           [int] $Tail = 40,
           [int] $TimeoutSeconds = 0)
 
-    if (-not $GuestPath) { $GuestPath = Join-Path $script:GuestStage (Split-Path -Leaf $LocalPath) }
+    if (-not $GuestPath) { $GuestPath = Join-Path $script:VmlGuestStage (Split-Path -Leaf $LocalPath) }
     Copy-ToGuest -LocalPath $LocalPath -GuestPath $GuestPath
 
     $isBat  = $GuestPath -match '\.(bat|cmd)$'
-    $gcArgs = @($script:GcBase) + @('run')
+    $gcArgs = @($script:VmlGcBase) + @('run')
     if ($TimeoutSeconds -gt 0) { $gcArgs += @('--timeout', ($TimeoutSeconds * 1000)) }
     if ($isBat) {
         $gcArgs += @('--exe', 'C:\Windows\System32\cmd.exe', '--wait-stdout', '--wait-stderr', '--',

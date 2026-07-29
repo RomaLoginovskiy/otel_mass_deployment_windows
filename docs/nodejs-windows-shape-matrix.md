@@ -36,9 +36,29 @@ asserts that each is *reported as such*: no false pass, no crash, no claim of co
 | Shape | What the tooling says | Why not covered |
 | --- | --- | --- |
 | **bare `node.exe`** (scheduled task, startup script, hand-started) | `workload.nodejs` without `workload.pm2`; doctor `skip`/`unknown` | no supervisor to inject env into and restart through. Instrumenting means editing whatever starts it |
-| **Node as a Windows service** (node-windows / nssm / winsw, no PM2) | not claimed as PM2 | the env lives in the service definition; changing it is a service reconfigure + restart, not a `pm2 restart` |
+| ~~**Node as a Windows service** (node-windows / nssm / winsw, no PM2)~~ | **now covered** — see below | was: the env lives in the service definition, so it is a service reconfigure + restart rather than a `pm2 restart` |
 | **iisnode** | `Resolve-IISAppRuntime` → Unsupported, `NON_DOTNET_APP_NOT_INSTRUMENTED`, kept out of `CX_IIS_SERVICES` | IIS runs no managed code (nothing for .NET auto-instrumentation) and there is no PM2 (nothing for the Node path). iisnode is also effectively EOL |
 | **IIS ARR → PM2 app** | IIS site Unsupported; the **Node** side carries the telemetry | correct division of labour, and SGA's actual architecture. See the trace-continuity note below |
+
+### Node as a Windows service, without PM2 — now covered
+
+`deploy\Instrument-NodeService.ps1` handles the shape that used to be listed as out of scope. There
+is no daemon to ask and no `pm2 restart` to run, so the environment goes where the SCM will hand it
+to the process, and the service is restarted and then **verified to still be Running** a few seconds
+later — a service whose new `NODE_OPTIONS` makes it crash reaches Running briefly first.
+
+| Launcher | Where the environment goes |
+| --- | --- |
+| winsw / node-windows | `<env name="..." value="..."/>` in the generated service XML, edited through the XML DOM (a regex rewrite produces two elements with one name, after which the last silently wins) |
+| nssm | `AppEnvironmentExtra`, read back and re-sent so existing entries survive |
+| `node.exe` launched directly by the SCM | the service's own `Environment` value (`REG_MULTI_SZ`) |
+| anything else | **refused, with the reason** — never guessed |
+
+`NODE_OPTIONS` is merged, never replaced, and PM2's own service is skipped on purpose:
+`Instrument-NodePM2.ps1` owns that shape, and instrumenting the God daemon would self-instrument
+every `pm2` CLI call. Ownership is published as `CX_NODE_SERVICES`, merged with whatever the PM2
+instrumenter published so neither erases the other. End-to-end coverage lives in
+[`docs/vm-e2e-matrix.md`](vm-e2e-matrix.md).
 
 ### Two things that look like gaps and are not
 
