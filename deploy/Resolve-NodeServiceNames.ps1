@@ -97,7 +97,53 @@ function Merge-CxNodeOptions {
       accumulate two hooks - loading the SDK twice is its own failure mode.
     #>
     [CmdletBinding()]
-    param([string] $Existing, [Parameter(Mandatory)][string] $Bootstrap)
+    param(
+        [string] $Existing,
+        [Parameter(Mandatory)][string] $Bootstrap,
+        # Paths/URLs this tooling owns, beyond whatever appears in $Bootstrap itself. Needed because
+        # the two artifacts are not always both present in the new value: switching an app from ESM
+        # back to CommonJS produces a bootstrap with only register.js, and without being told that
+        # hook.mjs is also ours the stale ESM loader stays behind forever. Callers already know both
+        # (Resolve-CxNodeBootstrap returns RegisterPath and HookUrl), so this is stated, not guessed
+        # from filenames - an app with its own register.js must not be touched.
+        [string[]] $OwnedTargets = @()
+    )
+
+    # Normalised targets of the bootstrap we are about to add. Recognising a PREVIOUS bootstrap by
+    # exact target is what makes this idempotent for any install prefix: the older rule matched only
+    # paths containing 'opentelemetry' or 'auto-instrumentations-node', which is true of the default
+    # prefix by coincidence, so a vendored or differently-prefixed copy (C:/otel/register.js) was
+    # not recognised and the SDK ended up loaded TWICE on every re-run.
+    # One normal form for both sides, so `file:///C:/x/hook.mjs`, `C:\x\hook.mjs` and
+    # `C:/x/hook.mjs` all compare equal. A plain TrimStart of the characters in 'file:/' would
+    # corrupt a path on drive F:, hence the anchored regex.
+    function ConvertTo-CxHookKey {
+        param([string] $Value)
+        if (-not $Value) { return '' }
+        $v = $Value.Trim('"') -replace '\\', '/'
+        $v = $v -replace '^file:/+', ''
+        return $v.ToLowerInvariant()
+    }
+
+    $ourTargets = @{}
+    foreach ($m in [regex]::Matches($Bootstrap, '(?:--(?:require|import)(?:=|\s+)|--experimental-loader=)("[^"]*"|\S+)')) {
+        $k = ConvertTo-CxHookKey -Value $m.Groups[1].Value
+        if ($k) { $ourTargets[$k] = $true }
+    }
+    foreach ($t in $OwnedTargets) {
+        $k = ConvertTo-CxHookKey -Value $t
+        if ($k) { $ourTargets[$k] = $true }
+    }
+
+    function Test-CxIsOurHookTarget {
+        param([string] $Target)
+        if (-not $Target) { return $false }
+        $k = ConvertTo-CxHookKey -Value $Target
+        if ($ourTargets.ContainsKey($k)) { return $true }
+        # Values written by an older version of this tooling, whose exact path we can no longer
+        # reconstruct - recognised by the package markers, as before.
+        return [bool]($k -match 'auto-instrumentations-node|opentelemetry')
+    }
 
     $kept = @()
     if ($Existing) {
@@ -110,12 +156,12 @@ function Merge-CxNodeOptions {
             $t = $tokens[$i]
             # Our ESM loader hook, in the `--experimental-loader=<url>` form. Dropped like the
             # bootstrap so a re-run cannot register the hook twice; an app's own loader is kept.
-            if ($t -match '^--experimental-loader=' -and $t -match 'opentelemetry') { continue }
+            if ($t -match '^--experimental-loader=(.*)$' -and (Test-CxIsOurHookTarget -Target $matches[1])) { continue }
             if ($t -match '^--(require|import)(=(.*))?$') {
                 $target = $matches[3]
                 if (-not $target -and ($i + 1) -lt $tokens.Count) { $target = $tokens[$i + 1]; $i++ }
                 # Only OUR bootstrap is removed; an app's own --require of its own module stays.
-                if ($target -match 'auto-instrumentations-node|opentelemetry') { continue }
+                if (Test-CxIsOurHookTarget -Target $target) { continue }
                 $kept += $t
                 if ($target -and $t -notmatch '=') { $kept += $target }
                 continue
@@ -125,6 +171,88 @@ function Merge-CxNodeOptions {
     }
     $kept += $Bootstrap
     return (($kept | Where-Object { $_ }) -join ' ').Trim()
+}
+
+function Resolve-CxNodeBootstrap {
+    <#
+      Resolve the OTel Node bootstrap flags for an already-installed instrumentation package, and
+      return BOTH forms: the CommonJS one and the ESM one.
+
+      This lives here, rather than inline in one instrumenter, because there are now two callers -
+      PM2-managed apps and Node running as a plain Windows service - and the ESM half of it is a set
+      of measured facts that must not be re-derived per caller:
+
+        --import C:/.../register.js          app CRASHES: Node's ESM resolver reads `C:` as a URL
+                                             scheme (ERR_UNSUPPORTED_ESM_URL_SCHEME)
+        --import file:///C:/.../register.js  starts cleanly, SDK loads, ZERO spans - nothing
+                                             patches ESM imports
+        --experimental-loader=file:///.../hook.mjs --require C:/.../register.js
+                                             works (17 spans against a real ESM app)
+
+      So the ESM form needs the loader hook as a file:// URL *and* --require for the CommonJS
+      register. A missing hook is REPORTED (EsmSupported=$false), never silently accepted: an ESM
+      app instrumented without it looks perfectly healthy and emits nothing.
+
+      Returns: RegisterPath, HookUrl, NodeOptionsCjs, NodeOptionsEsm, EsmSupported, Reason.
+      Never throws - a caller that cannot instrument should say why, not blow up a deploy.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $InstallPrefix = 'C:\cx\otel-node',
+        [string] $Package       = '@opentelemetry/auto-instrumentations-node'
+    )
+
+    $result = [pscustomobject]@{
+        RegisterPath   = $null
+        HookUrl        = $null
+        NodeOptionsCjs = $null
+        NodeOptionsEsm = $null
+        EsmSupported   = $false
+        Reason         = $null
+    }
+
+    $nodeModules = Join-Path $InstallPrefix 'node_modules'
+    if (-not (Test-Path -LiteralPath $nodeModules)) {
+        $result.Reason = "no node_modules under $InstallPrefix (install the package first, or pass -InstallPrefix)"
+        return $result
+    }
+
+    # Prefer Node's own require.resolve; fall back to a file search so the package's internal
+    # build layout is never hard-coded.
+    $env:NODE_PATH = $nodeModules
+    $registerPath = $null
+    try { $registerPath = (& node -e "console.log(require.resolve('$Package/register'))" 2>$null | Out-String).Trim() } catch { }
+    if (-not $registerPath -or -not (Test-Path -LiteralPath $registerPath)) {
+        $pkgDir = Join-Path $nodeModules ($Package -replace '/', '\')
+        $registerPath = Get-ChildItem -Path $pkgDir -Recurse -Filter 'register.js' -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $registerPath -or -not (Test-Path -LiteralPath $registerPath)) {
+        $result.Reason = "could not resolve '$Package/register' under $nodeModules"
+        return $result
+    }
+
+    # NODE_OPTIONS parses backslashes awkwardly; forward slashes are safe on Windows Node.
+    $registerFwd = $registerPath -replace '\\', '/'
+    $result.RegisterPath   = $registerFwd
+    $result.NodeOptionsCjs = "--require $registerFwd"
+
+    $hookPath = $null
+    try {
+        $instrDir = Join-Path $nodeModules '@opentelemetry\instrumentation'
+        $hookPath = Get-ChildItem -Path $instrDir -Filter 'hook.mjs' -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+    } catch { }
+
+    if ($hookPath) {
+        $result.HookUrl        = 'file:///' + ($hookPath -replace '\\', '/')
+        $result.NodeOptionsEsm = "--experimental-loader=$($result.HookUrl) --require $registerFwd"
+        $result.EsmSupported   = $true
+    } else {
+        $result.Reason = "no @opentelemetry/instrumentation/hook.mjs under $nodeModules - ESM apps cannot be instrumented (the SDK would load and emit nothing); CommonJS apps are unaffected"
+    }
+
+    return $result
 }
 
 function Test-CxNodeAppIsEsm {
