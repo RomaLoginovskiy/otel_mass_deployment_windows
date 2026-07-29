@@ -239,6 +239,26 @@ Assert-Equal 'Core + no CLR'           (Get-IISAppInstrumentability -Runtime 'As
 Assert-Equal 'Framework + CLR loading' (Get-IISAppInstrumentability -Runtime 'AspNetFramework' -PoolClrLoads $true)  'Supported'
 Assert-Equal 'Framework + no CLR'      (Get-IISAppInstrumentability -Runtime 'AspNetFramework' -PoolClrLoads $false) 'Misconfigured'
 Assert-Equal 'NonDotNet is never instrumented' (Get-IISAppInstrumentability -Runtime 'NonDotNet' -PoolClrLoads $true) 'Unsupported'
+
+# CLR 2 pools. Found on a real VM run: a Framework app in a managedRuntimeVersion=v2.0 pool was
+# classified Supported and CLAIMED in CX_IIS_SERVICES, so the host advertised a service name that
+# can never report - the OpenTelemetry .NET auto-instrumentation supports Framework 4.6.2+ only.
+# PoolClrLoads is $true for both v2.0 and v4.0, so the version has to be consulted explicitly.
+Assert-Equal 'Framework + CLR 2 cannot be instrumented' `
+    (Get-IISAppInstrumentability -Runtime 'AspNetFramework' -PoolClrLoads $true -PoolManagedRuntimeVersion 'v2.0') 'Unsupported'
+Assert-Equal 'Framework + CLR 2 (bare "2.0" spelling)' `
+    (Get-IISAppInstrumentability -Runtime 'AspNetFramework' -PoolClrLoads $true -PoolManagedRuntimeVersion '2.0') 'Unsupported'
+Assert-Equal 'Framework + v4.0 is still Supported' `
+    (Get-IISAppInstrumentability -Runtime 'AspNetFramework' -PoolClrLoads $true -PoolManagedRuntimeVersion 'v4.0') 'Supported'
+Assert-Equal 'Framework + absent attribute (defaults to v4.0) is still Supported' `
+    (Get-IISAppInstrumentability -Runtime 'AspNetFramework' -PoolClrLoads $true -PoolManagedRuntimeVersion $null) 'Supported'
+# A v2.0 pool does not change the Core verdict: Core never uses the desktop CLR, so the app runs and
+# reports either way and the finding stays about the pool being unnecessary, not fatal.
+Assert-Equal 'Core + CLR 2 is still only Misconfigured' `
+    (Get-IISAppInstrumentability -Runtime 'AspNetCore' -PoolClrLoads $true -PoolManagedRuntimeVersion 'v2.0') 'Misconfigured'
+# And v4.0 must NOT be caught by the version test (a naive '2' match would).
+Assert-Equal 'v4.0 is not mistaken for CLR 2' `
+    (Get-IISAppInstrumentability -Runtime 'AspNetFramework' -PoolClrLoads $true -PoolManagedRuntimeVersion 'v4.0.30319') 'Supported'
 Assert-Equal 'Unknown needs an override'       (Get-IISAppInstrumentability -Runtime 'Unknown'   -PoolClrLoads $true) 'RequiresOverride'
 
 Write-Host ''
