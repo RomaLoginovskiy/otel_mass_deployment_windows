@@ -55,12 +55,33 @@
 .PARAMETER SkipInstall
   Skip `npm install` (the package was pre-staged in InstallPrefix).
 
+.PARAMETER Apps
+  Instrument only these PM2 apps (by PM2 app name). Default: every app PM2 manages.
+
+  This exists because instrumenting is a RESTART. A host can easily carry two dozen apps
+  spanning dev/qa/uat, and restarting all of them because a deploy script ran is not a decision
+  this script gets to make - prove one app end to end, then widen.
+
+.PARAMETER ExcludeApps
+  Apps to leave alone. Defaults to PM2's own utility apps (pm2-logrotate,
+  pm2-prometheus-exporter, ...) - instrumenting those puts PM2's log rotator and metrics
+  exporter into APM as services. Pass @() to include them.
+
 .NOTES
-  Run in the SAME user context that owns the PM2 daemon (PM2 is per-user on Windows). Requires
-  node, npm and pm2 on PATH, and (for the machine env var) an elevated session. Online npm access
-  is required unless -SkipInstall. Windows PowerShell 5.1 compatible.
+  Requires node + npm on PATH when installing the package, the pm2 CLI somewhere findable, and
+  (for the machine env var) an elevated session. Online npm access is required unless
+  -SkipInstall. Windows PowerShell 5.1 compatible.
+
+  PM2 OWNERSHIP. PM2 is per-user when someone started it by hand, but a Windows host that runs
+  PM2 in production usually has it installed AS A SERVICE (pm2-installer / node-windows:
+  PM2_HOME=C:\ProgramData\pm2, daemon owned by NT AUTHORITY\LOCAL SERVICE). The daemon's IPC
+  pipe belongs to that account, so `pm2 restart --update-env` from any other identity - SYSTEM
+  included - does not reach the running apps. It does not error either: pm2 answers for the
+  caller's own (empty) daemon and exits 0. This script therefore detects the daemon owner and
+  routes the per-app env through Invoke-CxPm2AsOwner when it is not us. If that cannot be done
+  it says so and exits non-zero, rather than reporting success over apps that never changed.
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]    $OtlpEndpoint         = 'http://127.0.0.1:4318',
     [string]    $InstallPrefix        = 'C:\cx\otel-node',
@@ -69,6 +90,12 @@ param(
     [string]    $OverridesJson,
     [switch]    $NoRestart,
     [switch]    $SkipInstall,
+    [string[]]  $Apps,
+    [string[]]  $ExcludeApps,
+    # Only needed when the PM2 daemon is owned by an ORDINARY account. The built-in service
+    # identities (LOCAL SERVICE / NETWORK SERVICE / SYSTEM) and gMSAs log on without a password;
+    # a normal user cannot, and no mechanism can impersonate it without one.
+    [pscredential] $Pm2OwnerCredential,
     # Optional backup/manifest session (from Backup-Config.ps1, created by the orchestrator).
     $Session = $null
 )
@@ -101,11 +128,34 @@ if (Get-Command Resolve-CxOtlpEndpoint -ErrorAction SilentlyContinue) {
 }
 
 # ---- 0. Prerequisites ---------------------------------------------------------
-foreach ($tool in 'node','npm','pm2') {
+# node/npm are needed to stage the package and to resolve the register bootstrap; pm2 is looked
+# up by path rather than required on PATH. `pm2-installer` puts the CLI in C:\ProgramData\npm,
+# which is frequently absent from the PATH of the account a fleet tool runs the deploy as - and
+# demanding it here is what silently skipped this whole step on such a host.
+foreach ($tool in 'node','npm') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         Write-Warning "[node-instr] '$tool' not found on PATH - skipping Node/PM2 instrumentation."
         return
     }
+}
+$pm2Cli = Get-CxPm2CommandPath
+if (-not $pm2Cli) {
+    Write-Warning "[node-instr] the pm2 CLI could not be located (PATH, C:\ProgramData\npm, %APPDATA%\npm) - skipping Node/PM2 instrumentation."
+    return
+}
+
+# How PM2 is hosted decides HOW the env has to be applied, so resolve it before anything else.
+$topo = Get-CxPm2Topology
+Write-Host "[node-instr] pm2 cli       : $pm2Cli"
+Write-Host "[node-instr] pm2 hosting   : $($topo.Hosting)$(if ($topo.ServiceName) { " (service '$($topo.ServiceName)', state $($topo.ServiceState))" })"
+Write-Host "[node-instr] pm2 owner     : $(if ($topo.Owner) { $topo.Owner } else { '<unknown>' })   running as: $($topo.Identity)"
+Write-Host "[node-instr] PM2_HOME      : $(if ($topo.Home) { $topo.Home } else { '<unknown>' })"
+
+# The apps only answer to the account that owns their daemon. Route through a scheduled task
+# running as that account when it is not us; refuse to pretend otherwise.
+$applyAsOwner = ($topo.OwnerMismatch -and $topo.Owner -and $topo.Hosting -ne 'none')
+if ($applyAsOwner) {
+    Write-Host "[node-instr] the PM2 daemon belongs to $($topo.Owner), not to us - pm2 will be invoked as that account." -ForegroundColor Yellow
 }
 
 # ---- 1. Install the OTel Node auto-instrumentation package + resolve register --
@@ -139,6 +189,39 @@ $registerPath = $registerPath -replace '\\','/'
 $nodeOptions  = "--require $registerPath"
 Write-Host "[node-instr] register bootstrap: $registerPath"
 
+# ---- ESM apps: the loader hook, plus --require --------------------------------
+# An ES module app needs the instrumentation's ESM LOADER HOOK. Both obvious alternatives were
+# measured against a real ESM app with a console span exporter, and both are wrong:
+#
+#   --import C:/.../register.js                     -> the app CRASHES at startup with
+#                                                      ERR_UNSUPPORTED_ESM_URL_SCHEME, because Node's
+#                                                      ESM resolver reads `C:` as a URL scheme
+#   --import file:///C:/.../register.js             -> starts cleanly, SDK loads, and produces
+#                                                      ZERO spans: nothing patches ESM imports
+#   --experimental-loader=file:///.../hook.mjs
+#     --require C:/.../register.js                  -> 17 spans. This is the one that works.
+#
+# So: the hook registers itself in the ESM resolution chain (and must be a file:// URL for the same
+# scheme reason), while --require still starts the SDK (register.js is CommonJS, so a plain Windows
+# path is correct there). Without the hook an ESM app looks perfectly healthy and emits nothing -
+# which is exactly the failure mode this tooling exists to eliminate, so a missing hook is reported
+# rather than silently accepted.
+$hookPath = $null
+try {
+    $instrDir = Join-Path $nodeModules '@opentelemetry\instrumentation'
+    $hookPath = Get-ChildItem -Path $instrDir -Filter 'hook.mjs' -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+} catch { }
+$esmSupported   = [bool]$hookPath
+$nodeOptionsEsm = $null
+if ($esmSupported) {
+    $hookUrl        = 'file:///' + ($hookPath -replace '\\','/')
+    $nodeOptionsEsm = "--experimental-loader=$hookUrl --require $registerPath"
+    Write-Host "[node-instr] ESM loader hook  : $hookUrl"
+} else {
+    Write-Warning "[node-instr] no @opentelemetry/instrumentation/hook.mjs under $nodeModules - ESM apps cannot be instrumented (the SDK would load and emit nothing). CommonJS apps are unaffected."
+}
+
 # ---- 2. Per-app OTEL_SERVICE_NAME + NODE_OPTIONS ------------------------------
 # Merge overrides: JSON file first, then the -ServiceNameOverrides hashtable on top.
 if ($OverridesJson) {
@@ -149,7 +232,21 @@ if ($OverridesJson) {
     }
 }
 
-$svcMap = Get-PM2ServiceMap -Overrides $ServiceNameOverrides
+$mapArgs = @{ Overrides = $ServiceNameOverrides; Topology = $topo }
+if ($PSBoundParameters.ContainsKey('ExcludeApps')) { $mapArgs['ExcludeApps'] = $ExcludeApps }
+$svcMap = Get-PM2ServiceMap @mapArgs
+
+# -Apps narrows to a named subset AFTER enumeration, so an unknown name is reported instead of
+# quietly instrumenting nothing.
+if ($Apps) {
+    $known   = @($svcMap | ForEach-Object { $_.Name })
+    $unknown = @($Apps | Where-Object { $known -notcontains $_ })
+    if ($unknown.Count -gt 0) {
+        Write-Warning "[node-instr] -Apps named app(s) PM2 does not manage: $($unknown -join ', '). Known: $($known -join ', ')"
+    }
+    $svcMap = @($svcMap | Where-Object { $Apps -contains $_.Name })
+    if (@($svcMap).Count -eq 0) { throw "[node-instr] none of the -Apps names match a PM2 app on this host." }
+}
 
 if (-not $svcMap -or @($svcMap).Count -eq 0) {
     Write-Warning "[node-instr] PM2 is present but manages no apps - nothing to instrument."
@@ -168,41 +265,132 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
 }
 
 if ($Session) {
-    $Session.Manifest.nodeInstrumented  = $true
     $Session.Manifest.nodeInstallPrefix = $InstallPrefix
+    $Session.Manifest.nodePm2Hosting    = $topo.Hosting
+    $Session.Manifest.nodePm2Owner      = $topo.Owner
+    $Session.Manifest.nodePm2Home       = $topo.Home
+    # Set to the truth at the END of the run, not optimistically here: the orchestrator reads it
+    # for its status summary, and an install that reached no app must not report as instrumented.
+    $Session.Manifest.nodeInstrumented  = $false
 }
 
-Write-Host "[node-instr] instrumenting $(@($svcMap).Count) PM2 app(s):"
+Write-Host "[node-instr] instrumenting $(@($svcMap).Count) PM2 app(s) (source: $(@($svcMap)[0].Source)):"
+$failed = @()
 foreach ($r in $svcMap) {
-    Write-Host ("  {0,-20} mode={1,-13} instances={2} -> OTEL_SERVICE_NAME={3}" -f $r.Name, $r.ExecMode, $r.Instances, $r.ServiceName)
-    # Set the per-app env in THIS process; `pm2 restart --update-env` refreshes the app's
-    # runtime env from it. OTEL_SERVICE_NAME is set fresh each iteration (it differs per app).
-    $env:NODE_OPTIONS                = $nodeOptions
-    $env:OTEL_EXPORTER_OTLP_ENDPOINT = $OtlpEndpoint
-    $env:OTEL_EXPORTER_OTLP_PROTOCOL = 'http/protobuf'
-    $env:OTEL_SERVICE_NAME           = $r.ServiceName
-    $env:OTEL_TRACES_EXPORTER        = 'otlp'
-    $env:OTEL_METRICS_EXPORTER       = 'otlp'
-    $env:OTEL_LOGS_EXPORTER          = 'otlp'
-    if (-not $NoRestart) {
+    # ESM entry points additionally need the loader hook; everything else just --require. See the
+    # note above the $nodeOptionsEsm assignment for what was measured and why.
+    $appNodeOptions = $nodeOptions
+    if ($r.IsEsm) {
+        if ($esmSupported) {
+            $appNodeOptions = $nodeOptionsEsm
+        } else {
+            Write-Warning "[node-instr] $($r.Name) is an ES module but the ESM loader hook is not available - instrumenting it would start the SDK and produce no telemetry, so it is left alone."
+            $failed += $r.Name
+            continue
+        }
+    }
+    # Merge, never replace: an app that already sets NODE_OPTIONS for its own reasons (a heap
+    # limit, TLS behaviour, ICU data) must keep those flags. A prior bootstrap of ours is dropped
+    # so re-running cannot load the SDK twice.
+    $appNodeOptions = Merge-CxNodeOptions -Existing $r.NodeOptions -Bootstrap $appNodeOptions
+    $flag = if ($r.IsEsm) { 'esm+hook' } else { '--require' }
+    Write-Host ("  {0,-24} mode={1,-13} instances={2} {3,-9} -> OTEL_SERVICE_NAME={4}" -f `
+        $r.Name, $r.ExecMode, $r.Instances, $flag, $r.ServiceName)
+    if ($r.NodeOptions) { Write-Host "      preserving the app's own NODE_OPTIONS: $($r.NodeOptions)" }
+
+    # The env the app must come back up with. Applied either in THIS process (when we own the
+    # daemon and `pm2 restart --update-env` will read it) or inside the task that runs as the
+    # owner - the same set either way.
+    $appEnv = [ordered]@{
+        NODE_OPTIONS                = $appNodeOptions
+        OTEL_EXPORTER_OTLP_ENDPOINT = $OtlpEndpoint
+        OTEL_EXPORTER_OTLP_PROTOCOL = 'http/protobuf'
+        OTEL_SERVICE_NAME           = $r.ServiceName
+        OTEL_TRACES_EXPORTER        = 'otlp'
+        OTEL_METRICS_EXPORTER       = 'otlp'
+        OTEL_LOGS_EXPORTER          = 'otlp'
+    }
+
+    if ($NoRestart) {
+        # SetEnvironmentVariable, not Set-Item: Set-Item refuses an EMPTY value and, silenced, that
+        # refusal is invisible - the same trap that made uninstall a no-op.
+        foreach ($k in $appEnv.Keys) { [Environment]::SetEnvironmentVariable($k, [string]$appEnv[$k], 'Process') }
+        continue
+    }
+    # Restarting a live app is the outward-facing part of this script, so it is what -WhatIf
+    # gates on - everything above only reads or stages files.
+    if (-not $PSCmdlet.ShouldProcess($r.Name, "pm2 restart --update-env (OTEL_SERVICE_NAME=$($r.ServiceName))")) { continue }
+
+    if ($applyAsOwner) {
+        $ownerArgs = @{ Owner = $topo.Owner; Pm2Home = $topo.Home; Env = $appEnv
+                        Pm2ArgSets = @(, @('restart', [string]$r.Name, '--update-env')) }
+        if ($Pm2OwnerCredential) { $ownerArgs['OwnerCredential'] = $Pm2OwnerCredential }
+        $res = Invoke-CxPm2AsOwner @ownerArgs
+        if ($res.Output) { Write-Host $res.Output }
+        if ($res.Mechanism -and $res.Mechanism -ne 'none') { Write-Host "[node-instr] $($r.Name): applied via $($res.Mechanism)" }
+        if (-not $res.Ok) {
+            Write-Warning "[node-instr] $($r.Name): restart as $($topo.Owner) failed - $($res.Reason)"
+            $failed += $r.Name
+        }
+    } else {
+        # Set the per-app env in THIS process; `pm2 restart --update-env` refreshes the app's
+        # runtime env from it. OTEL_SERVICE_NAME is set fresh each iteration (it differs per app).
+        # SetEnvironmentVariable, not Set-Item: Set-Item refuses an EMPTY value and, silenced, that
+        # refusal is invisible - the same trap that made uninstall a no-op.
+        foreach ($k in $appEnv.Keys) { [Environment]::SetEnvironmentVariable($k, [string]$appEnv[$k], 'Process') }
         # No 2>&1 redirect (PS 5.1 NativeCommandError under Stop) - let pm2 write to the console.
-        & pm2 restart $r.Name --update-env
-        if ($LASTEXITCODE -ne 0) { Write-Warning "[node-instr] pm2 restart $($r.Name) exited $LASTEXITCODE" }
+        & $pm2Cli restart $r.Name --update-env
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "[node-instr] pm2 restart $($r.Name) exited $LASTEXITCODE"
+            $failed += $r.Name
+        }
     }
 }
 
 if ($NoRestart) {
     Write-Host "[node-instr] -NoRestart: env prepared but apps not restarted. Run 'pm2 restart all --update-env; pm2 save' later."
-} else {
+} elseif ($PSCmdlet.ShouldProcess('pm2 dump', 'pm2 save')) {
     # Persist the updated env into the PM2 dump so it survives daemon restart / `pm2 resurrect`.
-    & pm2 save
+    if ($applyAsOwner) {
+        $saveArgs = @{ Owner = $topo.Owner; Pm2Home = $topo.Home; Pm2ArgSets = @(, @('save')) }
+        if ($Pm2OwnerCredential) { $saveArgs['OwnerCredential'] = $Pm2OwnerCredential }
+        $res = Invoke-CxPm2AsOwner @saveArgs
+        if ($res.Output) { Write-Host $res.Output }
+        if (-not $res.Ok) { Write-Warning "[node-instr] pm2 save as $($topo.Owner) failed - $($res.Reason). The env is live but will not survive a daemon restart." }
+    } else {
+        & $pm2Cli save
+    }
+}
+
+# A partial apply must not read as success: the operator has to know which apps are still dark.
+if ($failed.Count -gt 0) {
+    Write-Warning "[node-instr] NOT instrumented: $($failed -join ', ')"
 }
 
 # ---- 3. Machine env var CX_NODE_SERVICES --------------------------------------
 # Comma-joined distinct Node service name(s), built from the SAME $svcMap whose .ServiceName
 # was just assigned as each app's OTEL_SERVICE_NAME. The collector stamps it onto INFRASTRUCTURE
 # telemetry (Node analog of CX_IIS_SERVICES) so host Service-ownership == the APM service names.
-$nodeServices = Get-NodeServiceLabelValue -Map $svcMap
+$instrumented = @($svcMap | Where-Object { $failed -notcontains $_.Name })
+$nodeServices = Get-NodeServiceLabelValue -Map $instrumented
+
+# -WhatIf skipped every restart, so no app carries the env and claiming ownership of their service
+# names would be a lie written to the machine environment. Report and stop here.
+if (-not $PSCmdlet.ShouldProcess('machine environment', "set CX_NODE_SERVICES=$nodeServices")) {
+    Write-Host "[node-instr] -WhatIf: would set machine CX_NODE_SERVICES=$nodeServices"
+    return
+}
+
+# A staged rollout (-Apps) instruments a subset, so the var must be the UNION with what is
+# already there - overwriting it would strip the ownership label off apps instrumented in an
+# earlier pass, which reads in Coralogix as those services having gone away.
+if ($Apps) {
+    $existing = @()
+    $priorVar = [Environment]::GetEnvironmentVariable('CX_NODE_SERVICES', 'Machine')
+    if ($priorVar) { $existing = @($priorVar -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    $union = @(@($existing) + @($instrumented | ForEach-Object { $_.ServiceName }) | Where-Object { $_ } | Select-Object -Unique)
+    $nodeServices = ($union -join ',')
+}
 if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
     $prior = [Environment]::GetEnvironmentVariable('CX_NODE_SERVICES', 'Machine')
     Record-EnvChange -Session $Session -Name 'CX_NODE_SERVICES' -PriorValue $prior
@@ -211,6 +399,19 @@ if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) 
 $env:CX_NODE_SERVICES = $nodeServices
 Write-Host "[node-instr] set machine CX_NODE_SERVICES=$nodeServices" -ForegroundColor Green
 
+if ($Session) {
+    $Session.Manifest.nodeInstrumented        = (@($instrumented).Count -gt 0)
+    $Session.Manifest.nodeInstrumentedApps    = @($instrumented | ForEach-Object { $_.Name })
+    $Session.Manifest.nodeInstrumentFailedApps = @($failed)
+}
+
 Write-Host ""
-Write-Host "[node-instr] done. $(@($svcMap).Count) app(s) export OTLP to $OtlpEndpoint (traces+metrics+logs)."
-Write-Host "[node-instr] cluster workers share their app's OTEL_SERVICE_NAME; process.pid separates them."
+if (@($instrumented).Count -eq 0) {
+    # Loud, but not a throw: the collector is already installed and the orchestrator still has
+    # to restart and verify it. The doctor (Test-NodeInstrumentation.ps1) is what grades this
+    # host afterwards, and it will report the ownership mismatch as a hard fail.
+    Write-Warning "[node-instr] NO app was instrumented. Nothing exports Node telemetry from this host yet - run doctor.bat -Only nodeInstrumentation for the reason."
+} else {
+    Write-Host "[node-instr] done. $(@($instrumented).Count) app(s) export OTLP to $OtlpEndpoint (traces+metrics+logs)."
+    Write-Host "[node-instr] cluster workers share their app's OTEL_SERVICE_NAME; process.pid separates them."
+}

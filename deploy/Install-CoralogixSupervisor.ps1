@@ -30,8 +30,22 @@
   Sets CORALOGIX_DOMAIN and CORALOGIX_PRIVATE_KEY (persisted as machine env vars so
   the service keeps them across restarts), produces the config, and installs.
 
+.PARAMETER Region
+  Coralogix region code: eu1, eu2, us1, us2, us3, ap1, ap2, ap3. Resolved to the
+  region's domain (<region>.coralogix.com) by Resolve-CxRegion.ps1 and published as
+  CORALOGIX_DOMAIN, which the base config's coralogix exporters and the vendor
+  installer's OpAMP endpoint both read. An unknown code is a hard error - it would
+  otherwise ship telemetry to the wrong account while looking healthy.
+
 .PARAMETER Domain
-  Coralogix domain. Default: eu1.coralogix.com
+  Full Coralogix ingress domain, for a private / non-standard endpoint the region
+  table does not cover. Wins over -Region when both are given.
+
+  When NEITHER is given the domain is resolved, in order, from: the CX_REGION
+  environment variable, a CORALOGIX_DOMAIN exported for this run, a region.txt file next
+  to this script, the CORALOGIX_DOMAIN a previous install persisted on this host, and
+  finally eu1.coralogix.com. See the block above the resolution for why the same
+  environment variable appears in two different places in that order.
 
 .PARAMETER PrivateKey
   Send-Your-Data API key. If omitted, read from -KeyFile.
@@ -77,7 +91,10 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Domain     = 'eu1.coralogix.com',
+    # Region code (eu1/eu2/us1/...) -> domain. Defaults are resolved below, not here,
+    # because the fallback chain reads the environment and a file on disk.
+    [string] $Region     = $null,
+    [string] $Domain     = $null,
     [string] $PrivateKey = $null,
     [string] $KeyFile    = (Join-Path $PSScriptRoot 'SendDataKey.txt'),
     [switch] $NoSupervisor,
@@ -113,6 +130,13 @@ if (-not $KeyFile)    { $KeyFile    = Join-Path $here 'SendDataKey.txt' }
 # Optional backup/manifest recording (shared session from the orchestrator).
 $backupHelper = Join-Path $here 'Backup-Config.ps1'
 if (Test-Path $backupHelper) { . $backupHelper }
+
+# Region table. NOT Test-Path guarded like the optional helpers: without it a -Region
+# cannot be resolved, and defaulting to eu1 in that case would send the fleet's data
+# to the wrong account silently. Fail the install instead.
+$regionHelper = Join-Path $here 'Resolve-CxRegion.ps1'
+if (-not (Test-Path $regionHelper)) { throw "Region table not found: $regionHelper (package is incomplete)" }
+. $regionHelper
 
 function Assert-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -183,6 +207,73 @@ function Set-SupervisorDescriptionAttributes {
 
 Assert-Admin
 
+# ---- Resolve the region / domain ----------------------------------------------
+# CORALOGIX_DOMAIN appears twice below because the same variable means two different
+# things: a value an operator exported for THIS run is a decision, while the identical
+# variable inherited from what a PREVIOUS install of ours persisted machine-wide is
+# only a leftover. They are told apart by comparing the process value with the machine
+# value - without that, "rebuild the package with -Region eu2 and re-deploy" would be a
+# silent no-op on every host that had already been installed against eu1.
+#
+# Precedence, most explicit first:
+#   1. -Domain              a private or non-standard ingress domain, verbatim.
+#   2. -Region              region code -> <region>.coralogix.com.
+#   3. CX_REGION env        the region-shaped equivalent, e.g. BatchPatch's
+#                           `set CX_REGION=eu2 && deploy.bat`.
+#   4. CORALOGIX_DOMAIN env when it DIFFERS from the machine value, i.e. exported for
+#                           this run: a private ingress chosen at deploy time.
+#   5. region.txt           next to this script - Build-DeploymentPackage.ps1 -Region
+#                           bakes it in so the remote command stays a bare 'deploy.bat'.
+#   6. CORALOGIX_DOMAIN env matching the machine value: no new decision anywhere, so a
+#                           re-run keeps the region this host was installed with instead
+#                           of dropping back to the eu1 default.
+#   7. eu1.coralogix.com    historical default.
+$machineDomain = [Environment]::GetEnvironmentVariable('CORALOGIX_DOMAIN', 'Machine')
+$envDomain     = Normalize-CxDomainString $env:CORALOGIX_DOMAIN
+$envDomainIsNew = $envDomain -and ($envDomain -ne (Normalize-CxDomainString $machineDomain))
+
+$regionSource = $null
+if ($Domain) {
+    if ($Region) { Write-Warning "[collector] both -Domain and -Region given; -Domain '$Domain' wins" }
+    $Domain = Normalize-CxDomainString $Domain
+    $regionSource = '-Domain'
+} elseif ($Region) {
+    $Domain = Resolve-CxDomain -Region $Region
+    $regionSource = "-Region $Region"
+} elseif ($env:CX_REGION) {
+    $Domain = Resolve-CxDomain -Region $env:CX_REGION
+    $regionSource = "CX_REGION env ($env:CX_REGION)"
+} elseif ($envDomainIsNew) {
+    $Domain = $envDomain
+    $regionSource = 'CORALOGIX_DOMAIN env (set for this run)'
+} else {
+    $regionFile = Join-Path $here 'region.txt'
+    if (Test-Path $regionFile) {
+        $fileRegion = (Get-Content -Path $regionFile -Raw).Trim()
+        # An empty region.txt means "no region chosen", not "region ''" - fall through.
+        if ($fileRegion) {
+            $Domain = Resolve-CxDomain -Region $fileRegion
+            $regionSource = "region.txt ($fileRegion)"
+        }
+    }
+    if (-not $Domain -and $envDomain) {
+        $Domain = $envDomain
+        $regionSource = 'CORALOGIX_DOMAIN env (already installed with it)'
+    }
+    if (-not $Domain) {
+        $Domain = 'eu1.coralogix.com'
+        $regionSource = 'default'
+    }
+}
+$resolvedRegion = Get-CxRegionForDomain -Domain $Domain
+Write-Host ("[collector] region {0} -> domain {1} (from {2})" -f
+    $(if ($resolvedRegion) { $resolvedRegion } else { 'custom' }), $Domain, $regionSource)
+if (-not $resolvedRegion) {
+    # Legitimate for a private ingress; also what a typo'd -Domain looks like. Say so
+    # once, loudly, because the collector will report healthy either way.
+    Write-Warning "[collector] '$Domain' is not a published Coralogix region domain. Data goes to ingress.$Domain - verify that is intended (regions: $(Format-CxRegionList))."
+}
+
 # Default the selector attributes to what Detect-Workloads.ps1 persisted machine-wide.
 if (-not $ResourceAttributes) {
     $ResourceAttributes = [Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES', 'Machine')
@@ -240,7 +331,8 @@ if ($Session) {
 [Environment]::SetEnvironmentVariable('CORALOGIX_PRIVATE_KEY', $PrivateKey, 'Machine')
 $env:CORALOGIX_DOMAIN      = $Domain
 $env:CORALOGIX_PRIVATE_KEY = $PrivateKey
-Write-Host "[supervisor] CORALOGIX_DOMAIN=$Domain (machine env set)"
+Write-Host ("[supervisor] CORALOGIX_DOMAIN={0} (machine env set; region {1})" -f
+    $Domain, $(if ($resolvedRegion) { $resolvedRegion } else { 'custom' }))
 
 # ---- Persist deployment environment (read by resource/environment processor) --
 if ($Environment) {

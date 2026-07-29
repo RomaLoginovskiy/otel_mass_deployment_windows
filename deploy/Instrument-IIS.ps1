@@ -46,6 +46,31 @@
 .PARAMETER OverridesJson
   Optional path to a JSON file of the same { autoName = overrideName } shape.
 
+.PARAMETER RuntimeOverrides
+  Optional hashtable forcing an application's RUNTIME when detection cannot decide, e.g.
+  @{ 'Wallet/api' = 'AspNetCore'; 'Static/' = 'NonDotNet' }. Allowed values: AspNetCore,
+  AspNetFramework, NonDotNet - a value outside that set fails the run rather than being
+  ignored.
+
+  KEYED DIFFERENTLY FROM -ServiceNameOverrides, and the difference is one character for
+  root applications:
+
+    -ServiceNameOverrides   key = derived SERVICE name   'Wallet'   'Wallet/api'
+    -RuntimeOverrides       key = APP IDENTITY           'Wallet/'  'Wallet/api'
+
+  The runtime key is what the doctor prints in its Target column, so it can be copied
+  straight off diagnostic output; the slash-less form is accepted as an alias for a root
+  app. They are separate spaces on purpose: a rename changes the label, not what the
+  application IS, so a runtime override must survive a rename.
+
+  Pass the SAME runtime overrides to Test-Agent.ps1, or the installer and the doctor
+  disagree about which apps belong in CX_IIS_SERVICES and drift is reported forever.
+
+.PARAMETER RuntimeOverridesJson
+  Optional path to a JSON file of { "Site/AppPath": "AspNetCore" } pairs. Also accepted
+  wrapped as { "runtimeOverrides": { ... } }. Also readable from CX_RUNTIME_OVERRIDES_JSON
+  so a fleet can stage the file once instead of threading a flag through deploy.bat.
+
 .NOTES
   Run elevated. The host-wide OTLP vars are set on <applicationPoolDefaults>, which
   only reaches pools that do not declare their own <environmentVariables> collection -
@@ -78,6 +103,8 @@ param(
     [string]    $LocalModule           = $env:CX_OTEL_DOTNET_MODULE,
     [hashtable] $ServiceNameOverrides  = @{},
     [string]    $OverridesJson,
+    [hashtable] $RuntimeOverrides      = @{},
+    [string]    $RuntimeOverridesJson  = $env:CX_RUNTIME_OVERRIDES_JSON,
     # Optional backup/manifest session (from Backup-Config.ps1, created by the
     # orchestrator). When supplied, mutated configs are backed up and recorded so
     # Uninstall-Agent.ps1 can reverse only the installer's own changes.
@@ -202,6 +229,20 @@ function Test-PoolEnvPresent {
     } catch { return $false }
 }
 
+function Get-PoolEnvValue {
+    # The value of an env var declared on a pool, or $null if it is not there. Used by
+    # Remove-PoolEnv to check ownership before deleting: only a value this installer would
+    # itself have written is ours to remove.
+    param([string] $Pool, [string] $Name)
+    try {
+        if (-not (Test-Path $appHostConfig)) { return $null }
+        [xml]$c = Get-Content -LiteralPath $appHostConfig -Raw
+        $n = $c.SelectSingleNode("/configuration/system.applicationHost/applicationPools/add[@name='$Pool']/environmentVariables/add[@name='$Name']")
+        if (-not $n) { return $null }
+        return [string]$n.GetAttribute('value')
+    } catch { return $null }
+}
+
 function Test-PoolHasOwnEnvBlock {
     <#
       True if a pool declares its OWN <environmentVariables> collection - which
@@ -270,6 +311,37 @@ function Set-PoolEnv {
         "/+[name='$Pool'].environmentVariables.[name='$Name',value='$Value']" /commit:apphost | Out-Null
 }
 
+function Remove-PoolEnv {
+    <#
+      Remove an env var from a named pool - the upgrade path for an app this installer used
+      to name and no longer will.
+
+      Needed because merely SKIPPING a now-unsupported app is not enough: a host instrumented
+      by an earlier build already carries OTEL_SERVICE_NAME on, say, a static site's dedicated
+      pool, and skipping leaves that value on disk forever. The doctor would keep reporting the
+      name as present while the installer refuses to claim it, and CX_IIS_SERVICES_DRIFT would
+      never clear.
+
+      -ExpectedValue makes this OWNERSHIP-CHECKED, the same guarantee Remove-WebConfigServiceName
+      gives: only a value this installer would itself have written is removed. Someone else's
+      OTEL_SERVICE_NAME is left alone.
+    #>
+    param([string] $Pool, [string] $Name, [string] $ExpectedValue)
+
+    if (-not (Test-PoolEnvPresent -Pool $Pool -Name $Name)) { return $false }
+    if ($ExpectedValue) {
+        $current = Get-PoolEnvValue -Pool $Pool -Name $Name
+        if ($null -ne $current -and $current -ne $ExpectedValue) {
+            Write-Host "  [pool] leaving $Name on '$Pool' alone: it is '$current', not a value this installer wrote" -ForegroundColor DarkGray
+            return $false
+        }
+    }
+    if ($Session) { Backup-DeployFile -Session $Session -Path $appHostConfig | Out-Null }
+    & $appcmd set config -section:system.applicationHost/applicationPools `
+        "/-[name='$Pool'].environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
+    return $true
+}
+
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
 
@@ -284,7 +356,40 @@ if ($OverridesJson) {
 }
 
 . (Join-Path $PSScriptRoot 'Resolve-IISServiceNames.ps1')
-$svcMap = Get-IISServiceMap -Overrides $ServiceNameOverrides
+
+# Runtime overrides use their own key space and their own value set, so they get their own
+# resolver rather than the -ServiceNameOverrides merge above. A bad value throws here, before
+# anything is written: an operator typo must not silently classify nothing and then report a
+# successful install.
+$runtimeOverrideTable = @{}
+if (Get-Command Resolve-IISRuntimeOverrides -ErrorAction SilentlyContinue) {
+    $runtimeOverrideTable = Resolve-IISRuntimeOverrides -Table $RuntimeOverrides -JsonPath $RuntimeOverridesJson
+} elseif ($RuntimeOverrides.Count -gt 0 -or $RuntimeOverridesJson) {
+    throw "Resolve-IISAppRuntime.ps1 is missing next to this script, so -RuntimeOverrides cannot be honored. Refusing to instrument with an override the caller believes is in force."
+}
+
+$svcMap = Get-IISServiceMap -Overrides $ServiceNameOverrides -RuntimeOverrides $runtimeOverrideTable
+
+# Findings, so this script reports in the same vocabulary the doctor does instead of prose
+# only greppable by eye. Deliberately NO exit code: Install-Agent.ps1 invokes this with `&`
+# and discards it, and a graded exit would either be swallowed or - once wired up - turn every
+# brownfield host red for an `info` that is the normal steady state (a static Default Web Site).
+$runtimeFindings = New-Object System.Collections.ArrayList
+function Add-RF { param($f) if ($f) { [void]$runtimeFindings.Add($f) } }
+
+# Every dot-source in this package is Test-Path guarded, so the classifier can legitimately be
+# absent on a host that got a partial copy. Without it every record's Instrumentability stays
+# $null, the switch below matches nothing and the loop falls through to the pre-classification
+# behaviour - the right degradation, but say so rather than silently over-claim again. (An
+# explicit -RuntimeOverrides in that state already threw above: honoring an override the caller
+# believes is in force matters more than limping on.)
+$rtCapable = [bool](Get-Command Resolve-IISAppRuntime -ErrorAction SilentlyContinue)
+if (-not $rtCapable) {
+    Write-Warning "[iis-instr] Resolve-IISAppRuntime.ps1 not found next to this script - application runtimes were NOT classified. Non-.NET apps on a dedicated pool will be named and claimed in CX_IIS_SERVICES as they were before classification existed."
+    function Get-IISAppKey { param([string]$Site, [string]$AppPath) $p = if ($AppPath) { $AppPath } else { '/' }; return "$Site$p" }
+    function Get-IISUnmatchedRuntimeOverrideKeys { param($Overrides, $Apps) return ,@() }
+    function New-IISRuntimeFinding { param($Record, [string]$Target, [string]$Check) return $null }
+}
 
 if (-not $svcMap -or @($svcMap).Count -eq 0) {
     Write-Warning "[iis-instr] no IIS sites/applications found - no per-app service names set."
@@ -310,8 +415,41 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
     # and the console output, and Run-E2ELoop.ps1 asserts zero duplicate pool/varname
     # entries. Ordinal-ignore-case because IIS pool names are case-insensitive.
     $otlpPatchedPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in (Get-IISUnmatchedRuntimeOverrideKeys -Overrides $runtimeOverrideTable -Apps $svcMap)) {
+        Write-Warning "[iis-instr] -RuntimeOverrides has an entry for '$k' but no such IIS application exists here, so that classification is NOT in force. Runtime keys are '<Site><virtual path>' with root apps ending in '/' - a key copied from -ServiceNameOverrides will not match."
+        Add-RF (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'RUNTIME_OVERRIDE_UNMATCHED' -Target $k `
+            -Message "no IIS application matches this -RuntimeOverrides key, so the forced classification is not applied")
+    }
+
     foreach ($r in $svcMap) {
-        Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}]" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope)
+        $appKey = Get-IISAppKey -Site $r.Site -AppPath $r.AppPath
+        Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}] {5}/{6}" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope, $r.DotNetRuntime, $r.Instrumentability)
+        Add-RF (New-IISRuntimeFinding -Record $r -Target $appKey)
+
+        # WHAT the app is decides whether it is instrumented at all; the pool-arity Scope only
+        # decides WHERE the name goes. Conflating the two is the defect this replaces: a static
+        # site on its own pool used to be handed an OTEL_SERVICE_NAME and counted into
+        # CX_IIS_SERVICES, so the host advertised ownership of a service nothing reports under.
+        if ($r.Instrumentability -eq 'Unsupported' -or $r.Instrumentability -eq 'RequiresOverride') {
+            Write-Host "  [skip] $appKey - $($r.RuntimeReason)" -ForegroundColor DarkGray
+            if ($r.Instrumentability -eq 'RequiresOverride') {
+                Write-Warning "[iis-instr] $appKey - runtime undetermined, so nothing was written and it is NOT claimed in CX_IIS_SERVICES. Decide it explicitly: -RuntimeOverrides @{'$appKey'='AspNetCore'}"
+            }
+            # Upgrade path. An earlier build of this installer named every dedicated-pool app
+            # regardless of runtime, so the value may already be sitting on the pool. Skipping
+            # alone would leave it there forever and keep the doctor reporting a name we refuse
+            # to claim; remove it, but only when it is one we would have written ourselves.
+            #
+            # Only the POOL scope needs this. A web.config name lives inside
+            # <aspNetCore><environmentVariables>, so an app can only have one if it had an
+            # <aspNetCore> element - and if it no longer classifies as Core, that element is
+            # gone and took the name with it. There is no stale-web.config-name case to clean.
+            if ($r.Scope -eq 'pool' -and (Remove-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME' -ExpectedValue $r.ServiceName)) {
+                Write-Host "  [pool] removed stale OTEL_SERVICE_NAME=$($r.ServiceName) from '$($r.Pool)' (left by an installer that did not classify runtimes)" -ForegroundColor Yellow
+            }
+            continue
+        }
+
         if ($r.Scope -eq 'pool') {
             # A pool that declares its own <environmentVariables> stops inheriting the
             # applicationPoolDefaults entries (see .NOTES), so re-set the OTLP vars here.
@@ -350,9 +488,16 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
         }
     }
 
-    $unnamed = @($svcMap).Count - $namedApps.Count
-    if ($unnamed -gt 0) {
-        Write-Warning "[iis-instr] $unnamed app(s) could not be given an OTEL_SERVICE_NAME (see the warnings above). They are EXCLUDED from CX_IIS_SERVICES so the host does not claim ownership of a name this installer did not set. An ASP.NET Framework app in this group still REPORTS - the instrumentation auto-detects 'Site\AppPath' - so the host's Service-ownership list is a subset of what it emits. Give such an app a dedicated pool to bring it under management."
+    # Two very different reasons for an app to end up unnamed, and folding them together made
+    # a perfectly healthy static-site host read as degraded. Report them separately.
+    $notInstrumentable = @($svcMap | Where-Object { $_.Instrumentability -eq 'Unsupported' -or $_.Instrumentability -eq 'RequiresOverride' })
+    $couldNotName = @($svcMap).Count - $namedApps.Count - $notInstrumentable.Count
+
+    if ($notInstrumentable.Count -gt 0) {
+        Write-Host "[iis-instr] $($notInstrumentable.Count) app(s) deliberately not instrumented (not .NET, or runtime undetermined) - this is normal, most hosts have at least the stock Default Web Site. They are excluded from CX_IIS_SERVICES: $(@($notInstrumentable | ForEach-Object { Get-IISAppKey -Site $_.Site -AppPath $_.AppPath }) -join ', ')"
+    }
+    if ($couldNotName -gt 0) {
+        Write-Warning "[iis-instr] $couldNotName .NET app(s) could not be given an OTEL_SERVICE_NAME (see the warnings above). They are EXCLUDED from CX_IIS_SERVICES so the host does not claim ownership of a name this installer did not set. An ASP.NET Framework app in this group still REPORTS - the instrumentation auto-detects 'Site\AppPath' - so the host's Service-ownership list is a subset of what it emits. Give such an app a dedicated pool to bring it under management."
     }
 
     # Machine env var CX_IIS_SERVICES = comma-joined distinct IIS service name(s).
@@ -372,6 +517,12 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
     # DOES report, under the auto-detected 'Site\AppPath', so this list can be a
     # subset of the services the host actually emits. Under-claiming costs a missing
     # ownership item; over-claiming costs permanent drift. Subset wins.
+    #
+    # $namedApps is now also RUNTIME-FILTERED: an app only reaches it if it classified as
+    # AspNetCore or AspNetFramework, because a name is only written for those. That makes the
+    # set strictly narrower than before, which is the safe direction - the rule above can only
+    # under-claim harder, never start over-claiming. Test-Agent.ps1 applies the identical
+    # filter when it rebuilds the expected set, and the two must be changed together.
     $iisServices = Get-IISServiceLabelValue -Map @($namedApps.ToArray())
     if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
         $priorIisSvc = [Environment]::GetEnvironmentVariable('CX_IIS_SERVICES', 'Machine')
@@ -452,4 +603,21 @@ if ($NoReset) {
 # ---- Verify -------------------------------------------------------------------
 Write-Host ""
 Write-Host "[iis-instr] W3SVC status: $((Get-Service W3SVC -ErrorAction SilentlyContinue).Status)"
-Write-Host "[iis-instr] done. ASP.NET Core pools must be set to 'No Managed Code' (managedRuntimeVersion='') or they emit no telemetry."
+
+# Runtime classification summary. Table only - no exit code, see the note where
+# $runtimeFindings is created.
+if ($runtimeFindings.Count -gt 0 -and (Get-Command Write-FindingTable -ErrorAction SilentlyContinue)) {
+    Write-FindingTable -Findings @($runtimeFindings.ToArray()) -Title 'IIS application runtimes'
+}
+if ($Session -and $Session.PSObject.Properties['Manifest'] -and $Session.Manifest) {
+    try { $Session.Manifest.runtimeFindings = @($runtimeFindings.ToArray() | ForEach-Object { @{ target = $_.target; code = $_.code; severity = $_.severity } }) } catch { }
+}
+
+# The old closing line here said "ASP.NET Core pools must be set to 'No Managed Code'
+# (managedRuntimeVersion='') or they emit no telemetry." Both halves were wrong, and the
+# second half was actively harmful: read as advice for EVERY pool it produces exactly the
+# ASP.NET Framework misconfiguration this script now reports. Microsoft's own wording is that
+# No Managed Code is "optional but recommended" for ASP.NET Core - the app still runs and
+# still reports either way.
+Write-Host "[iis-instr] done."
+Write-Host "[iis-instr] App pool .NET CLR version: 'No Managed Code' is recommended for ASP.NET CORE pools (the desktop CLR is loaded and unused otherwise). Do NOT apply it to ASP.NET FRAMEWORK pools - those need v4.0 or their managed handlers cannot load and IIS fails every request."

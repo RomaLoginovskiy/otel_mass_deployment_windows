@@ -16,8 +16,28 @@ REM      set CX_ENVIRONMENT=staging && set CORALOGIX_PRIVATE_KEY=cxtp_xxx && dep
 REM  CX_ENVIRONMENT labels this host's telemetry (production/staging/dev/...) so
 REM  Coralogix can split it by environment in Infra Explorer.
 REM
+REM      set CX_REGION=eu2 && deploy.bat          ship to the eu2 account
+REM  Coralogix region code (eu1/eu2/us1/us2/us3/ap1/ap2/ap3). It becomes the collector's
+REM  ingress domain <region>.coralogix.com AND the OpAMP endpoint, so it must match the
+REM  account the Send-Your-Data key belongs to - a key from another region authenticates
+REM  nowhere and the host reports healthy while sending nothing. An unknown code fails
+REM  the install. For a private ingress domain use CORALOGIX_DOMAIN instead:
+REM      set CORALOGIX_DOMAIN=my-ingress.example.com && deploy.bat
+REM  With neither set the region is taken from region.txt in this folder (baked in by
+REM  Build-DeploymentPackage.ps1 -Region), then from whatever a previous install
+REM  persisted, and finally eu1.
+REM
 REM      set CX_NO_SUPERVISOR=1 && deploy.bat     collector without the OpAMP Supervisor
 REM      set CX_SKIP_INSTRUMENT=1 && deploy.bat   collector only, leave IIS/Node alone
+REM
+REM      set CX_RUNTIME_OVERRIDES_JSON=C:\path\runtimes.json && deploy.bat
+REM  Force the runtime of IIS apps the installer cannot classify, e.g.
+REM      { "Wallet/api": "AspNetCore", "Legacy/": "AspNetFramework", "Static/": "NonDotNet" }
+REM  Keyed by "<Site><virtual path>" with root apps ending in '/' - the same string the
+REM  doctor prints in its Target column. Not added to ARGS below on purpose: the scripts
+REM  read this variable directly (like CX_OTEL_DOTNET_ARCHIVE), so the SAME file is picked
+REM  up by the install AND by doctor.bat. If only one of them saw it they would disagree
+REM  about which apps belong in CX_IIS_SERVICES and report drift forever.
 REM ===========================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -49,8 +69,17 @@ REM                       installer (-Config instead of -Supervisor
 REM                       -SupervisorCollectorBaseConfig). Instrumentation and the
 REM                       diagnostics are identical in both modes.
 REM   CX_SKIP_INSTRUMENT=1  install the collector but do NOT touch IIS / Node.
+REM   CX_REGION           which Coralogix account region receives the data.
+REM
+REM CORALOGIX_DOMAIN is deliberately NOT forwarded as -Domain. A previous install
+REM persisted it at machine scope, so this cmd.exe inherits it and cannot tell a value
+REM someone just exported from that leftover - passing it as an explicit flag would make
+REM the leftover outrank a baked-in region.txt forever. Install-CoralogixSupervisor.ps1
+REM reads the variable directly instead and compares it with the machine value to tell
+REM the two apart (same "read it, do not flag it" pattern as CX_RUNTIME_OVERRIDES_JSON).
 set ARGS=
 if defined CORALOGIX_PRIVATE_KEY set ARGS=%ARGS% -PrivateKey "%CORALOGIX_PRIVATE_KEY%"
+if defined CX_REGION set ARGS=%ARGS% -Region "%CX_REGION%"
 if defined CX_ENVIRONMENT set ARGS=%ARGS% -Environment "%CX_ENVIRONMENT%"
 if defined CX_NO_SUPERVISOR set ARGS=%ARGS% -NoSupervisor
 if defined CX_SKIP_INSTRUMENT set ARGS=%ARGS% -SkipInstrument

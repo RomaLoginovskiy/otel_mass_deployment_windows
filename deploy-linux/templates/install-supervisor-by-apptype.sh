@@ -9,11 +9,16 @@
 # Supported APP_TYPE values:
 #   postgresql | redis | valkey | elasticsearch | databases
 #
+# Region:
+#   CORALOGIX_REGION="eu2" (or --region eu2) -> domain eu2.coralogix.com.
+#   Codes: us1 us2 us3 eu1 eu2 ap1 ap2 ap3. CORALOGIX_DOMAIN overrides it for a
+#   private / legacy ingress domain.
+#
 # Examples:
 #   # Postgres host — only Postgres vars required
 #   sudo env \
 #     CORALOGIX_PRIVATE_KEY="<key>" \
-#     CORALOGIX_DOMAIN="eu2.coralogix.com" \
+#     CORALOGIX_REGION="eu2" \
 #     APP_TYPE="postgresql" ENV_TYPE="prod" \
 #     POSTGRES_OTEL_PASSWORD="<password>" \
 #     POSTGRES_OTEL_USER="otel_monitor" \
@@ -24,7 +29,7 @@
 #   # Redis host — Redis vars only (password optional / empty OK)
 #   sudo env \
 #     CORALOGIX_PRIVATE_KEY="<key>" \
-#     CORALOGIX_DOMAIN="eu2.coralogix.com" \
+#     CORALOGIX_REGION="eu2" \
 #     APP_TYPE="redis" ENV_TYPE="prod" \
 #     REDIS_ENDPOINT="localhost:6379" \
 #     REDIS_PASSWORD="" \
@@ -38,7 +43,35 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 : "${CORALOGIX_PRIVATE_KEY:?Set CORALOGIX_PRIVATE_KEY}"
-: "${CORALOGIX_DOMAIN:?Set CORALOGIX_DOMAIN (e.g. eu2.coralogix.com)}"
+
+# -----------------------------------------------------------------------------
+# Region -> domain (same contract as install-supervisor-default.sh)
+# -----------------------------------------------------------------------------
+# CORALOGIX_REGION="eu2" (or --region eu2) resolves to <region>.coralogix.com.
+# CORALOGIX_DOMAIN remains the escape hatch for a private / legacy ingress domain and
+# wins when both are set. Unknown region = hard error, because the alternative is a
+# host that looks healthy and ships to an account that is not yours.
+CX_REGIONS="us1 us2 us3 eu1 eu2 ap1 ap2 ap3"
+CORALOGIX_REGION="${CORALOGIX_REGION:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --region)   CORALOGIX_REGION="${2:?--region needs a value, e.g. --region eu2}"; shift 2 ;;
+    --region=*) CORALOGIX_REGION="${1#*=}"; shift ;;
+    *) break ;;
+  esac
+done
+
+if [[ -n "${CORALOGIX_DOMAIN:-}" && -n "${CORALOGIX_REGION}" ]]; then
+  echo "WARN: both CORALOGIX_DOMAIN and a region given; using domain ${CORALOGIX_DOMAIN}" >&2
+elif [[ -n "${CORALOGIX_REGION}" ]]; then
+  cx_region="$(printf '%s' "${CORALOGIX_REGION}" | tr '[:upper:]' '[:lower:]')"
+  case " ${CX_REGIONS} " in
+    *" ${cx_region} "*) CORALOGIX_DOMAIN="${cx_region}.coralogix.com" ;;
+    *) echo "ERROR: unknown Coralogix region '${CORALOGIX_REGION}'. Supported: ${CX_REGIONS}. Use CORALOGIX_DOMAIN=<domain> for a private ingress domain." >&2
+       exit 1 ;;
+  esac
+fi
+: "${CORALOGIX_DOMAIN:?Set CORALOGIX_REGION (${CX_REGIONS}) or CORALOGIX_DOMAIN (e.g. eu2.coralogix.com)}"
 
 # Fleet Management selection attributes
 APP_TYPE="${APP_TYPE:-databases}"
@@ -56,7 +89,11 @@ require_var() {
 
 # Credentials / endpoints to persist + pass into collector (filled per APP_TYPE)
 CRED_KEYS=()
-PASS_THROUGH_KEYS=("APP_TYPE" "ENV_TYPE")
+# CORALOGIX_DOMAIN is a pass-through but NOT a credential: it is written and printed
+# with APP_TYPE/ENV_TYPE below, not through the CRED_KEYS loop (which masks passwords
+# and is scoped per app.type). It has to reach the collector child because the pushed
+# config's coralogix exporters read ${env:CORALOGIX_DOMAIN}.
+PASS_THROUGH_KEYS=("CORALOGIX_DOMAIN" "APP_TYPE" "ENV_TYPE")
 
 case "${APP_TYPE_NORM}" in
   postgresql|postgres)
@@ -179,6 +216,7 @@ fi
 
 # Drop keys we manage so re-runs stay clean
 sed -i \
+  -e '/^CORALOGIX_DOMAIN=/d' \
   -e '/^APP_TYPE=/d' \
   -e '/^ENV_TYPE=/d' \
   "${SUPERVISOR_ENV}"
@@ -189,6 +227,7 @@ done
 {
   echo ""
   echo "${CRED_MARKER_BEGIN}"
+  echo "CORALOGIX_DOMAIN=${CORALOGIX_DOMAIN}"
   echo "APP_TYPE=${APP_TYPE}"
   echo "ENV_TYPE=${ENV_TYPE}"
   for key in "${CRED_KEYS[@]}"; do

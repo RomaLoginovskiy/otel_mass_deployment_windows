@@ -1,0 +1,7 @@
+{
+  "name": "cx-nodeshape-apps",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Parent of the per-module-system app variants. Holds the SHARED node_modules (pino) that cjs/, esm/, mjs/ and bare/ all resolve upward into, so one baked copy serves every shape.",
+  "//": "MUST NOT declare \"type\": \"module\" - that would leak ESM semantics into cjs/ and bare/, whose own package.json files are what the ESM probe is supposed to read."
+}

@@ -26,6 +26,7 @@ param(
     [string] $Package     = (Join-Path $PSScriptRoot '..\coralogix-agent-deploy.zip'),
     [string] $GuestStage  = 'C:\cx-deploy',
     [string] $Environment = '',   # deployment env (staging/production/...); -> guest CX_ENVIRONMENT -> deploy.bat -Environment
+    [string] $Region      = '',   # Coralogix region (eu1/eu2/us1/...); -> guest CX_REGION -> deploy.bat -Region
     [string] $TranscriptLog = (Join-Path $PSScriptRoot '..\poc-deploy-fromhost.log')
 )
 
@@ -68,15 +69,16 @@ try {
 
     # 5. Expand + run deploy.bat (the BatchPatch remote command).
     Write-Host "[ctl] expanding + running deploy.bat in guest (collector supervisor install + detect + IIS instr) ..."
-    $out = Invoke-Command -Session $s -ArgumentList $GuestStage, $Environment {
-        param($d, $envName)
+    $out = Invoke-Command -Session $s -ArgumentList $GuestStage, $Environment, $Region {
+        param($d, $envName, $region)
         $pkg = Join-Path $d 'pkg'
         if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
         Expand-Archive -Path (Join-Path $d 'coralogix-agent-deploy.zip') -DestinationPath $pkg -Force
         $bat = Join-Path $pkg 'deploy.bat'
-        # deploy.bat forwards CX_ENVIRONMENT as -Environment; set it in this process
-        # so the child cmd.exe inherits it.
+        # deploy.bat forwards CX_ENVIRONMENT as -Environment and CX_REGION as -Region;
+        # set them in this process so the child cmd.exe inherits them.
         if ($envName) { $env:CX_ENVIRONMENT = $envName }
+        if ($region)  { $env:CX_REGION      = $region }
         & cmd.exe /c "`"$bat`""
         "deploy.bat exit=$LASTEXITCODE"
     }
@@ -90,7 +92,10 @@ try {
         $health = try { (Invoke-WebRequest 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 8).StatusCode } catch { 'no' }
         $attrs = [Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES','Machine')
         $cxEnv = [Environment]::GetEnvironmentVariable('CX_ENVIRONMENT','Machine')
-        [pscustomobject]@{ services = ($svc -join '; '); health13133 = $health; otelResourceAttributes = $attrs; cxEnvironment = $cxEnv }
+        # The effective region: proof the -Region actually landed, since a wrong one still
+        # leaves the collector healthy and the services running.
+        $cxDom = [Environment]::GetEnvironmentVariable('CORALOGIX_DOMAIN','Machine')
+        [pscustomobject]@{ services = ($svc -join '; '); health13133 = $health; otelResourceAttributes = $attrs; cxEnvironment = $cxEnv; coralogixDomain = $cxDom }
     }
     $verify | Format-List | Out-String | Write-Host
 

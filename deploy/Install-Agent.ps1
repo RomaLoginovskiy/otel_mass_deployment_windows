@@ -15,8 +15,18 @@
     4. Restart the collector so it re-reads OTEL_RESOURCE_ATTRIBUTES, then verify
        and write a JSON status summary.
 
+.PARAMETER Region
+  Coralogix region code: eu1, eu2, us1, us2, us3, ap1, ap2, ap3 (see
+  Resolve-CxRegion.ps1). Forwarded to Install-CoralogixSupervisor.ps1, which resolves
+  it to <region>.coralogix.com and publishes it as CORALOGIX_DOMAIN. An unknown code
+  fails the install rather than defaulting.
+
 .PARAMETER Domain
-  Coralogix domain. Default: eu1.coralogix.com
+  Full Coralogix ingress domain, for a private / non-standard endpoint. Wins over
+  -Region. With neither given the region falls back to CX_REGION in the environment,
+  then a CORALOGIX_DOMAIN exported for this run, then region.txt in this folder, then
+  whatever a previous install persisted, then eu1.coralogix.com - resolved by
+  Install-CoralogixSupervisor.ps1, which documents the order.
 
 .PARAMETER KeyFile
   File containing the Send-Your-Data key. Default: .\SendDataKey.txt
@@ -50,7 +60,10 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Domain            = 'eu1.coralogix.com',
+    # Region/domain are resolved in Install-CoralogixSupervisor.ps1 (one authority for
+    # the fallback chain), so both default to $null here and are forwarded only when set.
+    [string] $Region            = $null,
+    [string] $Domain            = $null,
     [string] $KeyFile           = $null,
     [string] $PrivateKey        = $null,
     [string] $Environment       = $null,
@@ -84,6 +97,9 @@ $status = [ordered]@{
     # poc/Deploy-FromHost.ps1 and existing runbooks read it; it means "the
     # collector install step completed", not "the supervisor is running".
     mode          = $(if ($NoSupervisor) { 'no-supervisor' } else { 'supervisor' })
+    # Effective Coralogix ingress domain, filled in after the collector step from what
+    # was actually persisted (see below) - not from the -Region/-Domain arguments.
+    domain        = $null
     supervisor    = $false
     iisInstrumented = $false
     pm2Instrumented = $false
@@ -134,7 +150,11 @@ try {
     # -- 2. Install the collector ----------------------------------------------
     # -NoSupervisor selects the vendor installer's regular mode. Everything else
     # about this call is identical between the two modes.
-    $supArgs = @{ Domain = $Domain; BaseConfig = (Join-Path $here 'config.supervisor.yaml') }
+    # Pass -Region/-Domain ONLY when actually given: an empty value here would look
+    # explicit to the child script and short-circuit its env/region.txt fallbacks.
+    $supArgs = @{ BaseConfig = (Join-Path $here 'config.supervisor.yaml') }
+    if ($Region) { $supArgs['Region'] = $Region }
+    if ($Domain) { $supArgs['Domain'] = $Domain }
     if ($NoSupervisor) { $supArgs['NoSupervisor'] = $true }
     if ($PrivateKey) { $supArgs['PrivateKey'] = $PrivateKey } else { $supArgs['KeyFile'] = $KeyFile }
     # Persist CX_ENVIRONMENT (machine) so the collector's resource/environment
@@ -148,6 +168,10 @@ try {
     $supArgs['Session'] = $session
     & (Join-Path $here 'Install-CoralogixSupervisor.ps1') @supArgs
     $status.supervisor = $true
+    # Read the region back off what the child persisted rather than echoing the
+    # argument: with no -Region/-Domain the effective value comes from the env or
+    # region.txt, and the status summary is what a fleet rollout is audited against.
+    $status.domain = [Environment]::GetEnvironmentVariable('CORALOGIX_DOMAIN', 'Machine')
 
     # -- 3. Conditional IIS zero-code instrumentation ---------------------------
     if ($roles.IIS -and -not $SkipInstrument) {
@@ -163,8 +187,14 @@ try {
     # -- 3b. Conditional Node.js / PM2 zero-code instrumentation ----------------
     if ($roles.PM2 -and -not $SkipInstrument) {
         Write-Host "[agent] PM2 detected -> configuring zero-code Node.js instrumentation"
+        if ($roles.PM2Hosting -eq 'service') {
+            Write-Host "[agent] PM2 is hosted as a Windows service owned by $($roles.PM2Owner) - its apps are restarted as that account"
+        }
         & (Join-Path $here 'Instrument-NodePM2.ps1') -Session $session
-        $status.pm2Instrumented = $true
+        # Read the outcome back off the shared manifest instead of assuming success. An install
+        # that could not reach the PM2 daemon must not be reported as instrumented - that claim
+        # in the status summary is how a host ends up believed-covered and silent.
+        $status.pm2Instrumented = [bool]$session.Manifest.nodeInstrumented
     } elseif ($roles.PM2) {
         Write-Host "[agent] PM2 detected but -SkipInstrument set; skipping instrumentation"
     } else {

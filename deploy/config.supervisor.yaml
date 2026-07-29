@@ -167,7 +167,11 @@ exporters:
     - cx.application.name
     - service.namespace
     - host.name
-    domain: eu1.coralogix.com
+    # Region comes from the machine env var the installer persists (Install-Agent.ps1
+    # -Region / -Domain), NOT from a literal here: a hardcoded domain made the deploy
+    # flag cosmetic - the collector kept shipping to eu1 whatever region was requested.
+    # The default keeps a hand-placed copy of this config working without the env var.
+    domain: ${env:CORALOGIX_DOMAIN:-eu1.coralogix.com}
     domain_settings:
       keepalive:
         enabled: true
@@ -205,7 +209,9 @@ exporters:
         X-Coralogix-Distribution: helm-otel-standalone/0.0.42
   coralogix/resource_catalog:
     application_name: resource
-    domain: eu1.coralogix.com
+    # Same env var as the main exporter - both must move together or the entity
+    # catalog would land in a different account than the telemetry it describes.
+    domain: ${env:CORALOGIX_DOMAIN:-eu1.coralogix.com}
     logs:
       headers:
         X-Coralogix-Distribution: helm-otel-standalone/0.0.42
