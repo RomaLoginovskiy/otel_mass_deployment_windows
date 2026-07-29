@@ -76,6 +76,8 @@ misc/*.log
 # Re-including inside an ignored tree has to be done level by level - git will not
 # descend into an excluded DIRECTORY, so negating a file inside one has no effect.
 test/*
+# Fixture-only unit suites: no baked binaries, no keys, run from a clean clone.
+!test/Test-SupervisorConfigWriter.ps1
 !test/docker-win
 test/docker-win/*
 
