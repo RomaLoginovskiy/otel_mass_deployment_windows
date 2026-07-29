@@ -254,7 +254,10 @@ try {
                 Net8      = [bool](($runtimes -join ' ') -match 'Microsoft\.AspNetCore\.App 8\.')
                 Net6      = [bool](($runtimes -join ' ') -match 'Microsoft\.AspNetCore\.App 6\.')
                 Net35     = [bool]((Get-WindowsFeature -Name NET-Framework-Core -ErrorAction SilentlyContinue).Installed)
-                Node      = (if (Test-Path 'C:\nodejs\node.exe') { (& 'C:\nodejs\node.exe' --version 2>&1 | Select-Object -First 1) } else { '' })
+                # $(if ...) not (if ...): in Windows PowerShell 5.1 the bare parenthesised form
+                # PARSES fine and then fails at runtime with "The term 'if' is not recognized",
+                # because it is read as a command invocation. It would have reported node as absent.
+                Node      = $(if (Test-Path 'C:\nodejs\node.exe') { (& 'C:\nodejs\node.exe' --version 2>&1 | Select-Object -First 1) } else { '' })
                 Pm2       = [bool](Test-Path 'C:\npm-global\pm2.cmd')
                 OtelZip   = [bool](Test-Path 'C:\cx-stage\otel-dotnet.zip')
                 Fixtures  = @(Get-ChildItem 'C:\cx-fixtures' -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
