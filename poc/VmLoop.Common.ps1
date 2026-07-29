@@ -216,6 +216,69 @@ function Copy-ToGuest {
     if ($LASTEXITCODE -ne 0) { throw "copyto failed ($LocalPath -> $GuestPath): $($out -join ' ')" }
 }
 
+function Copy-DirToGuestAsZip {
+    <#
+      Stage a directory into the guest as ONE archive, then expand it there.
+
+      guestcontrol copies file by file, and the trees this harness stages are the worst possible
+      shape for that: otel-node is ~71 MB across thousands of tiny node_modules files, and npm-global
+      is not much better. One zip is a single transfer plus a local expand, which turns tens of
+      minutes into a couple of them - and it removes the partial-copy failure mode where a tree
+      arrives with a few files missing and the failure surfaces later as a confusing "module not
+      found" inside the guest.
+
+      Falls back to the per-file path when compression or expansion is unavailable, so a guest with
+      an unusual PowerShell still works.
+    #>
+    param([Parameter(Mandatory)] [string] $LocalDir,
+          [Parameter(Mandatory)] [string] $GuestDir,
+          [string] $StagingDir = $null)
+
+    if (-not (Test-Path -LiteralPath $LocalDir)) { return $false }
+    if (-not $StagingDir) { $StagingDir = $script:VmlHostStage }
+
+    $leaf = Split-Path -Leaf $LocalDir
+    $zip  = Join-Path $StagingDir ("$leaf-" + [System.Diagnostics.Process]::GetCurrentProcess().Id + '.zip')
+    try {
+        if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+        # -Force so a re-run overwrites; Optimal rather than NoCompression because node_modules
+        # compresses extremely well and the transfer, not the CPU, is the bottleneck here.
+        Compress-Archive -Path (Join-Path $LocalDir '*') -DestinationPath $zip -CompressionLevel Optimal -Force -ErrorAction Stop
+    } catch {
+        Write-Host "  [transport] could not compress $LocalDir ($($_.Exception.Message)); falling back to per-file copy" -ForegroundColor DarkYellow
+        return (Copy-DirToGuest -LocalDir $LocalDir -GuestDir $GuestDir)
+    }
+
+    $sizeMb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+    Write-Host "  [transport] $leaf -> ${sizeMb} MB archive"
+    $guestZip = "$($script:VmlGuestStage)\$leaf.zip"
+    try { Copy-ToGuest -LocalPath $zip -GuestPath $guestZip }
+    catch {
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+        Write-Host "  [transport] archive copy failed; falling back to per-file" -ForegroundColor DarkYellow
+        return (Copy-DirToGuest -LocalDir $LocalDir -GuestDir $GuestDir)
+    }
+    Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+
+    $res = Invoke-Guest -Script {
+        param($zipPath, $dest)
+        $ErrorActionPreference = 'Continue'
+        try {
+            if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+            Expand-Archive -LiteralPath $zipPath -DestinationPath $dest -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+            "EXPANDED:" + @(Get-ChildItem -LiteralPath $dest -Recurse -File -ErrorAction SilentlyContinue).Count
+        } catch { "FAILED:$($_.Exception.Message)" }
+    } -ArgumentList @($guestZip, $GuestDir) -TimeoutSeconds 1800
+
+    if ("$res" -match '^EXPANDED:(\d+)') {
+        Write-Host "  [transport] expanded $($Matches[1]) file(s) into $GuestDir"
+        return $true
+    }
+    Write-Host "  [transport] guest expand said: $res - falling back to per-file copy" -ForegroundColor DarkYellow
+    return (Copy-DirToGuest -LocalDir $LocalDir -GuestDir $GuestDir)
+}
+
 function Copy-DirToGuest {
     <#
       Recursive copy. VBoxManage's own --recursive is used where it works, but it refuses when the
