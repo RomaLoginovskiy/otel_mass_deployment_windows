@@ -70,7 +70,11 @@ param(
     # branch under test. Defaults to this repo's test\docker-win; point it elsewhere when the assets
     # were baked in another checkout. Missing assets skip the shapes that need them, with a note.
     [string]   $AssetRoot     = $null,
-    [string]   $GuestStage    = 'C:\cx-deploy',
+    # Deliberately NOT C:\cx-deploy. A guest that has ever been deployed to by hand already has a
+    # payload there, and deploy.bat runs "%~dp0Install-Agent.ps1" - the scripts next to ITSELF - so a
+    # stale copy silently shadows the branch under test. Every P3/P4/P5 result in an earlier run of
+    # this matrix described the guest's OLD scripts for exactly that reason.
+    [string]   $GuestStage    = 'C:\cx-matrix',
     [string]   $GuestFixtures = 'C:\cx-fixtures',
     [string]   $PrivateKey    = $env:CORALOGIX_PRIVATE_KEY,
     [string]   $Region        = 'eu1',
@@ -206,8 +210,11 @@ try {
     }
     if ($pre -and ($pre.Supervisor -or $pre.Collector)) {
         Write-Host '  guest already carries an agent - uninstalling to get a clean baseline'
+        # The payload has to be in place first: uninstall.bat, like deploy.bat, resolves its scripts
+        # with %~dp0, so it must sit beside the Uninstall-Agent.ps1 it is meant to run.
+        [void](Copy-DirToGuestAsZip -LocalDir (Join-Path $RepoRoot 'deploy') -GuestDir "$GuestStage\deploy")
         $un = Invoke-GuestFile -LocalPath (Join-Path $RepoRoot 'deploy\uninstall.bat') `
-                               -GuestPath "$GuestStage\uninstall.bat" -Tail 12 -TimeoutSeconds 900
+                               -GuestPath "$GuestStage\deploy\uninstall.bat" -Tail 12 -TimeoutSeconds 900
         Write-Host "  uninstall exit=$($un.Code)"
         $post = Invoke-GuestJson -Script {
             [pscustomobject]@{
@@ -484,10 +491,38 @@ try {
         } else {
             # Stage the CURRENT working tree, always overwriting: a stale C:\cx-deploy copy means
             # testing last week's code while believing otherwise.
-            foreach ($d in @('deploy')) {
-                [void](Copy-DirToGuest -LocalDir (Join-Path $RepoRoot $d) -GuestDir "$GuestStage\$d")
+            # One directory, as an archive, and deploy.bat is RUN FROM INSIDE it - never copied to
+            # the parent. deploy.bat resolves its scripts with %~dp0, so a deploy.bat sitting one
+            # level up executes whatever Install-Agent.ps1 happens to be beside it, which on a guest
+            # with an inherited payload is last month's code.
+            [void](Copy-DirToGuestAsZip -LocalDir (Join-Path $RepoRoot 'deploy') -GuestDir "$GuestStage\deploy")
+
+            # Prove the payload deploy.bat will use is the one under test, before running it. A
+            # marker carrying this checkout's HEAD is written next to the scripts and read back.
+            $headSha = ''
+            try { $headSha = (& git -C $RepoRoot rev-parse --short HEAD 2>$null | Out-String).Trim() } catch { }
+            if (-not $headSha) { $headSha = 'nogit-' + (Get-Date -Format 'yyyyMMddHHmmss') }
+            $markerLocal = Join-Path $script:VmlHostStage 'cx-payload-id.txt'
+            Set-Content -LiteralPath $markerLocal -Value $headSha -Encoding Ascii -NoNewline
+            Copy-ToGuest -LocalPath $markerLocal -GuestPath "$GuestStage\deploy\cx-payload-id.txt"
+
+            $payload = Invoke-GuestJson -Script {
+                param($stage)
+                $dir = "$stage\deploy"
+                [pscustomobject]@{
+                    Marker   = $(if (Test-Path "$dir\cx-payload-id.txt") { (Get-Content "$dir\cx-payload-id.txt" -Raw).Trim() } else { '' })
+                    HasBat   = (Test-Path "$dir\deploy.bat")
+                    HasAgent = (Test-Path "$dir\Install-Agent.ps1")
+                    # Anything at the PARENT level would shadow us if deploy.bat were run from there.
+                    ParentPs1 = @(Get-ChildItem $stage -Filter '*.ps1' -ErrorAction SilentlyContinue).Count
+                } | ConvertTo-Json -Compress
+            } -ArgumentList @($GuestStage) -TimeoutSeconds 300
+            if ($payload) {
+                Assert-Equal 'the guest is running THIS checkout''s payload' $headSha ([string]$payload.Marker)
+                Assert-True  'deploy.bat and Install-Agent.ps1 are in the same directory' `
+                    (([bool]$payload.HasBat) -and ([bool]$payload.HasAgent)) "bat=$($payload.HasBat) agent=$($payload.HasAgent)"
+                Assert-Equal 'no shadowing scripts at the stage root' 0 ([int]$payload.ParentPs1)
             }
-            Copy-ToGuest -LocalPath (Join-Path $RepoRoot 'deploy\deploy.bat') -GuestPath "$GuestStage\deploy.bat"
 
             $envBlock = @{
                 CX_REGION      = $Region
@@ -502,7 +537,7 @@ try {
                 foreach ($p in $envMap.PSObject.Properties) { Set-Item -Path "env:$($p.Name)" -Value ([string]$p.Value) }
                 $env:CORALOGIX_PRIVATE_KEY = $key
                 Set-Content -LiteralPath "$stage\deploy\SendDataKey.txt" -Value $key -Encoding Ascii -NoNewline
-                $out = & cmd.exe /c "`"$stage\deploy.bat`"" 2>&1 | ForEach-Object { "$_" }
+                $out = & cmd.exe /c "`"$stage\deploy\deploy.bat`"" 2>&1 | ForEach-Object { "$_" }
                 $code = $LASTEXITCODE
                 [pscustomobject]@{
                     Code       = $code
@@ -810,7 +845,7 @@ try {
     if (Want 'P10') {
         Write-PhaseHeader 'P10' 'uninstall leaves a working host'
         $un = Invoke-GuestFile -LocalPath (Join-Path $RepoRoot 'deploy\uninstall.bat') `
-                               -GuestPath "$GuestStage\uninstall.bat" -Tail 10 -TimeoutSeconds 1800
+                               -GuestPath "$GuestStage\deploy\uninstall.bat" -Tail 10 -TimeoutSeconds 1800
         Assert-True 'uninstall.bat exited 0' ($un.Code -eq 0) "exit=$($un.Code): $($un.Out)"
         $post = Invoke-GuestJson -Script {
             $ErrorActionPreference = 'Continue'

@@ -435,24 +435,66 @@ function Invoke-GuestFile {
     Copy-ToGuest -LocalPath $LocalPath -GuestPath $GuestPath
 
     $isBat  = $GuestPath -match '\.(bat|cmd)$'
+
+    # The guest script's OWN exit code is echoed as a marker and parsed back, because VBoxManage's
+    # exit code answers a different question. A long-running step can finish perfectly while the
+    # transport gives up reading its output ("Reading from guest process ... failed: VERR_TIMEOUT"),
+    # and VBoxManage then exits non-zero - which is how a successful uninstall
+    # (iisDeinstrumented=True, services=[], "exit code: 0" in its own output) was reported as
+    # "uninstall.bat exited 0 -> exit=1". Transport trouble and guest failure must not look alike.
+    $script:VmlStepSeq++
+    $marker  = 'CX_GUEST_EXIT'
+    $wrapLoc = Join-Path $script:VmlHostStage ("wrap-$($script:VmlStepSeq)." + $(if ($isBat) { 'cmd' } else { 'ps1' }))
+    $wrapGst = "$($script:VmlGuestStage)\wrap-$($script:VmlStepSeq)." + $(if ($isBat) { 'cmd' } else { 'ps1' })
+    $argLine = ($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+
+    if ($isBat) {
+        Set-Content -LiteralPath $wrapLoc -Encoding Ascii -Value @(
+            '@ECHO OFF',
+            "CALL `"$GuestPath`" $argLine",
+            "ECHO $marker=%ERRORLEVEL%"
+        )
+    } else {
+        Set-Content -LiteralPath $wrapLoc -Encoding utf8 -Value @(
+            '$ErrorActionPreference = ''Continue''',
+            "& '$GuestPath' $argLine",
+            "Write-Output ""$marker=`$LASTEXITCODE"""
+        )
+    }
+    Copy-ToGuest -LocalPath $wrapLoc -GuestPath $wrapGst
+
     $gcArgs = @($script:VmlGcBase) + @('run')
     if ($TimeoutSeconds -gt 0) { $gcArgs += @('--timeout', ($TimeoutSeconds * 1000)) }
     if ($isBat) {
         $gcArgs += @('--exe', 'C:\Windows\System32\cmd.exe', '--wait-stdout', '--wait-stderr', '--',
-                     'cmd', '/c', $GuestPath) + $Arguments
+                     'cmd', '/c', $wrapGst)
     } else {
         $gcArgs += @('--exe', 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
                      '--wait-stdout', '--wait-stderr', '--',
-                     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $GuestPath) + $Arguments
+                     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wrapGst)
     }
 
-    $out  = VBoxSoft @gcArgs
-    $code = $LASTEXITCODE
-    $lines = @($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() })
+    $out       = VBoxSoft @gcArgs
+    $vboxCode  = $LASTEXITCODE
+    $lines     = @($out | ForEach-Object { "$_" } | Where-Object { $_.Trim() })
+    $timedOut  = [bool](($lines -join ' ') -match 'VERR_TIMEOUT')
+
+    $guestCode = $null
+    foreach ($l in $lines) {
+        if ($l -match ($marker + '=(-?\d+)')) { $guestCode = [int]$Matches[1] }
+    }
+    if ($null -eq $guestCode -and $timedOut) {
+        Write-Host '  [transport] guest output was truncated by a read timeout; the step may well have succeeded - check its own output' -ForegroundColor DarkYellow
+    }
+
     return [pscustomobject]@{
-        Code = $code
-        Out  = (($lines | Select-Object -Last $Tail) -join "`n")
-        All  = $lines.Count
+        # The guest's own code when we have it; VBoxManage's only as a fallback.
+        Code          = $(if ($null -ne $guestCode) { $guestCode } else { $vboxCode })
+        GuestCode     = $guestCode
+        TransportCode = $vboxCode
+        TransportTimedOut = $timedOut
+        Out           = (($lines | Select-Object -Last $Tail) -join "`n")
+        All           = $lines.Count
     }
 }
 
