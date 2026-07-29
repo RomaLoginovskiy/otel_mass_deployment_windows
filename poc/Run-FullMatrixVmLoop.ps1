@@ -709,7 +709,13 @@ try {
                 # Service either.
                 $expected = if ($script:GuestIisServices) { $script:GuestIisServices } else { '' }
                 $mustNot  = @($svcNames.Clr2, 'arrproxy', 'staticwc', 'nocfg', 'binonly')
-                $vArgs = @('-QueryKeyFile', $QueryKeyFile, '-HostName', $HostRename, '-MustNotContain') + $mustNot
+                # A [string[]] parameter reached through `powershell -File` must be ONE
+                # comma-separated token. Spreading the array instead binds only its first element and
+                # shoves the rest onto whatever positional parameters follow - here 'staticwc' landed
+                # on -LookbackMinutes and the verifier died with "Cannot convert value 'staticwc' to
+                # type System.Int32" before running a single query.
+                $vArgs = @('-QueryKeyFile', $QueryKeyFile, '-HostName', $HostRename,
+                           '-MustNotContain', ($mustNot -join ','))
                 if ($expected) { $vArgs += @('-ExpectedValue', $expected) }
                 # Through Invoke-HostScript, not a bare call: the verifier writes to stderr, and under
                 # $ErrorActionPreference='Stop' that becomes a terminating NativeCommandError which
@@ -726,8 +732,10 @@ try {
                 # The PM2 shape this matrix provisions is the fork app; cluster is a known-open
                 # (env applies, no telemetry), so gating on it here would fail for a reason that is
                 # already documented rather than for anything this run changed.
+                # -Services is [string[]]: one comma-separated token, for the same reason as above.
                 $nArgs = @('-QueryKeyFile', $QueryKeyFile, '-Services', 'shape-user-fork',
                            '-ClusterService', 'shape-user-fork', '-MinClusterWorkers', '1')
+                # (single value, so no join needed here - but keep the shape identical if more are added)
                 $r = Invoke-HostScript -Path $nodeVerifier -Arguments $nArgs
                 Assert-True 'Node telemetry verified in Coralogix' ($r.Code -eq 0) $r.Out
             }
