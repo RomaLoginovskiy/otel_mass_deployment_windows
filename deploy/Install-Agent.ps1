@@ -72,6 +72,12 @@ param(
     [string] $Application       = $null,
     [switch] $NoSupervisor,
     [switch] $SkipInstrument,
+    # Comma-separated .NET Windows services (outside IIS) to instrument, e.g. 'cxworkersvc,billing'.
+    # Also readable from CX_DOTNET_SERVICE_NAMES so a fleet can set it per host without threading a
+    # flag through deploy.bat. Deliberately opt-in: unlike Node services, which are discovered by
+    # their command line, "every .NET service on this box" includes Windows' own services, and
+    # attaching a CLR profiler to those is not a decision a deploy script should make unprompted.
+    [string] $DotNetServices    = $null,
     [string] $InstrumentVersion = 'v1.16.0-beta.1'
 )
 
@@ -201,6 +207,42 @@ try {
         Write-Host "[agent] PM2 detected but -SkipInstrument set; skipping instrumentation"
     } else {
         Write-Host "[agent] PM2 not detected; skipping Node.js zero-code instrumentation"
+    }
+
+    # -- 3c. Windows services outside IIS and outside PM2 ------------------------
+    # Node started by the SCM with no PM2, and .NET services that are not hosted by IIS. Both were
+    # out of scope until now, and both are silent on a host that reports a fully successful install:
+    # the IIS path only reaches w3wp, and the PM2 path only reaches apps a daemon manages.
+    #
+    # Node services are DISCOVERED (the instrumenter enumerates services whose command line runs
+    # node.exe, excluding PM2's own). .NET services are NOT: "every .NET service on the box"
+    # includes Windows' own, and attaching a profiler to those is not a decision a deploy script
+    # should take by itself - so they must be named explicitly via CX_DOTNET_SERVICES.
+    if (-not $SkipInstrument) {
+        $nodeSvcScript = Join-Path $here 'Instrument-NodeService.ps1'
+        if (Test-Path $nodeSvcScript) {
+            Write-Host "[agent] checking for Node.js Windows services (no PM2) ..."
+            & $nodeSvcScript
+            # Exit 1 means at least one service was refused with a reason, which is information, not
+            # a reason to fail the whole install - the reasons are already printed.
+            $status.nodeServiceInstrumented = ($LASTEXITCODE -eq 0)
+        }
+
+        $dotnetSvcScript = Join-Path $here 'Instrument-DotNetService.ps1'
+        $dotnetSvcNames  = @()
+        foreach ($src in @($DotNetServices, $env:CX_DOTNET_SERVICE_NAMES)) {
+            if ($src) { $dotnetSvcNames += @(($src -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        }
+        $dotnetSvcNames = @($dotnetSvcNames | Sort-Object -Unique)
+        if ((Test-Path $dotnetSvcScript) -and $dotnetSvcNames.Count) {
+            Write-Host "[agent] instrumenting .NET Windows service(s): $($dotnetSvcNames -join ', ')"
+            & $dotnetSvcScript -Services $dotnetSvcNames
+            $status.dotnetServiceInstrumented = ($LASTEXITCODE -eq 0)
+        } elseif ($dotnetSvcNames.Count) {
+            Write-Warning "[agent] .NET services requested ($($dotnetSvcNames -join ', ')) but Instrument-DotNetService.ps1 is missing from the payload"
+        } else {
+            Write-Host "[agent] no .NET Windows services requested (-DotNetServices / CX_DOTNET_SERVICE_NAMES); skipping"
+        }
     }
 
     # -- 4. Restart collector to pick up OTEL_RESOURCE_ATTRIBUTES ----------------
