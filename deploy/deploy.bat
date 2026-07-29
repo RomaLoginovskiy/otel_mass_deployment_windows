@@ -9,6 +9,13 @@ REM  version the .NET auto-instrumentation module requires) with the execution
 REM  policy bypassed for this process only, and propagates the exit code so
 REM  BatchPatch marks the row failed on any error.
 REM
+REM  Run by hand instead of through BatchPatch? Every Install-Agent.ps1 flag can be
+REM  passed straight through:
+REM      deploy.bat -Domain eu2.coralogix.com -KeyFile C:\secrets\SendDataKey.txt
+REM      deploy.bat -Region eu2 -Environment staging
+REM  Arguments and the environment variables below are EXCLUSIVE: typing any argument
+REM  skips the env-var block entirely (see the note above the block for why).
+REM
 REM  Optional: set the key and/or the deployment environment out-of-band before
 REM  running instead of shipping SendDataKey.txt, e.g. in the BatchPatch remote
 REM  command:
@@ -84,7 +91,25 @@ REM the two apart (same "read it, do not flag it" pattern as CX_RUNTIME_OVERRIDE
 REM CX_DOMAIN is the flagged form that exists precisely because CORALOGIX_DOMAIN cannot be
 REM one: nothing we install ever persists CX_DOMAIN machine-wide, so its presence is
 REM unambiguously a decision made for THIS run and needs no leftover comparison.
+REM
+REM Two ways in, and they are mutually exclusive by design (same shape as doctor.bat):
+REM
+REM   deploy.bat -Domain eu2.coralogix.com -KeyFile C:\k.txt
+REM                                     command-line args win; env vars ignored
+REM   set CX_DOMAIN=eu2.coralogix.com && deploy.bat
+REM                                     for BatchPatch, which generally cannot pass
+REM                                     arguments to a remote command
+REM
+REM They must NOT be combined into one invocation. Passing -Domain twice is not "last
+REM one wins" - PowerShell fails parameter binding outright ("parameter 'Domain' is
+REM specified more than once"), the script never runs, and BatchPatch shows a red row
+REM with no diagnostics at all. So if any argument was typed, the env-var block is
+REM skipped entirely. Note the arguments go to Install-Agent.ps1, which accepts -Region
+REM and -Domain but ALSO -KeyFile / -Application / -InstrumentVersion that no env var
+REM below exposes; run `powershell -File Install-Agent.ps1 -?` for the full set.
 set ARGS=
+if not "%~1"=="" goto :runargs
+
 if defined CORALOGIX_PRIVATE_KEY set ARGS=%ARGS% -PrivateKey "%CORALOGIX_PRIVATE_KEY%"
 if defined CX_REGION set ARGS=%ARGS% -Region "%CX_REGION%"
 if defined CX_DOMAIN set ARGS=%ARGS% -Domain "%CX_DOMAIN%"
@@ -92,7 +117,8 @@ if defined CX_ENVIRONMENT set ARGS=%ARGS% -Environment "%CX_ENVIRONMENT%"
 if defined CX_NO_SUPERVISOR set ARGS=%ARGS% -NoSupervisor
 if defined CX_SKIP_INSTRUMENT set ARGS=%ARGS% -SkipInstrument
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1"%ARGS%
+:runargs
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1"%ARGS% %*
 
 set "RC=%ERRORLEVEL%"
 echo deploy.bat exit code: %RC%
