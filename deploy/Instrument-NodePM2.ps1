@@ -292,7 +292,11 @@ foreach ($r in $svcMap) {
     # Merge, never replace: an app that already sets NODE_OPTIONS for its own reasons (a heap
     # limit, TLS behaviour, ICU data) must keep those flags. A prior bootstrap of ours is dropped
     # so re-running cannot load the SDK twice.
-    $appNodeOptions = Merge-CxNodeOptions -Existing $r.NodeOptions -Bootstrap $appNodeOptions
+    # Both artifacts are declared as ours so a re-run cannot leave a stale hook behind: an app that
+    # switches from ESM to CommonJS produces a bootstrap mentioning only register.js, and the ESM
+    # loader would otherwise survive every future re-deploy.
+    $ownedTargets = @($registerPath, $(if ($esmSupported) { $hookUrl })) | Where-Object { $_ }
+    $appNodeOptions = Merge-CxNodeOptions -Existing $r.NodeOptions -Bootstrap $appNodeOptions -OwnedTargets $ownedTargets
     $flag = if ($r.IsEsm) { 'esm+hook' } else { '--require' }
     Write-Host ("  {0,-24} mode={1,-13} instances={2} {3,-9} -> OTEL_SERVICE_NAME={4}" -f `
         $r.Name, $r.ExecMode, $r.Instances, $flag, $r.ServiceName)
