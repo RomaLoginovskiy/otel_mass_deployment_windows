@@ -71,14 +71,29 @@
   Logging variants are left at the IIS default here; Run-E2ELoop.ps1 mutates them
   through break-state.ps1 so each case is attributable to one change.
 
+.PARAMETER WwwRoot
+  Where the shape content is written. Default C:\sites, i.e. unchanged container behaviour.
+
+.PARAMETER NoWait
+  Return once the shapes are provisioned instead of sleeping forever. As a container ENTRYPOINT
+  this script has to keep PID 1 alive, but the VM harness runs the very same file over
+  guestcontrol and needs it to exit - and the shapes have to be defined in ONE place, or the
+  container matrix and the VM matrix drift apart while both look green.
+
 .NOTES
   Runs as ContainerAdministrator, so the elevation-gated paths execute without an
   interactive UAC prompt.
 #>
+[CmdletBinding()]
+param(
+    [string] $WwwRoot = 'C:\sites',
+    [switch] $NoWait
+)
+
 $ErrorActionPreference = 'Stop'
 Import-Module WebAdministration -ErrorAction Stop
 
-$wwwroot = 'C:\sites'
+$wwwroot = $WwwRoot
 New-Item -ItemType Directory -Path $wwwroot -Force | Out-Null
 
 # WebAdministration cannot edit an app pool's environmentVariables collection, so the
@@ -384,5 +399,6 @@ Write-Host '[e2e] IIS provisioned. NOT instrumented, no collector - that is depl
 Write-Host '[alive]'
 
 # Hold the container open. W3SVC keeps running; the loop drives everything else
-# from outside via docker exec.
-while ($true) { Start-Sleep -Seconds 3600 }
+# from outside via docker exec. Skipped under -NoWait, where the caller (the VM harness) needs
+# this to be a provisioning step that returns.
+if (-not $NoWait) { while ($true) { Start-Sleep -Seconds 3600 } }

@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <!--
+    A .NET Windows service that is NOT hosted by IIS - the target for
+    deploy\Instrument-DotNetService.ps1. Everything the existing tooling instruments lives under
+    w3wp, where the pool environment is the injection point; a service has no pool, so the profiler
+    env has to go into the service's own registry Environment value. This fixture is what proves
+    that path end to end.
+
+    Self-contained publish so the guest needs no matching SDK - only the runtime that ships with
+    the output.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AssemblyName>cxworkersvc</AssemblyName>
+    <RootNamespace>CxWorkerSvc</RootNamespace>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Lets the same binary run as a Windows service and from a console for debugging. -->
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
+    <!--
+      The Worker SDK does not bring IHttpClientFactory - only the Web SDK does. Without this the
+      build fails with CS0246 on IHttpClientFactory, and the outbound call is the entire reason this
+      fixture exists (it is what the profiler turns into a client span).
+    -->
+    <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>
