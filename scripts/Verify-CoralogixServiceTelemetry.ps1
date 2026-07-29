@@ -95,6 +95,16 @@ $MustBeSilent = Split-List $MustBeSilent
 
 if (-not $Services.Count -and -not $MustBeSilent.Count) { throw 'nothing to check: pass -Services and/or -MustBeSilent' }
 
+# -HostName is REQUIRED, not advisory. This account also carries unrelated hosts (a production
+# Windows host in another tenant, a long-lived reference VM, Kubernetes collectors), and an
+# unscoped query answers from all of them: a positive gate would pass on someone else's spans, and
+# a "must be silent" gate would fail because a DIFFERENT host legitimately runs that service name.
+# Excluding other hosts is not a nicety here - it is the difference between testing this VM and
+# testing the account.
+if (-not $HostName) {
+    throw 'a -HostName is required: an unscoped query answers from every host in the account, so neither a positive nor a negative gate would mean anything about the host under test.'
+}
+
 $endISO   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 $startISO = (Get-Date).ToUniversalTime().AddMinutes(-$LookbackMinutes).ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 
@@ -139,19 +149,21 @@ function Get-HostFilter {
 function Get-SpanCount {
     param([string] $Svc)
     $hf = Get-HostFilter
+    # No unscoped fallback. An earlier version fell back to a host-wide query when the scoped one
+    # returned nothing, which quietly reintroduced every other host in the account.
     return (Get-Hits -Queries @(
         "source spans | filter `$l.serviceName == '$Svc'$hf | limit 500",
-        "source spans | filter `$d.serviceName == '$Svc'$hf | limit 500",
-        # Unscoped last: better a host-wide answer than none, and the tier/query used is printed.
-        "source spans | filter `$l.serviceName == '$Svc' | limit 500"
+        "source spans | filter `$d.serviceName == '$Svc'$hf | limit 500"
     ))
 }
 
 function Get-LogCount {
     param([string] $Svc)
+    # Log records carry the host as applicationname (LOWERCASE here, unlike the camelCase span
+    # label) and the service as subsystemname.
+    $u = $HostName.ToUpperInvariant()
     return (Get-Hits -Queries @(
-        "source logs | filter `$l.subsystemname == '$Svc' | limit 200",
-        "source logs | filter `$l.applicationname == '$Svc' | limit 200"
+        "source logs | filter `$l.subsystemname == '$Svc' && (`$l.applicationname == '$u' || `$l.applicationname == '$HostName') | limit 200"
     ))
 }
 
