@@ -839,6 +839,8 @@ Full finding reference: [`agent-diagnostics.md`](agent-diagnostics.md).
 | Service won't start | Base config needs `file_storage` → installer must pass `-EnableDynamicIISParsing` (it does). Run `validate`. Confirm `CORALOGIX_PRIVATE_KEY` set on the service. |
 | Agent not in Fleet Management | Supervisor can't reach OpAMP: check `CORALOGIX_DOMAIN`/key, and that the **base config has no opamp extension**. |
 | Selector attributes (`cx.host.role`/`workload.*`) not shown in Fleet Management | They must be in the **Supervisor** config `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` (the vendor template writes only static `service.name`/`cx.agent.type`). `Install-CoralogixSupervisor.ps1` injects them post-install + restarts `opampsupervisor`. If still absent: detection didn't run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed the `non_identifying_attributes:` anchor. Re-run deploy, or patch `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml` + restart. |
+| `opampsupervisor` will not start after a config edit — `StartServiceFailed`, and the Application log (source `opampsupervisor`) says `could not compose initial merged config: yaml: line NN: found unknown escape character` | A selector attribute value contains a **backslash** (`workload.pm2.home=C:\ProgramData\pm2`, `workload.pm2.owner=NT AUTHORITY\LocalService`). The supervisor re-serializes AgentDescription values into the merged config **without escaping them** and parses that text a second time, so one level of backslash escaping is consumed per pass. Every backslash must therefore be **doubled in the YAML value**: `workload.pm2.home: 'C:\\ProgramData\\pm2'` (or `"C:\\\\ProgramData\\\\pm2"`). Measured on a real supervisor — see the table below. `Install-CoralogixSupervisor.ps1` now emits this form and re-quotes non-conforming values it finds, so a re-deploy repairs the host; to fix by hand, double the backslashes and restart. |
+| Selector attribute value looks mangled in Fleet Management (`NT AUTHORITY` + junk + `ocalService`) rather than missing | Same root cause as above, on the *benign* side of it: when the character after the backslash happens to be a valid YAML escape the second parse succeeds and silently rewrites the value (`\L` → U+2028 LINE SEPARATOR, `\b` → backspace, `\t` → tab). The service starts, so nothing reports a problem. The fix is identical — double the backslashes. This is why the installer re-quotes values whose backslashes are not doubled even when the service is healthy. |
 | No IIS telemetry | Run `doctor.bat`. `POOL_NOT_NO_MANAGED_CODE` → the ASP.NET Core pool is not "No Managed Code"; recycle after fixing. `PROFILER_NOT_REGISTERED` → `Register-OpenTelemetryForIIS` never ran on this host. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `localhost` resolves to `::1` first and export is silently dropped; use `127.0.0.1`. |
 | `CX_IIS_SERVICES` not set / Service ownership blank | Run `doctor.bat -Only env,iisServiceName,effectiveConfig`. `CX_IIS_SERVICES_MISSING` → `Instrument-IIS.ps1` never ran or was not elevated. `CX_IIS_SERVICES_DRIFT` → sites changed after instrumentation; re-run and restart the collector. `EFFECTIVE_PROCESSOR_MISSING`/`_NOT_WIRED` → the env var is fine but `transform/iis_service_labels` is absent from the **remote** Fleet config, so it is never stamped. |
 | Doctor says the config is unreadable, but the deploy plainly worked | `APPHOST_UNREADABLE` / `APPHOST_ACCESS_DENIED`. `appcmd` reaches the config through the IIS COM API; the diagnostics do a plain file read, so one can fail while the other works. Usual cause is **WOW64** — see [below](#wow64-32-bit-host-processes). Other causes and the one-liner that tells them apart: [`agent-diagnostics.md`](agent-diagnostics.md#apphost_unreadable-when-the-deployment-clearly-worked). |
@@ -850,5 +852,36 @@ Full finding reference: [`agent-diagnostics.md`](agent-diagnostics.md).
 | Collector crash-loops, health → 503, log `failed getting host cpuinfo: SMBIOS processor information not found` | Host has no SMBIOS Type 4 (VirtualBox / some VMs). The base drops `host.cpu.*`, but a **Fleet-Management remote config** that re-adds them (or the `system` detector) overrides the base and re-triggers it. Remove `host.cpu.*` from the *assigned remote config* too, or don't assign one. Real fleet hardware is unaffected. |
 | `guestcontrol` fails after unattended install (`guest execution service not ready`) | Guest still in first-boot/OOBE. GA run level can read 3 before the exec service is up; wait for the desktop (a first-boot reboot settles it), then poll `guestcontrol run … echo <token>` on **exit code 0**, not a string match. |
 | POC `Deploy`/`Configure` fails `Unknown option: -NoProfile` | Old `Run-TestVM.ps1` passed a bare `--` to `VBoxManage`; PowerShell strips it. Fixed to `'--'`. Update the script. |
+
+### Backslashes in AgentDescription values (measured)
+
+The supervisor parses its `config.yaml`, then **re-serializes** the AgentDescription values into
+the merged config text without escaping backslashes, and parses that text again. One level of
+backslash escaping is consumed per pass, so the quoting that looks right is the one that fails.
+
+Measured against a real `opampsupervisor` on a Windows VM (`poc\Run-SupervisorVmLoop.ps1`, guest
+`cx-fleet-test`) for `workload.pm2.home = C:\ProgramData\pm2` and
+`workload.pm2.owner = NT AUTHORITY\LocalService`:
+
+| In `config.yaml` | What the 2nd parse sees | Outcome |
+| --- | --- | --- |
+| `workload.pm2.home: "C:\\ProgramData\\pm2"` | `C:\ProgramData\pm2` → `\p` | **service dead** — `could not compose initial merged config: yaml: line 49: found unknown escape character` |
+| `workload.pm2.home: 'C:\ProgramData\pm2'` | same | **service dead** — identical error; single vs double quotes is not what saves you |
+| `workload.pm2.owner: "NT AUTHORITY\\LocalService"` | `\L` **is** an escape (U+2028) | starts, value **silently corrupted** to `NT AUTHORITY`+U+2028+`ocalService` |
+| `workload.pm2.home: 'C:\\ProgramData\\pm2'` | `C:\\ProgramData\\pm2` | **starts, value exact** ✅ |
+| `workload.pm2.home: "C:\\\\ProgramData\\\\pm2"` | same as above | starts, value exact (equivalent; less legible) |
+| `workload.pm2.home: "C:/ProgramData/pm2"` | no backslash | starts, but the value is slash-ified (lossy) |
+
+So the rule is neither "avoid double quotes" nor "make it valid YAML" — both are satisfied by
+forms that kill the service or mangle the value. It is: **every backslash in the YAML value must
+be doubled.** `Install-CoralogixSupervisor.ps1` emits that form
+(`ConvertTo-SupervisorAttrScalar`) and re-quotes any value it finds that does not conform, so a
+re-deploy repairs a host that an earlier version broke — a key that is already present would
+otherwise be skipped. `test\Test-SupervisorConfigWriter.ps1` pins the string rules; the VM loop
+proves the real binary accepts them.
+
+Verification that the value survived end-to-end, rather than merely that the service started:
+publish an attribute whose value contains both `\P` and `\L`, restart, and read it back out of
+`C:\ProgramData\opampsupervisor\state\effective.yaml`.
 
 See `iis-instrumentation.md` for deeper IIS and config detail.
