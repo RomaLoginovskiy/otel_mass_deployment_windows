@@ -351,6 +351,33 @@ if (Use-Check 'env') {
         Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_IIS_SERVICES' -Message $cxIisServices `
             -Data @{ value = $cxIisServices })
     }
+
+    # CX_SERVICES is what the collector's transform/iis_service_labels reads FIRST; the per-runtime
+    # variables are only its inputs. A host that publishes CX_NODE_SERVICES or CX_DOTNET_SERVICES but
+    # no union silently falls back to IIS names, so those services are never claimed by the host
+    # entity - the exact failure that looks like "APM has spans, Infra Explorer shows no ownership".
+    $cxServices = Get-MachineVar 'CX_SERVICES'
+    $unionSet = @(@($cxIisServices, (Get-MachineVar 'CX_NODE_SERVICES'), (Get-MachineVar 'CX_DOTNET_SERVICES')) |
+        Where-Object { $_ } | ForEach-Object { $_ -split ',' } | ForEach-Object { "$_".Trim() } |
+        Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+    if (-not $unionSet.Count) {
+        Add-F (New-Finding -Check 'env' -Severity 'info' -Target 'CX_SERVICES' `
+            -Message 'not set, and no IIS/Node/.NET service names are published either - nothing is instrumented on this host to claim')
+    } elseif (-not $cxServices) {
+        Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_MISSING' -Target 'CX_SERVICES' `
+            -Message "not set, but $($unionSet.Count) service name(s) are published across CX_IIS_SERVICES/CX_NODE_SERVICES/CX_DOTNET_SERVICES. The collector falls back to IIS names only, so non-IIS services are not claimed for host ownership. Re-deploy: Install-Agent.ps1 publishes the union." `
+            -Data @{ expected = $unionSet })
+    } else {
+        $haveSet = @($cxServices -split ',' | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+        if (Compare-Object -ReferenceObject $unionSet -DifferenceObject $haveSet) {
+            Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_DRIFT' -Target 'CX_SERVICES' `
+                -Message "set to '$cxServices', which is not the union of the per-runtime variables ($($unionSet -join ',')) - a partial or stale deploy. Re-run the installer to republish it." `
+                -Data @{ cxServices = $haveSet; expected = $unionSet })
+        } else {
+            Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_SERVICES' -Message $cxServices `
+                -Data @{ value = $haveSet })
+        }
+    }
 } else {
     Add-F (New-Finding -Check 'env' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
 }
