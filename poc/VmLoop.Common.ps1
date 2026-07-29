@@ -154,15 +154,32 @@ function Wait-GuestReady {
 }
 
 function New-VmSnapshot {
+    <#
+      Take a snapshot of the VM under test.
+
+      NOT --live, and that was measured the hard way. `snapshot take --live` on a running guest put
+      both VMs into VMState="livesnapshotting" on this host and left them there: no snapshot ever
+      appeared, nothing was being written, and `guestcontrol` stopped answering for as long as the
+      state persisted - so the harness's own P0 killed its own transport. Worse, interrupting the
+      VBoxManage client mid-operation left the machine XML <inaccessible>, which is only recoverable
+      by unregistering and re-cloning.
+
+      So: pause, snapshot, resume. The guest is frozen for a few seconds instead of being asked to
+      snapshot itself while running.
+    #>
     param([string] $SnapshotName, [switch] $IfMissing)
 
     $existing = @(VBoxSoft snapshot $script:VmlName list --machinereadable) -join "`n"
     if ($IfMissing -and $existing -match ('SnapshotName[^=]*="' + [regex]::Escape($SnapshotName) + '"')) {
         return $false    # already there, nothing taken
     }
-    # A live snapshot of a running VM is fine for our purposes and avoids a stop/start cycle.
-    VBoxSoft snapshot $script:VmlName take $SnapshotName --live | Out-Null
-    return $true
+
+    $wasRunning = Test-VmRunning
+    if ($wasRunning) { VBoxSoft controlvm $script:VmlName pause | Out-Null; Start-Sleep -Seconds 2 }
+    VBoxSoft snapshot $script:VmlName take $SnapshotName | Out-Null
+    $ok = ($LASTEXITCODE -eq 0)
+    if ($wasRunning) { VBoxSoft controlvm $script:VmlName resume | Out-Null }
+    return $ok
 }
 
 function Restore-VmSnapshot {

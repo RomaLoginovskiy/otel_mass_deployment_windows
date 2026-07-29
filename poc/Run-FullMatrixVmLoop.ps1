@@ -80,6 +80,9 @@ param(
     [string]   $HostRename    = $null,     # empty = derive from the VM name
     [switch]   $SkipReboot,
     [switch]   $KeepState,
+    # Take a 'matrix-clean' snapshot in P0. Off by default: see New-VmSnapshot in VmLoop.Common.ps1
+    # for why snapshotting a running guest is the riskiest thing this harness can do on this host.
+    [switch]   $TakeSnapshot,
     [int]      $IngestWaitSeconds = 240
 )
 
@@ -183,7 +186,15 @@ try {
         Write-Host '  guest already carries the expected name'
     }
 
-    if (-not $KeepState) { [void](New-VmSnapshot -SnapshotName 'matrix-clean' -IfMissing) }
+    # Opt-in, not default. A snapshot here is a convenience for re-running phases, but taking one
+    # is the single most dangerous thing this phase can do: on this host it wedged the guest and
+    # then corrupted its machine registration (see New-VmSnapshot). The matrix does not need it.
+    if ($TakeSnapshot) {
+        $snapOk = New-VmSnapshot -SnapshotName 'matrix-clean' -IfMissing
+        Assert-True 'baseline snapshot taken (or already present)' ([bool]$snapOk) 'snapshot failed - continuing without one'
+        Assert-True 'guest still answers after snapshotting' (Wait-GuestReady -TimeoutSeconds 300) `
+            'the snapshot left the VM in a state where guestcontrol does not answer'
+    }
 
     # A clone of a host that already had the agent is not a clean baseline. Uninstall first so P3
     # is a real install rather than an upgrade over whatever the image happened to carry.
