@@ -17,15 +17,27 @@
   supply the key at deploy time (BatchPatch env var CORALOGIX_PRIVATE_KEY, or drop
   SendDataKey.txt on each host). The .example placeholder is never shipped.
 
+.PARAMETER Region
+  Coralogix region code (eu1, eu2, us1, us2, us3, ap1, ap2, ap3) to bake into the
+  package as region.txt. Install-Agent.ps1 falls back to that file when no -Region /
+  -Domain / CX_REGION is supplied at deploy time, so BatchPatch's remote command can
+  stay a bare 'deploy.bat' on a non-eu1 fleet. The region MUST match the account the
+  key belongs to: a key from another region authenticates nowhere while every host
+  still reports healthy. Omit to build a region-neutral package.
+
 .PARAMETER OutFile
   Output zip path. Default: .\coralogix-agent-deploy.zip
 
 .EXAMPLE
   .\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx.key
+
+.EXAMPLE
+  .\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx.key -Region eu2
 #>
 [CmdletBinding()]
 param(
     [string] $KeyFile = $null,
+    [string] $Region  = $null,
     [string] $OutFile = (Join-Path $PSScriptRoot 'coralogix-agent-deploy.zip')
 )
 
@@ -44,9 +56,9 @@ if (-not (Test-Path $deployDir)) { throw "deploy/ folder not found at $deployDir
 $required = @('deploy.bat','uninstall.bat','doctor.bat','Resolve-IISLogPaths.ps1',
               'Install-Agent.ps1','Uninstall-Agent.ps1',
               'Install-CoralogixSupervisor.ps1','Detect-Workloads.ps1',
-              'Instrument-IIS.ps1','Resolve-IISServiceNames.ps1',
+              'Instrument-IIS.ps1','Resolve-IISServiceNames.ps1','Resolve-IISAppRuntime.ps1',
               'Instrument-NodePM2.ps1','Resolve-NodeServiceNames.ps1',
-              'Backup-Config.ps1','Write-DeployLog.ps1',
+              'Backup-Config.ps1','Write-DeployLog.ps1','Resolve-CxRegion.ps1',
               'Test-Agent.ps1','Test-IISInstrumentation.ps1','Test-NodeInstrumentation.ps1',
               'config.supervisor.yaml')
 foreach ($r in $required) {
@@ -68,6 +80,18 @@ try {
         Write-Host "[build] included SendDataKey.txt from $KeyFile"
     } else {
         Write-Warning "[build] no -KeyFile: package built WITHOUT a key. Supply CORALOGIX_PRIVATE_KEY at deploy time or drop SendDataKey.txt on each host."
+    }
+
+    # Region: validated HERE, at build time, against the same table the installer uses.
+    # A typo caught now costs a rebuild; the same typo shipped in region.txt fails on
+    # every target host instead.
+    if ($Region) {
+        . (Join-Path $deployDir 'Resolve-CxRegion.ps1')
+        $regionDomain = Resolve-CxDomain -Region $Region   # throws on an unknown code
+        Set-Content -Path (Join-Path $stage 'region.txt') -Value $Region.Trim().ToLowerInvariant() -Encoding utf8 -NoNewline
+        Write-Host "[build] included region.txt -> $Region (domain $regionDomain)"
+    } else {
+        Write-Host "[build] no -Region: package is region-neutral. Hosts use CX_REGION / CORALOGIX_DOMAIN at deploy time, or the eu1 default."
     }
 
     if (Test-Path $OutFile) { Remove-Item $OutFile -Force }

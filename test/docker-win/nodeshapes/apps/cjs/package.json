@@ -1,0 +1,7 @@
+{
+  "name": "cx-app-cjs",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "//": "No \"type\" field => CommonJS. Test-CxNodeAppIsEsm must read this and choose --require."
+}

@@ -188,9 +188,13 @@ Register-OpenTelemetryForIIS
 > This maps to what happened on the call: import the module, install core, then register IIS. The early errors ("could not find path to OpenTelemetry") came from running the register step before the module and core files were in place.
 > 
 
-### 2. ASP.NET Core app pools need "No Managed Code"
+### 2. "No Managed Code" is for ASP.NET Core pools only
 
-For ASP.NET Core apps hosted in IIS, set the application pool's .NET CLR Version to "No Managed Code". If this is wrong, no telemetry is generated at all. .NET Framework apps do not need this. This is the practical difference behind the Framework versus Core confusion during the session.
+For ASP.NET Core apps hosted in IIS, set the application pool's .NET CLR Version to "No Managed Code". Microsoft's own wording is that this is *"optional but recommended"*: the app runs and reports either way, but a managed-CLR pool loads a desktop CLR that nothing in a Core app uses. The doctor reports the mismatch as `POOL_NOT_NO_MANAGED_CODE` (warn) and the app is still instrumented.
+
+> **Do not apply this to an ASP.NET Framework pool.** "No Managed Code" means IIS does not load the .NET Framework CLR into the worker process, so a Framework app's managed handlers cannot be created and **IIS fails every request** with 500.21. That is an outage, not a telemetry gap. Framework pools need `v4.0`. Reported as `FRAMEWORK_POOL_NO_MANAGED_CLR`.
+
+The setting is a property of the **pool**, not of the application, so it never decides on its own whether an app can be instrumented. `Instrument-IIS.ps1` classifies each application first — ASP.NET Core, ASP.NET Framework, non-.NET, or undeterminable — and only then judges the pairing. A static site, a PHP or Node app behind IIS, or a URL-Rewrite reverse proxy is skipped entirely and excluded from `CX_IIS_SERVICES`, because .NET auto-instrumentation produces nothing for it. See [agent-diagnostics.md](agent-diagnostics.md) → *"No Managed Code" does not mean unsupported* for the full matrix, the reverse-proxy distinction, and the `-RuntimeOverrides` escape hatch.
 
 ### 3. Point the apps at the collector and set a service name
 
@@ -462,7 +466,11 @@ zero counters means the problem is upstream of the connector, not in it. This is
 
 **"Could not find path to OpenTelemetry" or the module is not found.** The register or install step ran before the module was imported or the core files were installed. Run the steps in order: download, `Import-Module`, `Install-OpenTelemetryCore`, then `Register-OpenTelemetryForIIS`.
 
-**No telemetry from an ASP.NET Core app.** The app pool is probably not set to "No Managed Code". Fix the pool and recycle it. Reported per app as `POOL_NOT_NO_MANAGED_CODE`, naming the pool. If that passes and there is still nothing, look for `PROFILER_NOT_REGISTERED` (the register step never ran on this host), `PROFILER_PATH_MISSING` (the profiler DLL the registry points at was deleted — IIS starts and emits nothing), and `OTLP_ENDPOINT_LOCALHOST`.
+**No telemetry from an ASP.NET Core app.** Look for `PROFILER_NOT_REGISTERED` (the register step never ran on this host), `PROFILER_PATH_MISSING` (the profiler DLL the registry points at was deleted — IIS starts and emits nothing), and `OTLP_ENDPOINT_LOCALHOST` first: those are the ones that produce silence. `POOL_NOT_NO_MANAGED_CODE` is worth fixing but is **not** the cause of total silence — the app reports from a managed-CLR pool too.
+
+**An app is reported as `NON_DOTNET_APP_NOT_INSTRUMENTED` and you expected telemetry.** The classifier found neither `<aspNetCore>` nor classic ASP.NET configuration for it. Usual causes: the publish output is incomplete (no `web.config`, so IIS is not routing to ANCM either and the app is not serving), the site really is static or a reverse proxy, or the app is a child of a parent whose `<location inheritInChildApplications="false">` stops `<aspNetCore>` flowing down. If the detection is genuinely wrong, force it with `-RuntimeOverrides` — and pass the same override to the doctor.
+
+**An ASP.NET Framework app returns 500.21 after a "fix".** Its pool was set to "No Managed Code". That is correct for ASP.NET Core and breaks Framework apps outright. Set the pool back to `v4.0`.
 
 **Endpoint fixed centrally but the pools still export nowhere.** A pool with its own `<environmentVariables>` block **replaces** `applicationPoolDefaults` rather than merging with it, and IIS copies the defaults into that block the first time `appcmd` writes any variable to the pool. That copy never refreshes, so later edits to the defaults never reach an already-instrumented pool. Reported as `POOL_ENV_STALE`; fix by re-running `Instrument-IIS.ps1` and recycling the pool. (See Part 4, "Where the variables can live, and what wins".)
 

@@ -4,7 +4,7 @@ exporters:
     application_name_attributes:
     - cx.application.name
     - service.namespace
-    domain: app.coralogix.in
+    domain: ${env:CORALOGIX_DOMAIN:-app.coralogix.in}   # region from the installer's env var; a literal here would override it
     domain_settings:
       keepalive:
         enabled: true
@@ -39,7 +39,7 @@ exporters:
     timeout: 30s
   coralogix/resource_catalog:
     application_name: resource
-    domain: app.coralogix.in
+    domain: ${env:CORALOGIX_DOMAIN:-app.coralogix.in}   # region from the installer's env var; a literal here would override it
     logs:
       headers:
         X-Coralogix-Distribution: helm-otel-standalone/0.0.43

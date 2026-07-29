@@ -110,6 +110,14 @@ BatchPatch has no atomic "copy + run" object, so we ship one folder and one
    - **Option A (key in package):** `deploy.bat`
    - **Option B (key at deploy time):**
      `set CORALOGIX_PRIVATE_KEY=cxtp_xxx && deploy.bat`
+   - **Region (required unless your account is in eu1):** prepend
+     `set CX_REGION=<eu1|eu2|us1|us2|us3|ap1|ap2|ap3> &&`, e.g.
+     `set CX_REGION=eu2 && set CORALOGIX_PRIVATE_KEY=cxtp_xxx && deploy.bat`.
+     Or bake it into the package once — `Build-DeploymentPackage.ps1 -Region eu2`
+     writes `region.txt` and the remote command stays a bare `deploy.bat`.
+     The region must match the account the key belongs to: a key from another region
+     authenticates nowhere, and the host still reports healthy while sending nothing.
+     For a private ingress domain use `set CORALOGIX_DOMAIN=<domain>` instead.
    - **Environment label (optional, combine with either):** prepend
      `set CX_ENVIRONMENT=<production|staging|dev> &&` to tag this host's telemetry
      for the Coralogix per-environment split (see *Environment labeling* below), e.g.
@@ -322,9 +330,19 @@ When detection reports IIS, the orchestrator runs `Instrument-IIS.ps1`:
   specific apps with `-ServiceNameOverrides @{ 'Site/api' = 'custom' }` or
   `-OverridesJson <path>` (see [Command & flag reference](#command--flag-reference)).
 
+Only apps whose runtime classifies as **ASP.NET Core or ASP.NET Framework** are named at all.
+Static sites, native/ISAPI handlers, PHP/Node/Java behind IIS, and URL-Rewrite reverse proxies
+are skipped and kept out of `CX_IIS_SERVICES` — .NET auto-instrumentation emits nothing for
+them, so claiming them would point Service ownership at telemetry that never arrives. An app
+the installer cannot classify is reported (`RUNTIME_UNKNOWN_NEEDS_OVERRIDE`) rather than
+guessed at; force it with `CX_RUNTIME_OVERRIDES_JSON`.
+
 Reminders from `iis-instrumentation.md`:
 - Requires **Windows PowerShell 5.1** (not 7).
-- ASP.NET **Core** app pools must be **"No Managed Code"** or they emit nothing.
+- **"No Managed Code" is a pool setting, and it is per-runtime.** Recommended for ASP.NET
+  **Core** pools (the app still reports without it — Microsoft calls it *"optional but
+  recommended"*), and **wrong for ASP.NET Framework** pools, where it stops the app serving
+  requests at all. Do not apply it fleet-wide.
 - A trailing blank line in the W3SVC `Environment` REG_MULTI_SZ prevents IIS start.
 
 > ⚠️ **`localhost` vs `127.0.0.1`.** The IPv4 literal above is deliberate: on a dual-stack
@@ -622,10 +640,13 @@ Set either/both/neither before the call; each is independent.
 | Env var | Maps to | Effect |
 | --- | --- | --- |
 | `CORALOGIX_PRIVATE_KEY` | `-PrivateKey` | Send-Your-Data key at deploy time (overrides a baked-in `SendDataKey.txt`). |
+| `CX_REGION` | `-Region` | Coralogix region: `eu1`, `eu2`, `us1`, `us2`, `us3`, `ap1`, `ap2`, `ap3` → domain `<region>.coralogix.com`, which becomes both the exporters' ingress and the OpAMP endpoint. Must match the account the key belongs to. An unknown code **fails** the install. |
+| `CORALOGIX_DOMAIN` | *(read directly, not flagged)* | Full ingress domain for a private / non-standard endpoint. `Install-CoralogixSupervisor.ps1` reads the variable itself and compares it with the machine-scope value, because a previous install persists this variable machine-wide: a value exported for this run is a decision, the identical inherited value is only a leftover. Forwarded as a flag it would look explicit either way and would outrank a baked-in `region.txt` forever. Same pattern as `CX_RUNTIME_OVERRIDES_JSON`. |
 | `CX_ENVIRONMENT` | `-Environment` | Stamps the deployment environment on all of this host's telemetry. |
 | `CX_APPLICATION` | `-Application` | Coralogix **application** name for this host. **Leave unset** to get the default: the application name falls back to the host's own name (`host.name`). Set it only to group several hosts under one application. |
 | `CX_NO_SUPERVISOR=1` | `-NoSupervisor` | Install the collector **without** the OpAMP Supervisor — the plain `otelcol-contrib` service, config authoritative on disk, no Fleet Management registration. See [Collector modes](#collector-modes-supervisor-or-not) below. |
 | `CX_SKIP_INSTRUMENT=1` | `-SkipInstrument` | Install the collector but leave IIS and Node alone. |
+| `CX_RUNTIME_OVERRIDES_JSON` | `-RuntimeOverridesJson` | Path to a JSON file forcing the runtime of IIS apps the installer cannot classify, e.g. `{ "Wallet/api": "AspNetCore", "Static/": "NonDotNet" }`. Read **directly** by `Instrument-IIS.ps1`, `Test-IISInstrumentation.ps1` and `Test-Agent.ps1` rather than passed as a flag, so the install and the diagnostics see the same file — if only one of them did, they would disagree about which apps belong in `CX_IIS_SERVICES` and report drift no re-run can clear. Keys are app identity (`Site/`, `Site/api`), **not** the service-name keys `-ServiceNameOverrides` uses. |
 
 ### Collector modes (supervisor or not)
 
@@ -691,6 +712,7 @@ Read-only. Changes nothing on the host; safe to run and re-run at any time.
 | `-EffectiveConfig` | string | `C:\ProgramData\opampsupervisor\state\effective.yaml` | Merged config to search for the processor. |
 | `-RequiredProcessors` / `-RequiredPipelines` | string[] | `transform/iis_service_labels` / `logs`,`logs/resource_catalog` | What must be present and wired. |
 | `-ServiceNameOverrides` / `-OverridesJson` | hashtable / string | empty | Must match what the install used, or every app reports false drift. |
+| `-RuntimeOverrides` / `-RuntimeOverridesJson` | hashtable / string | empty / `CX_RUNTIME_OVERRIDES_JSON` | Force an app's runtime. Must match the install for the same reason, but with a sharper failure: these decide `CX_IIS_SERVICES` membership, so a mismatch produces drift no re-run clears. Keyed by app identity (`Site/`, `Site/api`) — a different key space from `-ServiceNameOverrides`. |
 | `-HealthRetries` / `-HealthDelaySec` / `-TimeoutSec` | int | `3` / `5` / `8` | Health probe tuning (shorter than the installer's, which has just restarted the supervisor). |
 | `-ExpectedOtlpEndpoint` | string | `http://127.0.0.1:4318` | Endpoint apps should carry; anything containing `localhost` raises `OTLP_ENDPOINT_LOCALHOST`. |
 | `-BaseCollectorConfig` | string | `C:\Program Files\OpenTelemetry OpAMP Supervisor\collector.yaml` | Fallback config to search when the supervisor's effective config is absent. |
@@ -724,7 +746,8 @@ The single entry point `deploy.bat` invokes; runnable directly when not using Ba
 
 | Flag | Type | Default | Purpose |
 | --- | --- | --- | --- |
-| `-Domain` | string | `eu1.coralogix.com` | Coralogix region domain. |
+| `-Region` | string | `$null` | Coralogix region code (`eu1`/`eu2`/`us1`/`us2`/`us3`/`ap1`/`ap2`/`ap3`) → `<region>.coralogix.com`. Unknown code = hard error. |
+| `-Domain` | string | `$null` → see fallback chain | Full ingress domain, for a private endpoint. Wins over `-Region`. With neither flag: `CX_REGION` env → `CORALOGIX_DOMAIN` exported for this run → `region.txt` next to the scripts → the `CORALOGIX_DOMAIN` a previous install persisted → `eu1.coralogix.com`. |
 | `-KeyFile` | string | `$null` → `<scriptdir>\SendDataKey.txt` | File holding the Send-Your-Data key. |
 | `-PrivateKey` | string | `$null` | Key value; overrides `-KeyFile`. Prefer a secured file / BatchPatch env var. |
 | `-Environment` | string | `$null` | `deployment.environment.name` resource attribute (e.g. `production`). |
@@ -758,6 +781,8 @@ Invoked by the orchestrator on IIS hosts; runnable standalone.
 | `-NoReset` | switch | off | Skip the final `iisreset` (and pass `-NoReset` to `Register-OpenTelemetryForIIS`). |
 | `-ServiceNameOverrides` | hashtable | `@{}` | Rename apps, keyed by the auto-derived service name, e.g. `@{ 'Wallet/api' = 'wallet-api' }`. Merged over `-OverridesJson` if both are given. |
 | `-OverridesJson` | string | *(unset)* | Path to a JSON file of the same `{ autoName = overrideName }` shape. |
+| `-RuntimeOverrides` | hashtable | `@{}` | Force an app's **runtime** where detection cannot decide: `AspNetCore`, `AspNetFramework` or `NonDotNet`. Any other value fails the run rather than being ignored. Keyed by **app identity** — `'Wallet/'` for a root app, `'Wallet/api'` for a nested one — which is the string the doctor prints in its `Target` column, and **not** the service-name key space `-ServiceNameOverrides` uses (root apps differ by one trailing slash; the slash-less form is accepted as an alias). |
+| `-RuntimeOverridesJson` | string | `$env:CX_RUNTIME_OVERRIDES_JSON` | Path to a JSON file of `{ "Site/AppPath": "AspNetCore" }` pairs. The env-var default is what keeps the install and the diagnostics on the same classification. |
 | `-LocalArchive` | string | `$env:CX_OTEL_DOTNET_ARCHIVE` | Pre-staged `opentelemetry-dotnet-instrumentation-windows.zip`, passed to the vendor module as `-LocalPath`. See **Offline / proxied hosts** below. |
 | `-LocalModule` | string | `$env:CX_OTEL_DOTNET_MODULE` | Pre-staged `OpenTelemetry.DotNet.Auto.psm1`. |
 
@@ -792,7 +817,8 @@ Invoked by the orchestrator; documented for standalone supervisor installs.
 
 | Flag | Type | Default | Purpose |
 | --- | --- | --- | --- |
-| `-Domain` | string | `eu1.coralogix.com` | Coralogix region domain. |
+| `-Region` | string | `$null` | Region code → domain. Persisted as machine env var `CORALOGIX_DOMAIN`, which the base config's `coralogix` exporters read as `${env:CORALOGIX_DOMAIN:-eu1.coralogix.com}` and the vendor installer turns into the OpAMP endpoint. |
+| `-Domain` | string | `$null` → see fallback chain | Full ingress domain; wins over `-Region`. Fallbacks: `CX_REGION` env → `CORALOGIX_DOMAIN` exported for this run → `region.txt` → the persisted `CORALOGIX_DOMAIN` → `eu1.coralogix.com`. |
 | `-PrivateKey` | string | `$null` | Send-Your-Data key; if omitted, read from `-KeyFile`. |
 | `-KeyFile` | string | `<scriptdir>\SendDataKey.txt` | Key file (falls back to `..\SimpleWebApp\coralogix\SendDataKey.txt`). |
 | `-BaseConfig` | string | `<scriptdir>\config.supervisor.yaml` | Base config passed as `-SupervisorCollectorBaseConfig` (must have **no** `opamp` extension). |
@@ -845,7 +871,8 @@ Full finding reference: [`agent-diagnostics.md`](agent-diagnostics.md).
 | Service won't start | Base config needs `file_storage` → installer must pass `-EnableDynamicIISParsing` (it does). Run `validate`. Confirm `CORALOGIX_PRIVATE_KEY` set on the service. |
 | Agent not in Fleet Management | Supervisor can't reach OpAMP: check `CORALOGIX_DOMAIN`/key, and that the **base config has no opamp extension**. |
 | Selector attributes (`cx.host.role`/`workload.*`) not shown in Fleet Management | They must be in the **Supervisor** config `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` (the vendor template writes only static `service.name`/`cx.agent.type`). `Install-CoralogixSupervisor.ps1` injects them post-install + restarts `opampsupervisor`. If still absent: detection didn't run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed the `non_identifying_attributes:` anchor. Re-run deploy, or patch `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml` + restart. |
-| No IIS telemetry | Run `doctor.bat`. `POOL_NOT_NO_MANAGED_CODE` → the ASP.NET Core pool is not "No Managed Code"; recycle after fixing. `PROFILER_NOT_REGISTERED` → `Register-OpenTelemetryForIIS` never ran on this host. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `localhost` resolves to `::1` first and export is silently dropped; use `127.0.0.1`. `POOL_LOST_INHERITANCE` → the pool has its own `<environmentVariables>` and so never saw `applicationPoolDefaults`; re-run `deploy.bat` (the instrumenter writes the OTLP vars straight onto such pools) and recycle. |
+| No IIS telemetry | Run `doctor.bat`. `PROFILER_NOT_REGISTERED` → `Register-OpenTelemetryForIIS` never ran on this host. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `localhost` resolves to `::1` first and export is silently dropped; use `127.0.0.1`. `POOL_LOST_INHERITANCE` → the pool has its own `<environmentVariables>` and so never saw `applicationPoolDefaults`; re-run `deploy.bat` (the instrumenter writes the OTLP vars straight onto such pools) and recycle. `POOL_NOT_NO_MANAGED_CODE` is worth fixing but is **not** a cause of silence — a Core app reports from a managed-CLR pool too. |
+| A specific IIS app sends nothing | `NON_DOTNET_APP_NOT_INSTRUMENTED` → the classifier found neither `<aspNetCore>` nor classic ASP.NET config, so it is static, native, a non-.NET runtime behind IIS, or a reverse proxy; instrument the backend where it runs, or force the runtime with `CX_RUNTIME_OVERRIDES_JSON` if detection is wrong. `RUNTIME_UNKNOWN_NEEDS_OVERRIDE` → deliberately undecided; supply the override. `FRAMEWORK_POOL_NO_MANAGED_CLR` → the app is not merely uninstrumented, it is **down**: a .NET Framework app cannot run in a No-Managed-Code pool. Set that pool to `v4.0`. |
 | `CX_IIS_SERVICES` not set / Service ownership blank | Run `doctor.bat -Only env,iisServiceName,effectiveConfig`. `CX_IIS_SERVICES_MISSING` → `Instrument-IIS.ps1` never ran or was not elevated. `CX_IIS_SERVICES_DRIFT` → sites changed after instrumentation; re-run and restart the collector. `EFFECTIVE_PROCESSOR_MISSING`/`_NOT_WIRED` → the env var is fine but `transform/iis_service_labels` is absent from the **remote** Fleet config, so it is never stamped. |
 | Doctor says the config is unreadable, but the deploy plainly worked | `APPHOST_UNREADABLE` / `APPHOST_ACCESS_DENIED`. `appcmd` reaches the config through the IIS COM API; the diagnostics do a plain file read, so one can fail while the other works. Usual cause is **WOW64** — see [below](#wow64-32-bit-host-processes). Other causes and the one-liner that tells them apart: [`agent-diagnostics.md`](agent-diagnostics.md#apphost_unreadable-when-the-deployment-clearly-worked). |
 | Endpoint fixed centrally but hosts still export nowhere | `POOL_ENV_STALE`. A pool's own `<environmentVariables>` block replaces `applicationPoolDefaults` and is only a snapshot taken when the pool was first written — later changes to the defaults never reach it. Re-run `Instrument-IIS.ps1` and recycle the pool. |

@@ -169,7 +169,7 @@ exporters:
     application_name_attributes:
     - cx.application.name
     - service.namespace
-    domain: eu1.coralogix.com
+    domain: ${env:CORALOGIX_DOMAIN:-eu1.coralogix.com}   # region from the installer's env var; a literal here would override it
     domain_settings:
       keepalive:
         enabled: true
@@ -207,7 +207,7 @@ exporters:
         X-Coralogix-Distribution: helm-otel-standalone/0.0.42
   coralogix/resource_catalog:
     application_name: resource
-    domain: eu1.coralogix.com
+    domain: ${env:CORALOGIX_DOMAIN:-eu1.coralogix.com}   # region from the installer's env var; a literal here would override it
     logs:
       headers:
         X-Coralogix-Distribution: helm-otel-standalone/0.0.42

@@ -226,7 +226,12 @@ try {
                 Remove-PoolEnvEntry -Pool $p -Name 'OTEL_EXPORTER_OTLP_PROTOCOL'
             }
             try {
-                $svcMap = Get-IISServiceMap
+                # -SkipRuntimeClassification on purpose. Uninstall must clean up names written
+                # by ANY prior version of the installer, including ones it would no longer
+                # write today (before runtime classification, every dedicated-pool app was
+                # named - static sites included). Filtering here would strand exactly those.
+                # Removal is already ownership-checked by value, so being broad is safe.
+                $svcMap = Get-IISServiceMap -SkipRuntimeClassification
                 foreach ($r in @($svcMap)) {
                     if ($r.Scope -eq 'webconfig' -and $r.PhysicalPath) {
                         Remove-WebConfigServiceName -PhysicalPath $r.PhysicalPath | Out-Null
@@ -267,8 +272,21 @@ try {
 
     # -- 1b. Node.js / PM2 de-instrumentation ----------------------------------
     # Clear NODE_OPTIONS/OTEL_* off each PM2 app so its workers restart uninstrumented.
-    # Guard: manifest flag when available, else best-effort if pm2 is on PATH.
-    $nodeWasInstrumented = if ($manifest) { [bool]$manifest.nodeInstrumented } else { [bool](Get-Command pm2 -ErrorAction SilentlyContinue) }
+    # Guard: manifest flag when available, else best-effort.
+    #
+    # The best-effort probe deliberately does NOT rest on `Get-Command pm2`: where PM2 is hosted
+    # as a Windows service the CLI lives in C:\ProgramData\npm and is routinely off the PATH of
+    # the account running uninstall, so that test answers "no PM2 here" on precisely the hosts
+    # that have the most of it. Ask the topology instead, and fall back to the PATH check only if
+    # the helper is missing from this deploy directory.
+    $nodeWasInstrumented = $false
+    if ($manifest) {
+        $nodeWasInstrumented = [bool]$manifest.nodeInstrumented
+    } elseif (Get-Command Get-CxPm2Topology -ErrorAction SilentlyContinue) {
+        try { $nodeWasInstrumented = ((Get-CxPm2Topology).Hosting -ne 'none') } catch { }
+    } else {
+        $nodeWasInstrumented = [bool](Get-Command pm2 -ErrorAction SilentlyContinue)
+    }
     if ($nodeWasInstrumented -and (Get-Command Remove-NodeInstrumentation -ErrorAction SilentlyContinue)) {
         try {
             Write-Host "[uninstall] reverting Node.js/PM2 instrumentation ..."

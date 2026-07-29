@@ -39,6 +39,19 @@
   childNoWebConfig   add a child application under a site with NO web.config
   removeChildApp     undo childNoWebConfig (leave the site single-app again)
 
+  Runtime classification (the app decides, not the pool):
+  poolNoManagedCode    set a FRAMEWORK app's pool to No Managed Code - the mirror of
+                       poolManagedRuntime, and broken in the opposite direction
+  restorePoolRuntimeV4 undo poolNoManagedCode. Not interchangeable with
+                       restorePoolRuntime, which sets '' for a Core pool
+  webConfigStaticOnly  replace a web.config with static-content-only settings, so the
+                       file exists but configures no .NET runtime
+  webConfigFramework   put classic ASP.NET config on a No-Managed-Code pool WITHOUT
+                       touching the pool
+  binOnly              remove web.config and drop a bin\*.dll - deliberately ambiguous
+  seedStaleServiceName put OTEL_SERVICE_NAME on a pool the way a pre-classification
+                       installer would have, to test that a re-run REMOVES it
+
 .PARAMETER Site
   Which site the log and web.config cases act on. Default: shop
 #>
@@ -51,7 +64,9 @@ param(
                  'logDirCustom','restoreLogDir','logFormatIis','logDisabled',
                  'logCentralW3C','restoreLogCentral','clearLogSlots',
                  'webConfigRemove','webConfigMalformed','webConfigInherit',
-                 'webConfigRestore','childNoWebConfig','removeChildApp')]
+                 'webConfigRestore','childNoWebConfig','removeChildApp',
+                 'poolNoManagedCode','restorePoolRuntimeV4','webConfigStaticOnly',
+                 'webConfigFramework','binOnly','seedStaleServiceName')]
     [string] $Case,
     [string] $Pool = 'shop',
     [string] $Site = 'shop',
@@ -111,7 +126,12 @@ switch ($Case) {
     'restoreIisServices' {
         . C:\cx\deploy\Resolve-IISServiceNames.ps1
         $m = Get-IISServiceMap
-        $v = Get-IISServiceLabelValue -Map $m
+        # Must apply the SAME membership filter Instrument-IIS.ps1 uses, or this "restore"
+        # writes an over-claiming value: Test-Agent.ps1 then computes a narrower expected set,
+        # reports CX_IIS_SERVICES_DRIFT, and every later case in Run-DoctorTest.ps1 inherits it.
+        # A restore that leaves the host dirtier than it found it is worse than no restore.
+        $instr = @($m | Where-Object { @('AspNetCore','AspNetFramework') -contains $_.DotNetRuntime })
+        $v = Get-IISServiceLabelValue -Map $instr
         [Environment]::SetEnvironmentVariable('CX_IIS_SERVICES', $v, 'Machine')
         Write-Host "restored CX_IIS_SERVICES=$v"
     }
@@ -120,6 +140,72 @@ switch ($Case) {
         Import-Module WebAdministration
         Set-ItemProperty "IIS:\AppPools\$Pool" -Name managedRuntimeVersion -Value 'v4.0'
         Write-Host "pool '$Pool' managedRuntimeVersion=v4.0 (wrong for ASP.NET Core)"
+    }
+
+    # The MIRROR of poolManagedRuntime, for a .NET FRAMEWORK app. Same pool setting is correct
+    # in one direction and broken in the other, which is the whole point of classifying the app
+    # instead of reading the pool: with No Managed Code the CLR never loads, the managed
+    # handlers cannot be created, and IIS fails every request with 500.21.
+    'poolNoManagedCode' {
+        Import-Module WebAdministration
+        Set-ItemProperty "IIS:\AppPools\$Pool" -Name managedRuntimeVersion -Value ([string]::Empty)
+        Write-Host "pool '$Pool' managedRuntimeVersion='' (No Managed Code - wrong for ASP.NET Framework)"
+    }
+    # Undo for the case above. NOT the same as 'restorePoolRuntime', which sets '' because it
+    # restores a CORE pool - using it here would leave the Framework pool broken.
+    'restorePoolRuntimeV4' {
+        Import-Module WebAdministration
+        Set-ItemProperty "IIS:\AppPools\$Pool" -Name managedRuntimeVersion -Value 'v4.0'
+        Write-Host "pool '$Pool' managedRuntimeVersion=v4.0 (correct for ASP.NET Framework)"
+    }
+
+    # A web.config that EXISTS but configures no runtime. Undone by 'webConfigRestore'.
+    'webConfigStaticOnly' {
+        $p = Join-Path 'C:\inetpub' $Site
+        Set-Content -Path (Join-Path $p 'web.config') -Encoding utf8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <staticContent><mimeMap fileExtension=".woff2" mimeType="font/woff2" /></staticContent>
+  </system.webServer>
+</configuration>
+'@
+        Write-Host "site '$Site' web.config replaced with static-content-only (no .NET runtime)"
+    }
+
+    # Classic ASP.NET config on a pool left at No Managed Code - the misconfiguration detected
+    # WITHOUT touching the pool, which proves the verdict comes from the app, not the pool.
+    'webConfigFramework' {
+        $p = Join-Path 'C:\inetpub' $Site
+        Set-Content -Path (Join-Path $p 'web.config') -Encoding utf8 -Value @'
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.web>
+    <compilation targetFramework="4.8" />
+  </system.web>
+</configuration>
+'@
+        Write-Host "site '$Site' web.config replaced with classic ASP.NET (<system.web><compilation>)"
+    }
+
+    # Managed assemblies and no web.config: ambiguous on purpose. Undone by 'webConfigRestore'
+    # plus removing bin\ - the restore below handles the web.config, so remove bin here too if
+    # you need a clean revert.
+    'binOnly' {
+        $p = Join-Path 'C:\inetpub' $Site
+        Remove-Item -LiteralPath (Join-Path $p 'web.config') -Force -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path (Join-Path $p 'bin') -Force | Out-Null
+        Set-Content -Path (Join-Path $p 'bin\App.dll') -Encoding utf8 -Value 'presence is the signal'
+        Write-Host "site '$Site' web.config removed, bin\App.dll added (runtime ambiguous)"
+    }
+
+    # Simulate a host instrumented by a PRE-classification installer: a name sitting on the
+    # pool of an app that today would not be named at all. The installer must actively REMOVE
+    # it, not merely skip the app - skipping leaves the value on disk forever and the doctor
+    # keeps reporting a name nothing reports under.
+    'seedStaleServiceName' {
+        Set-PoolEnvVar -PoolName $Pool -Name 'OTEL_SERVICE_NAME' -Value $Site
+        Write-Host "pool '$Pool' seeded with OTEL_SERVICE_NAME=$Site (as an older installer would have left it)"
     }
     'restorePoolRuntime' {
         Import-Module WebAdministration

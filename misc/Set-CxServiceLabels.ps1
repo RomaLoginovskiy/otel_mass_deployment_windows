@@ -339,6 +339,100 @@ if ($overrides.Count -gt 0) {
 # Stage 1 - IIS discovery
 # ---------------------------------------------------------------------------------------------
 
+function Get-CxStandaloneAppRuntime {
+    <#
+      Which runtime is behind this IIS application - and can .NET OpenTelemetry automatic
+      instrumentation do anything for it?
+
+      Returns 'AspNetCore' | 'AspNetFramework' | 'NonDotNet' | 'Unknown'.
+
+      INLINED, not dot-sourced, because this script is deliberately standalone: it is the tool
+      you copy onto a host whose deploy package is missing or broken. That is the same trade
+      misc\Test-CxInstrumentation.ps1 makes. Keep the RULES here in step with
+      deploy\Resolve-IISAppRuntime.ps1 - if the two disagree, running this tool after the
+      installer silently re-introduces the over-claim it exists to repair.
+
+      Why this matters here specifically: this script's whole job is rebuilding
+      CX_IIS_SERVICES. Before classification it built the label from EVERY IIS application, so
+      running it on a host with a static Default Web Site put a service into the label that no
+      APM telemetry ever arrives for - and because the doctor compares the variable against
+      the apps it believes are instrumented, that drift could never clear.
+
+      Deliberately NOT reimplemented in full: no ancestor/<location> inheritance walk (a child
+      app inheriting <aspNetCore> from its parent classifies Unknown here, not AspNetCore).
+      That errs toward "leave it out of the label", which is the safe direction for a repair
+      tool - under-claiming loses an ownership item, over-claiming poisons it permanently.
+    #>
+    param([string] $PhysicalPath)
+
+    if (-not $PhysicalPath) { return 'Unknown' }
+
+    $wc  = Join-Path $PhysicalPath 'web.config'
+    $raw = $null
+    $absent = $false
+    try {
+        $raw = [System.IO.File]::ReadAllText($wc)
+    } catch [System.IO.DirectoryNotFoundException] {
+        return 'NonDotNet'          # the folder is gone; IIS cannot serve this app at all
+    } catch [System.IO.FileNotFoundException] {
+        $absent = $true
+    } catch {
+        return 'Unknown'            # ACL or similar - could not look, which is not "nothing there"
+    }
+
+    if (-not $absent) {
+        $x = $null
+        try { [xml]$x = $raw } catch { return 'Unknown' }   # malformed XML: unreadable, not absent
+
+        if ($x.SelectSingleNode('//aspNetCore')) { return 'AspNetCore' }
+
+        # POSITIVE .NET Framework evidence only - never the pool's managedRuntimeVersion. That
+        # attribute is absent by default and defaults to v4.0, so keying off it would classify
+        # every static site on DefaultAppPool as Framework.
+        $meaningful = @('compilation','httpHandlers','httpModules','authentication','authorization',
+                        'pages','sessionState','machineKey','globalization','customErrors',
+                        'membership','roleManager','profile','siteMap','webServices','trust','identity')
+        try {
+            foreach ($sw in @($x.SelectNodes('//system.web'))) {
+                foreach ($c in @($sw.ChildNodes)) {
+                    if ($c.NodeType -eq [System.Xml.XmlNodeType]::Element -and $meaningful -contains $c.LocalName) { return 'AspNetFramework' }
+                }
+            }
+            foreach ($n in @($x.SelectNodes('//system.webServer/handlers/add')) + @($x.SelectNodes('//system.webServer/modules/add'))) {
+                $t = [string]$n.GetAttribute('type')
+                if ($t -and $t -notmatch 'AspNetCoreModule') { return 'AspNetFramework' }
+                if (([string]$n.GetAttribute('path')) -match '\.(aspx|asmx|ashx|axd)$') { return 'AspNetFramework' }
+            }
+            if ($x.SelectSingleNode('//runtime/assemblyBinding') -or
+                $x.SelectSingleNode('//system.web.extensions') -or
+                $x.SelectSingleNode('//system.serviceModel')) { return 'AspNetFramework' }
+        } catch { return 'Unknown' }
+    }
+
+    # No decisive web.config evidence. Probe the app root - non-recursive, one level only.
+    try {
+        if (-not [System.IO.Directory]::Exists($PhysicalPath)) { return 'NonDotNet' }
+        foreach ($pat in @('Global.asax','*.aspx','*.asmx','*.ashx')) {
+            if (@([System.IO.Directory]::EnumerateFiles($PhysicalPath, $pat, [System.IO.SearchOption]::TopDirectoryOnly) | Select-Object -First 1).Count -gt 0) {
+                return 'AspNetFramework'
+            }
+        }
+        # Managed assemblies with nothing wiring them to a pipeline. NOT promoted to Framework:
+        # static sites carry stray bin folders and an out-of-process Core publish puts DLLs in
+        # the app root. Ambiguous is the honest answer.
+        $bin = Join-Path $PhysicalPath 'bin'
+        if ([System.IO.Directory]::Exists($bin) -and
+            @([System.IO.Directory]::EnumerateFiles($bin, '*.dll', [System.IO.SearchOption]::TopDirectoryOnly) | Select-Object -First 1).Count -gt 0) {
+            return 'Unknown'
+        }
+        if (@([System.IO.Directory]::EnumerateFiles($PhysicalPath, '*.runtimeconfig.json', [System.IO.SearchOption]::TopDirectoryOnly) | Select-Object -First 1).Count -gt 0) {
+            return 'Unknown'
+        }
+    } catch { return 'Unknown' }
+
+    return 'NonDotNet'
+}
+
 $iisRecords  = @()
 $iisPresent  = $false   # IIS is installed on this host
 $iisExpected = $false   # IIS is installed AND should have yielded names
@@ -399,12 +493,16 @@ if ($SkipIis) {
 
                     # Root application (virtual path '/') IS the site; Get-WebApplication returns
                     # only the non-root applications.
+                    $rootPhys = ''
+                    try { $rootPhys = [Environment]::ExpandEnvironmentVariables([string]$site.physicalPath) } catch {}
                     $iisRecords += [pscustomobject]@{
-                        Site        = $siteName
-                        AppPath     = '/'
-                        Pool        = [string]$site.applicationPool
-                        ServiceName = $siteName
-                        State       = [string]$site.State
+                        Site         = $siteName
+                        AppPath      = '/'
+                        Pool         = [string]$site.applicationPool
+                        ServiceName  = $siteName
+                        State        = [string]$site.State
+                        PhysicalPath = $rootPhys
+                        Runtime      = (Get-CxStandaloneAppRuntime -PhysicalPath $rootPhys)
                     }
 
                     $apps = @()
@@ -417,12 +515,20 @@ if ($SkipIis) {
                     }
                     foreach ($app in $apps) {
                         $appPath = [string]$app.path            # e.g. '/api'
+                        $phys    = [string]$app.PhysicalPath
+                        if (-not $phys) {
+                            $vdir = Get-WebVirtualDirectory -Site $siteName -Application $appPath.TrimStart('/') -Name '/' -ErrorAction SilentlyContinue
+                            if ($vdir) { $phys = [string]$vdir.PhysicalPath }
+                        }
+                        try { $phys = [Environment]::ExpandEnvironmentVariables($phys) } catch {}
                         $iisRecords += [pscustomobject]@{
-                            Site        = $siteName
-                            AppPath     = $appPath
-                            Pool        = [string]$app.applicationPool
-                            ServiceName = "$siteName$appPath"   # 'Wallet' + '/api' -> 'Wallet/api'
-                            State       = [string]$site.State
+                            Site         = $siteName
+                            AppPath      = $appPath
+                            Pool         = [string]$app.applicationPool
+                            ServiceName  = "$siteName$appPath"   # 'Wallet' + '/api' -> 'Wallet/api'
+                            State        = [string]$site.State
+                            PhysicalPath = $phys
+                            Runtime      = (Get-CxStandaloneAppRuntime -PhysicalPath $phys)
                         }
                     }
                 }
@@ -437,9 +543,16 @@ if ($SkipIis) {
                 }
 
                 Write-Step -Stage 'iis' -Level 'OK' -Message "$($iisRecords.Count) IIS application(s) across $($sites.Count) site(s)"
-                Write-Detail ("{0,-28} {1,-12} {2,-22} {3,-10} {4}" -f 'SITE','APPPATH','POOL','STATE','SERVICENAME')
+                Write-Detail ("{0,-28} {1,-12} {2,-22} {3,-10} {4,-16} {5}" -f 'SITE','APPPATH','POOL','STATE','RUNTIME','SERVICENAME')
                 foreach ($r in $iisRecords) {
-                    Write-Detail ("{0,-28} {1,-12} {2,-22} {3,-10} {4}" -f $r.Site, $r.AppPath, $r.Pool, $r.State, $r.ServiceName)
+                    Write-Detail ("{0,-28} {1,-12} {2,-22} {3,-10} {4,-16} {5}" -f $r.Site, $r.AppPath, $r.Pool, $r.State, $r.Runtime, $r.ServiceName)
+                }
+
+                $notDotNet = @($iisRecords | Where-Object { @('AspNetCore','AspNetFramework') -notcontains $_.Runtime })
+                if ($notDotNet.Count -gt 0) {
+                    Write-Step -Stage 'iis' -Level 'INFO' -Message "$($notDotNet.Count) application(s) excluded from the label: $(@($notDotNet | ForEach-Object { "$($_.ServiceName)[$($_.Runtime)]" }) -join ', ')" `
+                        -Cause 'CX_IIS_SERVICES advertises OpenTelemetry SERVICES, and .NET auto-instrumentation produces none for a static, native, PHP/Node, reverse-proxied or undeterminable app - claiming one would point Service ownership at telemetry that never arrives' `
+                        -Fix   'no action needed for static or proxied sites; if one of these IS a .NET app the detection missed, give it a web.config that declares <aspNetCore> or classic <system.web>'
                 }
 
                 foreach ($r in $iisRecords) {
@@ -460,7 +573,12 @@ if ($SkipIis) {
     }
 }
 
-$iisNames = @($iisRecords | ForEach-Object { $_.ServiceName } | Where-Object { $_ })
+# INSTRUMENTABLE apps only. Same membership rule as Instrument-IIS.ps1 and Test-Agent.ps1: a
+# name belongs in CX_IIS_SERVICES only if something actually reports under it. Including the
+# rest is what made this tool undo the installer's fix when it was run afterwards.
+$iisNames = @($iisRecords |
+    Where-Object { @('AspNetCore','AspNetFramework') -contains $_.Runtime } |
+    ForEach-Object { $_.ServiceName } | Where-Object { $_ })
 
 # ---------------------------------------------------------------------------------------------
 # Stage 2 - Node / PM2 discovery

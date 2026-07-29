@@ -25,12 +25,13 @@ flowchart LR
 | `docs/fleet-deployment.md` | Fleet-scale runbook: build a package, push with BatchPatch, Supervisor mode, workload detection → selector attributes, Fleet Management. |
 | `docs/agent-diagnostics.md` | **When something is wrong on a host.** Read-only diagnostics (`doctor.bat` / `Test-Agent.ps1` / the two instrumentation validators), graded exit codes, and what each finding means. |
 | `docs/iis-e2e-matrix.md` | The IIS shapes and log layouts the end-to-end loop covers — and **every layout that needs a fix or a non-default setting** before telemetry works. |
+| `docs/nodejs-windows-shape-matrix.md` | Every way **Node.js** runs on Windows — PM2 per-user, PM2 as a service under three different accounts, stopped daemon, bare `node.exe`, node-as-a-service, iisnode, IIS ARR → PM2 — which ones get zero-code telemetry, and which are reported out of scope rather than silently assumed. |
 | `deploy/` | The deployment package payload (see below). |
 | `Build-DeploymentPackage.ps1` | Zips `deploy/` into `coralogix-agent-deploy.zip`. |
 | `poc/` | VirtualBox harness to validate the package on a throwaway Windows Server 2025 VM before fleet rollout. |
 | `SimpleWebApp/` | A minimal ASP.NET Core 8 app (with a SQL Server call) used as an instrumentation target for testing. |
 | `scripts/` | Single-host / test helpers: `deploy-app.ps1` (build + zero-code instrument `SimpleWebApp` on IIS in one pass), `generate-load.ps1` (emit test traffic), and the operator-side `Verify-Coralogix*.ps1` server-side gates. See [`scripts/README.md`](scripts/README.md). |
-| `test/docker-win/` | Windows-container harnesses: the Coralogix E2E (IIS + PM2, and a RabbitMQ variant), the offline **asserting** diagnostics test `Run-DoctorTest.ps1`, and `Run-E2ELoop.ps1` — the full deploy loop over an 8-shape IIS host. See [`test/docker-win/README.md`](test/docker-win/README.md). |
+| `test/docker-win/` | Windows-container harnesses: the Coralogix E2E (IIS + PM2, and a RabbitMQ variant), the offline **asserting** diagnostics test `Run-DoctorTest.ps1`, and `Run-E2ELoop.ps1` — the full deploy loop over a 14-shape IIS host. Plus `test/Test-ResolveIISAppRuntime.ps1`, fixture-only unit tests for the app-runtime classification rules, and `test/Test-Pm2Topology.ps1`, the same for PM2 topology / service-hosted-daemon detection (no Docker, no IIS, no elevation, ~1s each). See [`test/docker-win/README.md`](test/docker-win/README.md). |
 | `deploy-linux/` | **Linux** path: OpAMP Supervisor install for Linux DB hosts (Redis/Valkey/PostgreSQL/Elasticsearch), managed via Fleet Management. See [`deploy-linux/README.md`](deploy-linux/README.md). |
 
 ## Two paths
@@ -47,17 +48,23 @@ Follow [`docs/iis-instrumentation.md`](docs/iis-instrumentation.md). In short:
    `Instrument-IIS.ps1` (or `deploy-app.ps1 -InstrumentAllApps`) auto-discovers every IIS
    site/app and sets a distinct `OTEL_SERVICE_NAME` per app from the site name + app path
    (root app → site name; nested `/api` → `Site/api`).
-4. ASP.NET **Core** pools must be **"No Managed Code"** or they emit nothing.
+4. **"No Managed Code" is a pool setting, not a verdict on the app.** It is recommended for
+   ASP.NET **Core** pools (they run on CoreCLR and never use the desktop CLR) and **wrong for
+   ASP.NET Framework** pools, where it stops the app running at all. `Instrument-IIS.ps1`
+   classifies each app's actual runtime first and skips what .NET auto-instrumentation cannot
+   help — static sites, PHP/Node behind IIS, reverse proxies — keeping them out of
+   `CX_IIS_SERVICES`. See [`docs/agent-diagnostics.md`](docs/agent-diagnostics.md).
 
 ### Fleet (scripted)
 
 Follow [`docs/fleet-deployment.md`](docs/fleet-deployment.md).
 
 ```powershell
-# 1. Build the package (from repo root). -KeyFile bakes the key in; -OutFile
-#    overrides the output path.
-.\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx-send-your-data.key
+# 1. Build the package (from repo root). -KeyFile bakes the key in; -Region bakes the
+#    Coralogix region in (region.txt); -OutFile overrides the output path.
+.\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx-send-your-data.key -Region eu2
 #    -> coralogix-agent-deploy.zip
+#    Region can also be chosen per host at deploy time: set CX_REGION=eu2 && deploy.bat
 
 # 2. Push with BatchPatch to a 2-3 host pilot, then the full fleet.
 #    Each host runs deploy.bat -> Install-Agent.ps1:
@@ -97,7 +104,7 @@ Fleet Management — same pattern as the Windows fleet path.
 # Copy the installer to the host, then run it with Fleet labels + DB credentials:
 sudo env \
   CORALOGIX_PRIVATE_KEY="<send-your-data-key>" \
-  CORALOGIX_DOMAIN="<region-domain>" \
+  CORALOGIX_REGION="eu2" \
   APP_TYPE="postgresql" \
   ENV_TYPE="prod" \
   POSTGRES_OTEL_PASSWORD="<otel_monitor_password>" \
@@ -125,8 +132,8 @@ that folder's README.
 | `Instrument-IIS.ps1` | Zero-code .NET auto-instrumentation, IIS hosts only. |
 | `Resolve-IISServiceNames.ps1` | Per-app `OTEL_SERVICE_NAME` mapping + `web.config` read/write helpers (dot-sourced by the install + uninstall scripts). |
 | `Resolve-IISLogPaths.ps1` | Discovers where IIS really writes access logs (custom `logFile.directory`, central W3C, non-W3C formats) and publishes `CX_IIS_LOG_DIR_n`, so sites logging outside the collector's default glob are not silently lost. |
-| `Instrument-NodePM2.ps1` | Zero-code Node instrumentation via per-app `NODE_OPTIONS`, PM2 hosts only. |
-| `Resolve-NodeServiceNames.ps1` | Per-app Node `OTEL_SERVICE_NAME` mapping helpers (dot-sourced by the install + uninstall scripts). |
+| `Instrument-NodePM2.ps1` | Zero-code Node instrumentation via per-app `NODE_OPTIONS`, PM2 hosts only. `-Apps` for a staged rollout, `-WhatIf` to see what would restart. Runs `pm2` as the daemon's owning account when PM2 is hosted as a Windows service. |
+| `Resolve-NodeServiceNames.ps1` | PM2 topology + per-app Node `OTEL_SERVICE_NAME` mapping helpers (dot-sourced by the detect, install, uninstall and doctor scripts). Finds a service-hosted PM2 daemon and its app set without being able to query it — see [`docs/nodejs-pm2-instrumentation.md`](docs/nodejs-pm2-instrumentation.md). |
 | `Backup-Config.ps1` | Backup + manifest helper; snapshots every config the install mutates before it changes it. |
 | `doctor.bat` | BatchPatch entry point for the read-only host diagnostic; propagates the graded exit code (`0` pass / `1` hard fail / `2` degraded). |
 | `Test-Agent.ps1` | Host doctor: env vars, per-app `OTEL_SERVICE_NAME` readback, services, health, export counters, OTLP ports, effective-config processor, plus the two instrumentation validators. `-Only` runs a subset. See [`docs/agent-diagnostics.md`](docs/agent-diagnostics.md). |
@@ -163,7 +170,11 @@ IIS zero-code instrumentation configured.
 
 - Windows 10/11 or Windows Server 2016+, Administrator access.
 - **Windows PowerShell 5.1** (the .NET auto-instrumentation module requires 5.1, not 7).
-- A Coralogix **Send-Your-Data API key** and your Coralogix **domain** (e.g. `eu1.coralogix.com`).
+- A Coralogix **Send-Your-Data API key** and the **region** the key belongs to
+  (`eu1`, `eu2`, `us1`, `us2`, `us3`, `ap1`, `ap2`, `ap3` — domain
+  `<region>.coralogix.com`). Pass it as `-Region` / `CX_REGION`, or bake it into the
+  package with `Build-DeploymentPackage.ps1 -Region`. Default is `eu1`; a key used
+  against the wrong region authenticates nowhere while the host still reports healthy.
 - IIS role installed if using the IIS receivers.
 
 > **Security:** never commit the Send-Your-Data key. The collector reads it from

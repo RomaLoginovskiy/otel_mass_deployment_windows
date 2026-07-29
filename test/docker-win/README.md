@@ -3,7 +3,8 @@
 | Harness | Kind | Runner | In git |
 | --- | --- | --- | --- |
 | **Diagnostics** | **Offline, self-asserting** — no keys, no network | `Run-DoctorTest.ps1` | ✅ |
-| **Full deploy loop** | Drives `deploy.bat` / `doctor.bat` over an 8-shape IIS host, injects faults | `Run-E2ELoop.ps1` | ✅ |
+| **Full deploy loop** | Drives `deploy.bat` / `doctor.bat` over a 14-shape IIS host, injects faults | `Run-E2ELoop.ps1` | ✅ |
+| **Runtime classification** | Fixture-only unit tests for the detection rules — no Docker, no IIS, ~1s | `test/Test-ResolveIISAppRuntime.ps1` | ✅ |
 | **IIS + supervisor E2E** (below) | Ships telemetry to Coralogix; human reads the verdict | `Run-DockerWinTest.ps1` | — |
 | **Node.js + PM2 variant** | Same image, PM2 apps added | `Run-DockerWinTest.ps1` + `scripts/Verify-CoralogixNodeSpans.ps1` | — |
 | **RabbitMQ variant** | Ships RabbitMQ metrics/logs | `Run-RabbitmqTest.ps1` | — |
@@ -17,8 +18,10 @@ build-and-run recipe for whoever recreates them locally — the `.gitignore` all
 exactly which files are tracked.
 
 > `Run-E2ELoop.ps1` is the only harness that exercises the **real** `deploy.bat` path
-> rather than re-implementing it. It found three defects in shipped scripts that the
-> offline diagnostics matrix could not — see
+> rather than re-implementing it. It found several defects in shipped scripts that the
+> offline diagnostics matrix could not — most recently that a static site on its own app
+> pool was named and claimed in `CX_IIS_SERVICES`, because naming was decided by pool
+> arity and never looked at what the application was. See
 > [`docs/iis-e2e-matrix.md`](../../docs/iis-e2e-matrix.md). Note the container cannot
 > install a collector (Server Core .NET cannot fetch the MSI); those phases skip.
 
@@ -196,6 +199,66 @@ Teardown: `docker rm -f cx-rabbitmq-test`.
 
 ---
 
+## Node deployment SHAPE matrix (self-asserting; Coralogix optional)
+
+`Dockerfile.nodeshapes` + `entrypoint.nodeshapes.ps1` + `setup-nodeshape.ps1` + `Run-NodeShapesTest.ps1`,
+with app fixtures under `nodeshapes/`. Full table of shapes and verdicts:
+[`docs/nodejs-windows-shape-matrix.md`](../../docs/nodejs-windows-shape-matrix.md).
+
+It exists because service-hosted PM2 support shipped behind fixture unit tests only: nothing had
+watched `Invoke-CxPm2AsOwner` actually reach a daemon owned by another account, and no Node hosting
+shape other than a per-user PM2 had been exercised at all. Both gaps are the kind that end in a
+silent no-op on a customer host — which is what happened on SGA's OTIOMWQA01, where 26 PM2 apps ran
+with zero Node telemetry while every script reported success.
+
+One container, shapes applied and reset through `docker exec setup-nodeshape.ps1` (the
+`break-state.ps1` arrangement), so the harness controls ordering and can observe state before and
+after each step without paying container-start cost per case. Each shape is gated **twice**: locally
+in seconds (the doctor's findings and graded exit code, plus the collector's own counters on `:8888`),
+then **once** in Coralogix at the end — a single DataPrime sweep over every shape's service name, so
+the 10–15 minute ingest lag is paid once for the whole matrix instead of per case.
+
+```powershell
+# from the repo root
+./test/docker-win/Run-NodeShapesTest.ps1 -SkipCoralogix      # the matrix, local gates only
+./test/docker-win/Run-NodeShapesTest.ps1 -Only p3-service    # one phase (p0-probe..p6-coralogix)
+./test/docker-win/Run-NodeShapesTest.ps1 -Region eu1         # + the backend sweep
+# options: -SkipBuild -KeepContainer -IngestWaitSec -PrivateKey -QueryKeyFile -KeyLabel
+```
+
+Phases: **P0** probes what the container can prove (Task Scheduler and a transient service each
+running as `LOCAL SERVICE`, and which mechanism the run will use) · **P1** Node present / PM2 absent
+/ PM2 idle · **P2** per-user PM2 (fork, cluster, ESM `type:module`, `.mjs`, SGA-style dotted names,
+an app with pre-existing `NODE_OPTIONS`, `-Apps`/`-WhatIf`) · **P3** PM2 as a Windows service under
+`LOCAL SERVICE`, `LocalSystem` and an ordinary account, plus stopped-daemon `dump.pm2` fallback and
+two daemons at once · **P4** bare `node.exe` from a scheduled task, node-as-a-service without PM2,
+iisnode, IIS ARR → PM2 · **P5** uninstall for both hostings · **P6** the Coralogix sweep.
+
+### Prerequisites (baked on the host; the build SKIPs the IIS shapes loudly without them)
+
+```powershell
+$b = 'test/docker-win'
+# shared with the other harnesses
+Invoke-WebRequest 'https://nodejs.org/dist/v20.11.0/node-v20.11.0-win-x64.zip' -OutFile "$b/node.zip" -UseBasicParsing
+npm install -g pm2 node-windows --prefix "$b/npm-global"     # node-windows is what makes PM2 a service
+npm install --prefix "$b/nodeapp" --omit=dev                 # pino, reused as the apps' shared node_modules
+npm install --prefix "$b/otel-node" '@opentelemetry/auto-instrumentations-node' '@opentelemetry/api'
+# otelcol-contrib.exe: as for the E2E image (real collector, real Coralogix)
+
+# IIS-hosted Node shapes (optional; staged in vendor/iis so the COPY does not drag in the
+# 190 MB of Erlang/RabbitMQ installers vendor/ holds for the other harness)
+New-Item -ItemType Directory -Force "$b/vendor/iis" | Out-Null
+Invoke-WebRequest 'https://download.microsoft.com/download/1/2/8/128E2E22-C1B9-44A4-BE2A-5859ED1D4592/rewrite_amd64_en-US.msi' -OutFile "$b/vendor/iis/rewrite_amd64_en-US.msi" -UseBasicParsing
+Invoke-WebRequest 'https://download.microsoft.com/download/E/9/8/E9849D6A-020E-47E4-9FD0-A023E99B54EB/requestRouter_amd64.msi' -OutFile "$b/vendor/iis/requestRouter_amd64.msi" -UseBasicParsing
+Invoke-WebRequest 'https://github.com/Azure/iisnode/releases/download/v0.2.21/iisnode-full-v0.2.21-x64.msi' -OutFile "$b/vendor/iis/iisnode-full-v0.2.21-x64.msi" -UseBasicParsing
+```
+
+URL Rewrite must install **before** ARR (ARR's installer requires it); the Dockerfile already does
+them in that order and records what landed in `C:\cx\state\iis-modules.txt`, which
+`setup-nodeshape.ps1` reads to decide between running a shape and reporting a loud SKIP.
+
+---
+
 ## Diagnostics harness (offline, self-asserting)
 
 `Dockerfile.doctor` + `entrypoint.doctor.ps1` + `break-state.ps1` + `Run-DoctorTest.ps1`.
@@ -218,31 +281,53 @@ branches is the point.
 # options: -SkipBuild  -KeepContainer  -Image cx-doctor-test  -Container cx-doctor
 ```
 
-27 assertions in six groups:
+54 assertions in eight groups:
 
-- **A. baseline** — missing collector → exit 1; `Default Web Site` pool resolved via
-  `<sites><applicationDefaults>`; `web.config` readback on a shared pool; no PM2 → `NO_PM2`
-  (a skip, not a failure).
+- **A. baseline** — missing collector → exit 1; pool resolution via
+  `<sites><applicationDefaults>` (pinned positively on `corepool-defaults`, a .NET app —
+  `Default Web Site` is static and now deliberately unnamed, so it can no longer prove that
+  naming worked); `web.config` readback on a shared pool; no PM2 → `NO_PM2` (a skip, not a
+  failure).
 - **B. argument handling** — `-Only` comma form (what `doctor.bat` forwards), space form
   *rejected* rather than silently mis-bound, case-insensitivity, bad name failing loudly.
 - **C. standalone/aggregator parity** — `Test-IISInstrumentation.ps1` run directly emits the
   same finding codes as the same check run through `Test-Agent.ps1`. This is what proves the
   two entry points share one implementation instead of drifting.
+- **C2. web.config presence vs readability** — absent, malformed, and inherited-from-a-parent
+  are three different answers and must not collapse into one.
+- **C3. runtime classification** — that the verdict comes from the **application**, not from
+  its pool. A static site on a dedicated pool is `NON_DOTNET_APP_NOT_INSTRUMENTED` and absent
+  from `CX_IIS_SERVICES` (the over-claim this group exists to pin); a Framework app is
+  detected from `<system.web>` rather than from a `v4.0` pool; "No Managed Code" is correct
+  for Core and `FRAMEWORK_POOL_NO_MANAGED_CLR` for Framework; a `<staticContent>`-only
+  `web.config` is not .NET; `bin\*.dll` with no `web.config` is `RUNTIME_UNKNOWN_NEEDS_OVERRIDE`
+  rather than a guess; and `-RuntimeOverrides` resolves it — including the trailing-slash
+  alias, an unmatched key (warn), and an invalid value (hard fail).
 - **D. broken states** — `CX_IIS_SERVICES_MISSING`, `CX_IIS_SERVICES_DRIFT`,
   `POOL_NOT_NO_MANAGED_CODE`, `POOL_ENV_STALE`, `PROFILER_REGISTRY_MALFORMED` (hard fail,
   exit 1), `PROFILER_PATH_MISSING`.
-- **E. WOW64 (32-bit host process)** — the validators run through
+- **E. IIS access-log coverage** — a site logging outside the collector's single hardcoded
+  `include` ships nothing, silently. Covers a custom directory, the `CX_IIS_LOG_DIR_n` slot
+  that fixes it, non-W3C format, disabled logging, and central W3C mode.
+- **F. WOW64 (32-bit host process)** — the validators run through
   `SysWOW64\WindowsPowerShell\v1.0\powershell.exe`, and `doctor.bat` is driven from
   `SysWOW64\cmd.exe`. Asserts `Get-CxInetsrvDir` returns `Sysnative` under WOW64 and
   `System32` otherwise, that a 32-bit run reads `applicationHost.config` instead of
   reporting `APPHOST_UNREADABLE`, and — by forcing the redirected path explicitly — that
   the underlying failure is still reproducible, so the group cannot pass vacuously.
   Skipped with a notice if the image has no 32-bit PowerShell.
-- **F. read-only invariant** — SHA-256 of `applicationHost.config` plus the whole machine
+- **G. read-only invariant** — SHA-256 of `applicationHost.config` plus the whole machine
   environment, taken before and after a full run, must be identical; `-NoFileOutput` leaves
   no `agent-doctor.json`; the default run writes one that parses. The `-NoFileOutput` case
-  clears any report an earlier group left behind first — `doctor.bat` in group E writes one
+  clears any report an earlier group left behind first — `doctor.bat` in group F writes one
   by default, and without the reset this would assert the run's history rather than the switch.
+  This group is also what proves runtime classification stays read-only: it reads every app's
+  `web.config` and probes app roots, and must still change nothing.
+
+There is a matching **unit** suite for the classification rules alone, `test/Test-ResolveIISAppRuntime.ps1`.
+It builds throwaway fixture directories, needs no Docker, no IIS and no elevation, and finishes
+in about a second — run it first when changing detection, and leave the containers to prove the
+things only a real IIS can (enumeration, `appcmd` writes, `CX_IIS_SERVICES`, exit grading).
 
 Mutations live in `break-state.ps1` (`-Case clearIisServices|poolEnvStale|profilerMalformed|…`)
 and are **destructive by design** — only ever safe because the container is disposable. Keeping
