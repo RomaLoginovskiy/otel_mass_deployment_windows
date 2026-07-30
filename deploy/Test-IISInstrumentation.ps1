@@ -613,9 +613,47 @@ function Test-IISInstrumentation {
                     -Message "$svc registers a CLR profiler that is NOT the OpenTelemetry one ($($foreign -join ', ')), and only one profiler can attach to a process - so .NET auto-instrumentation emits NOTHING for anything this service starts, however healthy the collector is. The DLL path points at $vendor$(if ($paths) { " ($($paths -join ', '))" }). Decide which agent owns .NET on this host: keep theirs and instrument these applications another way, or remove/exclude theirs and re-run the install." `
                     -Data @{ foreign = $foreign; expected = $otelClsid; paths = @($paths); vendorHint = $vendor })
             } else {
-                Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
-                    -Message "profiler registered and it is ours (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
-                    -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; coreclrEnable = $clrEnable; corEnable = $fwEnable })
+                # REGISTERED is not LOADED, and the difference is the whole finding. MEASURED on a
+                # host running the reference agent in fullstack mode: W3SVC carried our CLSID and all
+                # four path variants, every value correct - and no process on the box had
+                # OpenTelemetry.AutoInstrumentation.Native.dll in it. the reference agent injects at process
+                # creation, into w3wp AND into the dotnet/apphost children of out-of-process apps, and
+                # only one CLR profiler can attach - so ours never did. This check graded that host a
+                # pass, which is the false green this tooling exists to prevent.
+                #
+                # Evidence, not inference: enumerate the worker processes and look for our library.
+                # Absence is only meaningful once a worker is actually up, so a host with no worker
+                # running is 'unknown', never a fail - an idle pool has nothing to load it into yet.
+                $ourDll  = 'OpenTelemetry.AutoInstrumentation.Native'
+                $workers = @()
+                try {
+                    $workers = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+                        Where-Object { $_.Name -in @('w3wp.exe','dotnet.exe') -or ($_.CommandLine -and $_.CommandLine -match '\\aspnetcorev2') })
+                } catch { }
+                if (@($workers).Count -eq 0) {
+                    Add-F (New-Finding -Check 'profiler' -Severity 'unknown' -Code 'PROFILER_LOAD_UNVERIFIED' -Target $svc `
+                        -Message "$svc registers our profiler correctly, but no IIS worker process is running, so whether the profiler actually LOADS could not be verified. Send a request to an application and re-run - a registration that never loads is the failure mode this check exists for.")
+                } else {
+                    $withOurs = @(); $withForeign = @()
+                    foreach ($w in $workers) {
+                        $mods = @()
+                        try { $mods = @((Get-Process -Id $w.ProcessId -ErrorAction Stop).Modules | Select-Object -ExpandProperty ModuleName) } catch { continue }
+                        if ($mods -match $ourDll) { $withOurs += $w.ProcessId }
+                        # Any other vendor's CLR profiler in the same process explains WHY ours is not
+                        # there, and is the actionable half for the operator.
+                        $f = @($mods | Where-Object { $_ -match 'the reference agent|newrelic|appdynamics|datadog|elastic.*profiler|instana' } | Select-Object -Unique)
+                        if (@($f).Count -gt 0) { $withForeign += "pid $($w.ProcessId): $($f -join ',')" }
+                    }
+                    if (@($withOurs).Count -gt 0) {
+                        Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
+                            -Message "profiler registered AND loaded - our native library is in $(@($withOurs).Count) of $(@($workers).Count) worker process(es) (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
+                            -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; loadedIn = @($withOurs) })
+                    } else {
+                        Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_NOT_LOADED_IN_PROCESS' -Target $svc `
+                            -Message "$svc registers OUR profiler correctly, but our native library ($ourDll.dll) is loaded in NONE of the $(@($workers).Count) running worker process(es) - so .NET auto-instrumentation produces no spans while every variable reads as configured.$(if (@($withForeign).Count -gt 0) { " Another vendor's CLR profiler is in those processes instead ($($withForeign -join '; ')), and only ONE profiler can attach per process - it injects at process creation and wins over environment-based registration." } else { ' No other vendor profiler was found either, so check the profiler DLL path and that the worker restarted after the install.' }) Registration is not attachment: this is the state a check on the environment alone reports as healthy." `
+                            -Data @{ workers = @($workers | ForEach-Object { $_.ProcessId }); foreign = @($withForeign) })
+                    }
+                }
             }
 
             # Our GUID with somebody else's library is the subtler half, and it is silent: the CLR
