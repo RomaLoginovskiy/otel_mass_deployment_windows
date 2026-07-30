@@ -424,7 +424,7 @@ try {
     }
 
     # -- 3. Machine env vars ----------------------------------------------------
-    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES','CX_DOTNET_SERVICES','CX_SERVICES')
+    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES','CX_IISNODE_SERVICES','CX_DOTNET_SERVICES','CX_SERVICES')
     if ($manifest -and $manifest.envVars) {
         foreach ($e in @($manifest.envVars)) {
             if (-not $e) { continue }
