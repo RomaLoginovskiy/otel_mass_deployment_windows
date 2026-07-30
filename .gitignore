@@ -93,6 +93,13 @@ test/docker-win/*
 # easily reproduce (it would need a LOCAL SERVICE-owned node-windows daemon).
 !test/Test-Pm2Topology.ps1
 
+# iisnode unit tests. Fixture-only, and the only gate on two things nothing else covers: that
+# iisnode stays a THIRD axis (a hybrid app must keep its .NET verdict), and that
+# misc/Enable-IisnodeInstrumentation.ps1's standalone fallbacks still agree with the deploy
+# libraries they mirror - the moment they drift, that script "fixes" a host into a state the real
+# installer overwrites. A Windows container cannot cover it without iisnode in the image.
+!test/Test-IisnodeInstrumentation.ps1
+
 # Offline diagnostics matrix - no keys, no network (Run-DoctorTest.ps1).
 !test/docker-win/Run-DoctorTest.ps1
 !test/docker-win/Dockerfile.doctor

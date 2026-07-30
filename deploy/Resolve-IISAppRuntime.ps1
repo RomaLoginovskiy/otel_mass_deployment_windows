@@ -176,7 +176,7 @@ function Get-CxWebConfigRuntimeState {
 
     # $Reason, not $Error: a parameter named Error would shadow the automatic $Error collection.
     function New-State {
-        param($State, $IsCore, $Inheritable = $false, $DirMissing = $false, $Reason = $null, $FrameworkEvidence = @(), $CoreEvidence = @())
+        param($State, $IsCore, $Inheritable = $false, $DirMissing = $false, $Reason = $null, $FrameworkEvidence = @(), $CoreEvidence = @(), $NodeEvidence = @(), $NodeEntryScript = $null)
         [pscustomobject]@{
             State             = $State
             IsCore            = $IsCore
@@ -185,6 +185,13 @@ function Get-CxWebConfigRuntimeState {
             Error             = $Reason
             FrameworkEvidence = @($FrameworkEvidence)
             CoreEvidence      = @($CoreEvidence)
+            # Third axis, deliberately NOT folded into the two above. An iisnode application is
+            # very often ALSO an ASP.NET Framework application (same pool, same web.config: managed
+            # modules for some paths, an iisnode handler for others), and w3wp then hosts the CLR
+            # while node.exe runs as its child. Making this a DotNetRuntime value would force a
+            # choice between two things that are both true.
+            NodeEvidence      = @($NodeEvidence)
+            NodeEntryScript   = $NodeEntryScript
         }
     }
 
@@ -269,7 +276,47 @@ function Get-CxWebConfigRuntimeState {
         if ($x.SelectSingleNode('//system.serviceModel'))     { [void]$fw.Add('system.serviceModel') }
     } catch {}
 
-    return (New-State 'ok' ([bool]$core) -Inheritable $inheritable -FrameworkEvidence $fw.ToArray() -CoreEvidence $coreEv.ToArray())
+    # -- Node hosted by iisnode ------------------------------------------------------------
+    # iisnode is a NATIVE IIS module that spawns node.exe as a CHILD OF W3WP, so the Node
+    # process inherits the APP POOL's environment - not PM2's, not the machine's. That is the
+    # whole reason this axis exists: Instrument-NodePM2.ps1 can never reach such an app, and on a
+    # real host three apps that looked like dark PM2 apps turned out to be iisnode pools.
+    #
+    # Deliberately NOT inferred from an ARR rewrite rule to 127.0.0.1: a reverse proxy in front of
+    # a backend process says nothing about what that backend is or where it runs, and the pool's
+    # environment does not reach it. Guessing there would put a name into the instrumented set
+    # that no process can ever report under.
+    $node = New-Object System.Collections.Generic.List[string]
+    $nodeEntry = $null
+    try {
+        foreach ($h in @($x.SelectNodes('//system.webServer/handlers/add')) + @($x.SelectNodes('//handlers/add'))) {
+            $mods = [string]$h.GetAttribute('modules')
+            $sp   = [string]$h.GetAttribute('scriptProcessor')
+            $isNodeHandler = ($mods -match '(^|[,\s])iisnode([,\s]|$)') -or ($sp -match 'iisnode\.dll')
+            if (-not $isNodeHandler) { continue }
+            if (-not $node.Contains('handlers/iisnode')) { [void]$node.Add('handlers/iisnode') }
+            # The handler's path IS the entry script ('server.js', 'app.mjs'). A wildcard path
+            # ('*') names no file, so leave the entry null rather than inventing one - the ESM
+            # probe falls back to the application directory's package.json.
+            $p = [string]$h.GetAttribute('path')
+            if (-not $nodeEntry -and $p -and $p -notmatch '[\*\?]') { $nodeEntry = $p }
+        }
+    } catch {}
+    try {
+        $inode = $x.SelectSingleNode('//iisnode')
+        if ($inode) {
+            if (-not $node.Contains('<iisnode>')) { [void]$node.Add('<iisnode>') }
+            # An explicit nodeProcessCommandLine REPLACES the node.exe invocation, so an operator
+            # can have pinned flags there. Recorded because it changes where instrumentation has to
+            # go: a command line that hard-codes its own --require is not something pool env alone
+            # can be reasoned about.
+            $cl = [string]$inode.GetAttribute('nodeProcessCommandLine')
+            if ($cl) { [void]$node.Add("nodeProcessCommandLine=$cl") }
+        }
+    } catch {}
+
+    return (New-State 'ok' ([bool]$core) -Inheritable $inheritable -FrameworkEvidence $fw.ToArray() -CoreEvidence $coreEv.ToArray() `
+                            -NodeEvidence $node.ToArray() -NodeEntryScript $nodeEntry)
 }
 
 function Get-CxWebConfigCoreState {
@@ -532,6 +579,53 @@ function Resolve-IISAppRuntime {
         }
     }
 
+    # -- Node hosting, resolved independently of the .NET verdict ----------------------------
+    # Orthogonal on purpose (see the NodeEvidence note in New-State): a hybrid app is both, and an
+    # operator -Override that forces a .NET runtime must not switch iisnode detection off - the two
+    # answers are about two different processes (w3wp and its node.exe child).
+    $nodeHosting       = $null
+    $nodeEvidence      = @()
+    $nodeEntry         = $null
+    $nodeIsEsm         = $false
+    $nodeInheritedFrom = $null
+
+    # An -Override short-circuited the read above, so pay for it here - and only here. Overridden
+    # apps are rare; every other app already has its state parsed.
+    $nodeWc = if ($null -ne $wc) { $wc } elseif ($PhysicalPath) { Get-CxWebConfigRuntimeState -PhysicalPath $PhysicalPath } else { $null }
+    if ($nodeWc -and @($nodeWc.NodeEvidence).Count -gt 0) {
+        $nodeHosting  = 'iisnode'
+        $nodeEvidence = @($nodeWc.NodeEvidence)
+        $nodeEntry    = $nodeWc.NodeEntryScript
+    }
+    elseif ($nodeWc -and $nodeWc.State -eq 'absent') {
+        # Only when the app has NO web.config of its own. IIS inherits <handlers> into child
+        # applications, so a parent's iisnode handler really does serve this path - but an app with
+        # its own web.config and no iisnode handler in it has already answered the question, and
+        # re-reading ancestors for every such app would cost a directory walk per app on a
+        # 200-app host for nothing.
+        for ($i = 0; $i -lt @($AncestorPhysicalPaths).Count; $i++) {
+            $awc = Get-CxWebConfigRuntimeState -PhysicalPath $AncestorPhysicalPaths[$i]
+            if ($awc.State -ne 'ok') { continue }
+            if (@($awc.NodeEvidence).Count -gt 0) {
+                $nodeHosting  = 'iisnode'
+                $nodeEvidence = @(@($awc.NodeEvidence) + 'inherited from an ancestor application')
+                $nodeEntry    = $awc.NodeEntryScript
+                $nodeInheritedFrom = if ($i -lt @($InheritedFromLabels).Count) { $InheritedFromLabels[$i] } else { $AncestorPhysicalPaths[$i] }
+            }
+            # Nearest readable ancestor decides, exactly as for <aspNetCore> above.
+            break
+        }
+    }
+
+    # ESM vs CommonJS decides the bootstrap FLAG, and getting it wrong fails silently: --require
+    # cannot patch an ESM import graph, so the SDK starts and emits nothing. Reuse the Node path's
+    # probe rather than writing a second one - guarded, because this library is dot-sourced on its
+    # own by callers that do not need the Node helpers.
+    if ($nodeHosting -eq 'iisnode' -and (Get-Command Test-CxNodeAppIsEsm -ErrorAction SilentlyContinue)) {
+        $entryFull = if ($nodeEntry -and $PhysicalPath) { Join-Path $PhysicalPath $nodeEntry } else { '' }
+        try { $nodeIsEsm = [bool](Test-CxNodeAppIsEsm -Script $entryFull -Cwd $PhysicalPath) } catch { $nodeIsEsm = $false }
+    }
+
     $instr = Get-IISAppInstrumentability -Runtime $runtime -PoolClrLoads $poolClrLoads `
                                          -PoolManagedRuntimeVersion $PoolManagedRuntimeVersion
 
@@ -563,6 +657,13 @@ function Resolve-IISAppRuntime {
         PoolManagedRuntimeVersion = $PoolManagedRuntimeVersion
         PoolFound                 = $PoolFound
         RuntimeReason             = $reason
+        # Node axis. NodeHosting is 'iisnode' or $null; it never changes DotNetRuntime, and a caller
+        # that only cares about .NET can ignore these four without its behaviour changing.
+        NodeHosting               = $nodeHosting
+        NodeEvidence              = @($nodeEvidence)
+        NodeEntryScript           = $nodeEntry
+        NodeIsEsm                 = $nodeIsEsm
+        NodeInheritedFrom         = $nodeInheritedFrom
     }
 }
 
@@ -642,6 +743,103 @@ function New-IISRuntimeFinding {
         webConfigState            = $Record.WebConfigState
         managedRuntimeVersion     = $Record.PoolManagedRuntimeVersion
         poolClrLoads              = $Record.PoolClrLoads
+    })
+}
+
+function New-IISNodeFinding {
+    <#
+    .SYNOPSIS
+      The iisnode counterpart of New-IISRuntimeFinding: one mapping from an outcome token to code,
+      severity and message, shared by the installer, the doctor and misc\Enable-IisnodeInstrumentation.ps1.
+
+    .DESCRIPTION
+      A SEPARATE function rather than another branch of New-IISRuntimeFinding, because the two are
+      not alternatives. New-IISRuntimeFinding keys on DotNetRuntime/Instrumentability, and an
+      iisnode application is frequently ALSO AspNetFramework/Supported - it must be able to carry
+      both findings at once, one about w3wp and one about w3wp's node.exe child.
+
+      -Outcome tokens:
+        instrumented   pool env carries our bootstrap                            pass
+        missing        iisnode app with no bootstrap on its pool - it is dark    warn
+        esmUnsupported the app is an ES module, and iisnode cannot host one at
+                       all - so there is nothing here to instrument             warn
+        sharedPool     two or more iisnode apps share one pool, so a single
+                       pool-level OTEL_SERVICE_NAME cannot name either           warn
+        packageMissing the Node instrumentation package is not staged here       warn
+        stalePath      the bootstrap points at a register.js that is gone        warn
+        customCmdLine  <iisnode nodeProcessCommandLine> overrides the node
+                       invocation, so pool NODE_OPTIONS may not be the whole
+                       story                                                     info
+
+      Returns $null (never throws) if the New-Finding helper is not loaded.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('instrumented','missing','esmUnsupported','sharedPool','packageMissing','stalePath','customCmdLine')]
+        [string] $Outcome,
+        $Record,
+        [string] $Target,
+        [string] $Check  = 'iisnode',
+        [string] $Detail
+    )
+
+    if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) { return $null }
+
+    $isEsm = if ($Record) { [bool]$Record.NodeIsEsm } else { $false }
+    $entry = if ($Record) { [string]$Record.NodeEntryScript } else { '' }
+
+    switch ($Outcome) {
+        'instrumented' {
+            $code = 'IISNODE_APP_INSTRUMENTED'; $sev = 'pass'
+            $msg  = "iisnode application: NODE_OPTIONS$(if ($isEsm) { ' (esm loader hook + --require)' } else { ' (--require)' }) is set on its app pool, so the node.exe child of w3wp loads the SDK"
+        }
+        'missing' {
+            $code = 'IISNODE_NODE_OPTIONS_MISSING'; $sev = 'warn'
+            $msg  = "iisnode application with no OTel bootstrap on its app pool - it emits NOTHING. iisnode spawns node.exe as a CHILD OF W3WP, so its environment comes from the pool, not from PM2: Instrument-NodePM2.ps1 cannot reach this app however healthy PM2 looks. Fix: Instrument-IIS.ps1, or misc\Enable-IisnodeInstrumentation.ps1 -Apply on an already-deployed host"
+        }
+        'esmUnsupported' {
+            # MEASURED on a real host (iisnode 0.2.26, Node 20.11, Server 2025): iisnode's own
+            # interceptor.js does `require(<the app's entry point>)`, and a CommonJS require can
+            # never load an ES module. Every request returns HTTP 500 / HRESULT 0x2 with
+            # ERR_REQUIRE_ESM in the iisnode stderr log - WITH our bootstrap and WITHOUT it, for an
+            # .mjs entry and for a "type":"module" package.json alike. So this is a property of the
+            # HOST, not of instrumentation, and no loader hook can rescue it: the app never gets far
+            # enough to load one. (Contrast the PM2 path, where the loader hook is exactly the fix -
+            # there node runs the app directly, with no CommonJS interceptor in front of it.)
+            #
+            # warn, not fail: the agent is not broken and did not cause this. But it cannot be a
+            # pass either - grading an app that 500s on every request as "instrumented" is precisely
+            # the reads-healthy-emits-nothing report this tooling exists to prevent.
+            $code = 'IISNODE_ESM_NOT_HOSTABLE'; $sev = 'warn'
+            $msg  = "this application is an ES module$(if ($entry) { " ($entry)" }) and iisnode cannot host ES modules: its interceptor.js require()s the entry point, so the application fails with ERR_REQUIRE_ESM and returns HTTP 500 on every request (measured on iisnode 0.2.26 / Node 20 - with and without instrumentation). Not instrumented and not claimed as a service, because there is no working process to instrument. Fix is application-side and unrelated to telemetry: give it a CommonJS entry point that dynamic-import()s the ESM app, or host it under PM2 / a Windows service instead of iisnode"
+        }
+        'sharedPool' {
+            $code = 'IISNODE_SHARED_POOL_AMBIGUOUS'; $sev = 'warn'
+            $msg  = "two or more iisnode applications share this app pool. Their node.exe children inherit ONE pool environment, so a single OTEL_SERVICE_NAME cannot name them apart and none is written - a name that maps to two services is worse than no name. Fix: give each application its own pool, or set the bootstrap per app via <iisnode nodeProcessCommandLine>"
+        }
+        'packageMissing' {
+            $code = 'IISNODE_PACKAGE_MISSING'; $sev = 'warn'
+            $msg  = "iisnode application found, but the Node instrumentation package is not staged on this host, so no bootstrap was written. This path deliberately does NOT run npm install (IIS hosts are frequently offline): stage it with Instrument-NodePM2.ps1, or copy a prepared node_modules tree into the install prefix"
+        }
+        'stalePath' {
+            $code = 'IISNODE_REGISTER_PATH_STALE'; $sev = 'warn'
+            $msg  = "the pool's NODE_OPTIONS points at a register bootstrap that no longer exists, so node.exe fails the preload and runs uninstrumented"
+        }
+        'customCmdLine' {
+            $code = 'IISNODE_CUSTOM_COMMAND_LINE'; $sev = 'info'
+            $msg  = "this application sets <iisnode nodeProcessCommandLine>, which replaces the node.exe invocation. Pool NODE_OPTIONS still applies (Node reads it from the environment), but if that command line carries its own --require of an OTel bootstrap the SDK could load twice"
+        }
+    }
+
+    if ($Detail) { $msg = "$msg. $Detail" }
+
+    return (New-Finding -Check $Check -Severity $sev -Code $code -Target $Target -Message $msg -Data @{
+        nodeHosting       = if ($Record) { $Record.NodeHosting } else { 'iisnode' }
+        nodeEvidence      = if ($Record) { @($Record.NodeEvidence) } else { @() }
+        nodeEntryScript   = $entry
+        nodeIsEsm         = $isEsm
+        nodeInheritedFrom = if ($Record) { $Record.NodeInheritedFrom } else { $null }
+        dotNetRuntime     = if ($Record) { $Record.DotNetRuntime } else { $null }
     })
 }
 

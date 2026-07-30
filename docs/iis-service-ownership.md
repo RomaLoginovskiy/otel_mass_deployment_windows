@@ -49,6 +49,14 @@ comma-joined. It is the union of the per-workload slices — `CX_IIS_SERVICES` f
 `Instrument-IIS.ps1`, `CX_NODE_SERVICES` from the Node instrumenters, `CX_DOTNET_SERVICES` from
 the .NET service instrumenter — published by `Install-Agent.ps1`.
 
+> **iisnode apps land in `CX_NODE_SERVICES`, not `CX_IIS_SERVICES`** — even though
+> `Instrument-IIS.ps1` is what writes them. `CX_IIS_SERVICES` is the set instrumented by the .NET
+> profiler, and `Test-Agent.ps1` rebuilds it with that same .NET-only filter, so a Node service in
+> there would report `CX_IIS_SERVICES_DRIFT` permanently. The Node variable is written as a **union**
+> with whatever PM2 already published, for the same reason: overwriting would strip the ownership
+> label off services that are reporting fine, which reads in Coralogix as those services having
+> gone away.
+
 The processor sets each key to an **OpenTelemetry array**, by splitting that value on the comma:
 
 ```yaml

@@ -83,6 +83,102 @@ function Convert-CxJsonEscapes {
     return $sb.ToString()
 }
 
+function Get-CxRegisterPathFromNodeOptions {
+    <#
+      Extract the --require target from a NODE_OPTIONS value. Handles both the quoted and
+      unquoted forms.
+
+      Canonical copy. Test-NodeInstrumentation.ps1 and Test-IISInstrumentation.ps1 both need it -
+      the PM2 doctor reads it off an app's environment, the IIS doctor off an app POOL's - and
+      each keeps a fallback definition for the case where this library is not next to it.
+    #>
+    [CmdletBinding()]
+    param([string] $NodeOptions)
+
+    if (-not $NodeOptions) { return $null }
+    $m = [regex]::Match($NodeOptions, '--require(?:=|\s+)(?:"([^"]+)"|(\S+))')
+    if (-not $m.Success) { return $null }
+    if ($m.Groups[1].Success) { return $m.Groups[1].Value }
+    return $m.Groups[2].Value
+}
+
+function ConvertTo-CxNodeHookKey {
+    <#
+      One normal form for a --require/--import/--experimental-loader target, so
+      `file:///C:/x/hook.mjs`, `C:\x\hook.mjs` and `C:/x/hook.mjs` all compare equal.
+
+      A plain TrimStart of the characters in 'file:/' would corrupt a path on drive F:, hence the
+      anchored regex.
+    #>
+    [CmdletBinding()]
+    param([string] $Value)
+    if (-not $Value) { return '' }
+    $v = $Value.Trim('"') -replace '\\', '/'
+    $v = $v -replace '^file:/+', ''
+    return $v.ToLowerInvariant()
+}
+
+function Remove-CxNodeOptionsBootstrap {
+    <#
+      Strip OUR bootstrap out of a NODE_OPTIONS value and return what is left - which may be ''.
+
+      This is the uninstall half of Merge-CxNodeOptions, and it exists as its own function because
+      the IIS/iisnode path cannot use the PM2 trick of blanking the whole variable. An app pool's
+      NODE_OPTIONS is a single merged string that may also carry the application's own flags
+      (--max-old-space-size, --tls-*, --icu-data-dir), so blanking it would silently change the
+      app's heap ceiling during an uninstall and nothing would report it. Merge-CxNodeOptions calls
+      this too, so install and uninstall share ONE definition of "ours".
+
+      -OwnedTargets are the paths/URLs this tooling owns. Values written by an older version of the
+      tooling, whose exact prefix we can no longer reconstruct, are still recognised by the package
+      markers - otherwise an upgrade would strand a hook forever.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]   $Existing,
+        [string[]] $OwnedTargets = @()
+    )
+
+    if (-not $Existing) { return '' }
+
+    $ourTargets = @{}
+    foreach ($t in $OwnedTargets) {
+        $k = ConvertTo-CxNodeHookKey -Value $t
+        if ($k) { $ourTargets[$k] = $true }
+    }
+
+    function Test-CxIsOurHookTarget {
+        param([string] $Target)
+        if (-not $Target) { return $false }
+        $k = ConvertTo-CxNodeHookKey -Value $Target
+        if ($ourTargets.ContainsKey($k)) { return $true }
+        return [bool]($k -match 'auto-instrumentations-node|opentelemetry')
+    }
+
+    $kept = @()
+    # Tokenise on whitespace, honouring quoted paths, then drop our own hooks.
+    # @() is load-bearing: a SINGLE match pipes out as a bare string, whose .Count is 1 and whose
+    # [0] is the first CHARACTER - so a lone '--max-old-space-size=512' silently became '-'. The
+    # array wrapper is the difference between preserving the app's flag and corrupting it.
+    $tokens = @([regex]::Matches($Existing, '"[^"]*"|\S+') | ForEach-Object { $_.Value })
+    for ($i = 0; $i -lt $tokens.Count; $i++) {
+        $t = $tokens[$i]
+        # Our ESM loader hook, in the `--experimental-loader=<url>` form. An app's own loader is kept.
+        if ($t -match '^--experimental-loader=(.*)$' -and (Test-CxIsOurHookTarget -Target $matches[1])) { continue }
+        if ($t -match '^--(require|import)(=(.*))?$') {
+            $target = $matches[3]
+            if (-not $target -and ($i + 1) -lt $tokens.Count) { $target = $tokens[$i + 1]; $i++ }
+            # Only OUR bootstrap is removed; an app's own --require of its own module stays.
+            if (Test-CxIsOurHookTarget -Target $target) { continue }
+            $kept += $t
+            if ($target -and $t -notmatch '=') { $kept += $target }
+            continue
+        }
+        $kept += $t
+    }
+    return (($kept | Where-Object { $_ }) -join ' ').Trim()
+}
+
 function Merge-CxNodeOptions {
     <#
       Combine an app's EXISTING NODE_OPTIONS with our bootstrap flag, preserving its own flags.
@@ -109,68 +205,21 @@ function Merge-CxNodeOptions {
         [string[]] $OwnedTargets = @()
     )
 
-    # Normalised targets of the bootstrap we are about to add. Recognising a PREVIOUS bootstrap by
-    # exact target is what makes this idempotent for any install prefix: the older rule matched only
-    # paths containing 'opentelemetry' or 'auto-instrumentations-node', which is true of the default
-    # prefix by coincidence, so a vendored or differently-prefixed copy (C:/otel/register.js) was
-    # not recognised and the SDK ended up loaded TWICE on every re-run.
-    # One normal form for both sides, so `file:///C:/x/hook.mjs`, `C:\x\hook.mjs` and
-    # `C:/x/hook.mjs` all compare equal. A plain TrimStart of the characters in 'file:/' would
-    # corrupt a path on drive F:, hence the anchored regex.
-    function ConvertTo-CxHookKey {
-        param([string] $Value)
-        if (-not $Value) { return '' }
-        $v = $Value.Trim('"') -replace '\\', '/'
-        $v = $v -replace '^file:/+', ''
-        return $v.ToLowerInvariant()
-    }
-
-    $ourTargets = @{}
-    foreach ($m in [regex]::Matches($Bootstrap, '(?:--(?:require|import)(?:=|\s+)|--experimental-loader=)("[^"]*"|\S+)')) {
-        $k = ConvertTo-CxHookKey -Value $m.Groups[1].Value
-        if ($k) { $ourTargets[$k] = $true }
-    }
-    foreach ($t in $OwnedTargets) {
-        $k = ConvertTo-CxHookKey -Value $t
-        if ($k) { $ourTargets[$k] = $true }
-    }
-
-    function Test-CxIsOurHookTarget {
-        param([string] $Target)
-        if (-not $Target) { return $false }
-        $k = ConvertTo-CxHookKey -Value $Target
-        if ($ourTargets.ContainsKey($k)) { return $true }
-        # Values written by an older version of this tooling, whose exact path we can no longer
-        # reconstruct - recognised by the package markers, as before.
-        return [bool]($k -match 'auto-instrumentations-node|opentelemetry')
-    }
-
-    $kept = @()
-    if ($Existing) {
-        # Tokenise on whitespace, honouring quoted paths, then drop our own prior hooks.
-        # @() is load-bearing: a SINGLE match pipes out as a bare string, whose .Count is 1 and
-        # whose [0] is the first CHARACTER - so a lone '--max-old-space-size=512' silently became
-        # '-'. The array wrapper is the difference between preserving the app's flag and corrupting it.
-        $tokens = @([regex]::Matches($Existing, '"[^"]*"|\S+') | ForEach-Object { $_.Value })
-        for ($i = 0; $i -lt $tokens.Count; $i++) {
-            $t = $tokens[$i]
-            # Our ESM loader hook, in the `--experimental-loader=<url>` form. Dropped like the
-            # bootstrap so a re-run cannot register the hook twice; an app's own loader is kept.
-            if ($t -match '^--experimental-loader=(.*)$' -and (Test-CxIsOurHookTarget -Target $matches[1])) { continue }
-            if ($t -match '^--(require|import)(=(.*))?$') {
-                $target = $matches[3]
-                if (-not $target -and ($i + 1) -lt $tokens.Count) { $target = $tokens[$i + 1]; $i++ }
-                # Only OUR bootstrap is removed; an app's own --require of its own module stays.
-                if (Test-CxIsOurHookTarget -Target $target) { continue }
-                $kept += $t
-                if ($target -and $t -notmatch '=') { $kept += $target }
-                continue
-            }
-            $kept += $t
-        }
-    }
-    $kept += $Bootstrap
-    return (($kept | Where-Object { $_ }) -join ' ').Trim()
+    # Recognising a PREVIOUS bootstrap by exact target is what makes this idempotent for any install
+    # prefix: the older rule matched only paths containing 'opentelemetry' or
+    # 'auto-instrumentations-node', which is true of the default prefix by coincidence, so a
+    # vendored or differently-prefixed copy (C:/otel/register.js) was not recognised and the SDK
+    # ended up loaded TWICE on every re-run.
+    #
+    # The targets inside $Bootstrap are ours by definition, so they join $OwnedTargets rather than
+    # being matched by pattern. Removal itself is Remove-CxNodeOptionsBootstrap, shared with
+    # uninstall so the two can never disagree about what belongs to us.
+    $bootstrapTargets = @(
+        [regex]::Matches($Bootstrap, '(?:--(?:require|import)(?:=|\s+)|--experimental-loader=)("[^"]*"|\S+)') |
+            ForEach-Object { $_.Groups[1].Value }
+    )
+    $kept = Remove-CxNodeOptionsBootstrap -Existing $Existing -OwnedTargets (@($bootstrapTargets) + @($OwnedTargets))
+    return ((@($kept, $Bootstrap) | Where-Object { $_ }) -join ' ').Trim()
 }
 
 function Resolve-CxNodeBootstrap {

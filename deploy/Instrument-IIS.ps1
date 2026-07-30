@@ -105,6 +105,15 @@ param(
     [string]    $OverridesJson,
     [hashtable] $RuntimeOverrides      = @{},
     [string]    $RuntimeOverridesJson  = $env:CX_RUNTIME_OVERRIDES_JSON,
+    # iisnode: where the OTel NODE instrumentation package is staged. Same default as
+    # Instrument-NodePM2.ps1 -InstallPrefix, because it is the same package - an IIS host that
+    # also runs PM2 stages it once and both paths find it.
+    [string]    $NodeInstallPrefix     = 'C:\cx\otel-node',
+    # Leave iisnode applications alone. Classification and findings still report them; only the
+    # writing is suppressed. For a host where something else already instruments node.exe (a
+    # Dynatrace OneAgent Node module, say), where two agents on the same http hooks is the
+    # bigger risk.
+    [switch]    $NoIisnode,
     # Optional backup/manifest session (from Backup-Config.ps1, created by the
     # orchestrator). When supplied, mutated configs are backed up and recorded so
     # Uninstall-Agent.ps1 can reverse only the installer's own changes.
@@ -430,6 +439,64 @@ function Remove-PoolEnv {
     return $true
 }
 
+function Get-PoolIdentityAccount {
+    <#
+      The Windows account a pool's worker process runs as, in a form icacls accepts.
+
+      Needed because the iisnode bootstrap is a FILE the node.exe child has to read, and that child
+      runs as the pool identity - which is NOT the account running this installer, and NOT
+      LOCAL SERVICE either. The default, ApplicationPoolIdentity, is a virtual account named after
+      the pool ("IIS AppPool\Foo"); it has no rights to C:\cx\otel-node, so an uninstrumented app
+      is exactly what a missing grant produces - node fails the preload and keeps serving.
+
+      Returns $null when it cannot be determined, so the caller can say so instead of granting
+      rights to a guessed account.
+    #>
+    param([string] $Pool)
+    if (-not $Pool) { return $null }
+    $type = ''
+    $user = ''
+    try { $type = (& $appcmd list apppool "$Pool" /text:processModel.identityType 2>$null | Out-String).Trim() } catch {}
+    try { $user = (& $appcmd list apppool "$Pool" /text:processModel.userName    2>$null | Out-String).Trim() } catch {}
+    switch ($type) {
+        'ApplicationPoolIdentity' { return "IIS AppPool\$Pool" }
+        'LocalService'            { return 'NT AUTHORITY\LOCAL SERVICE' }
+        'LocalSystem'             { return 'NT AUTHORITY\SYSTEM' }
+        'NetworkService'          { return 'NT AUTHORITY\NETWORK SERVICE' }
+        'SpecificUser'            { if ($user) { return $user } else { return $null } }
+        default {
+            # An absent attribute means the IIS default, which is ApplicationPoolIdentity.
+            if (-not $type) { return "IIS AppPool\$Pool" }
+            return $null
+        }
+    }
+}
+
+function Grant-PoolReadAccess {
+    <#
+      Give a pool identity read+execute on the Node instrumentation directory.
+
+      Not reversed by uninstall on purpose: it is a read-only grant on a directory this package
+      owns, and revoking it would be the only part of uninstall that could break an app pool
+      still holding the file open.
+    #>
+    param([string] $Pool, [string] $Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $acct = Get-PoolIdentityAccount -Pool $Pool
+    if (-not $acct) {
+        Write-Warning "[iis-instr] could not determine the identity of pool '$Pool', so no read grant was made on $Path. If its node.exe cannot read the bootstrap it will run uninstrumented."
+        return $false
+    }
+    # (OI)(CI) so the grant reaches the files under node_modules, not just the folder itself.
+    $out = & icacls.exe "$Path" /grant "${acct}:(OI)(CI)(RX)" 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "[iis-instr] icacls could not grant '$acct' read access to $Path - $($out.Trim())"
+        return $false
+    }
+    Write-Host "  [acl]  $acct  read+execute on $Path"
+    return $true
+}
+
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
 
@@ -442,6 +509,14 @@ if ($OverridesJson) {
         if (-not $ServiceNameOverrides.ContainsKey($p.Name)) { $ServiceNameOverrides[$p.Name] = $p.Value }
     }
 }
+
+# The Node helpers, for iisnode applications. Loaded BEFORE Resolve-IISServiceNames.ps1 runs its
+# classification, because Resolve-IISAppRuntime's ESM probe calls Test-CxNodeAppIsEsm when it is
+# available and silently answers "CommonJS" when it is not - and a CommonJS answer for an ESM app
+# is the silent-zero-telemetry case. Guarded like every other dot-source here: a partial copy of
+# the package degrades to "no iisnode support", which is reported below, not to a broken deploy.
+$nodeLib = Join-Path $PSScriptRoot 'Resolve-NodeServiceNames.ps1'
+if (Test-Path $nodeLib) { . $nodeLib }
 
 . (Join-Path $PSScriptRoot 'Resolve-IISServiceNames.ps1')
 
@@ -477,6 +552,39 @@ if (-not $rtCapable) {
     function Get-IISAppKey { param([string]$Site, [string]$AppPath) $p = if ($AppPath) { $AppPath } else { '/' }; return "$Site$p" }
     function Get-IISUnmatchedRuntimeOverrideKeys { param($Overrides, $Apps) return ,@() }
     function New-IISRuntimeFinding { param($Record, [string]$Target, [string]$Check) return $null }
+    function New-IISNodeFinding { param([string]$Outcome, $Record, [string]$Target, [string]$Check, [string]$Detail) return $null }
+}
+
+# ---- 2b-i. iisnode: resolve the Node bootstrap ONCE ---------------------------
+# An iisnode application is Node hosted BY IIS: the module spawns node.exe as a child of w3wp, so
+# the only environment that reaches it is the APP POOL's. Nothing about the .NET profiler applies,
+# and Instrument-NodePM2.ps1 cannot see these apps at all - PM2 does not manage them.
+#
+# NO npm install here, deliberately. IIS hosts are frequently offline or proxy-bound, and a deploy
+# that reaches this point has already installed the collector; failing it over a package fetch
+# would be a worse outcome than reporting IISNODE_PACKAGE_MISSING and leaving the app dark with a
+# named reason. The package is staged by the Node path (or copied in by the fleet).
+$iisnodeApps  = New-Object System.Collections.ArrayList
+$iisnodeAll   = @($svcMap | Where-Object { $_.NodeHosting -eq 'iisnode' })
+$nodeBoot     = $null
+$nodeReason   = $null
+if (@($iisnodeAll).Count -gt 0) {
+    Write-Host "[iis-instr] $(@($iisnodeAll).Count) iisnode application(s) found (Node hosted by IIS, environment comes from the app pool)"
+    if ($NoIisnode) {
+        $nodeReason = '-NoIisnode was passed, so their pools were left alone'
+        Write-Host "[iis-instr] -NoIisnode: not instrumenting them - $nodeReason" -ForegroundColor Yellow
+    } elseif (-not (Get-Command Resolve-CxNodeBootstrap -ErrorAction SilentlyContinue)) {
+        $nodeReason = 'Resolve-NodeServiceNames.ps1 is not next to this script, so the Node bootstrap could not be resolved'
+        Write-Warning "[iis-instr] $nodeReason"
+    } else {
+        $nodeBoot = Resolve-CxNodeBootstrap -InstallPrefix $NodeInstallPrefix
+        if (-not $nodeBoot.RegisterPath) {
+            $nodeReason = $nodeBoot.Reason
+            $nodeBoot   = $null
+        } else {
+            Write-Host "[iis-instr] node bootstrap: $($nodeBoot.RegisterPath)$(if ($nodeBoot.EsmSupported) { " (+ esm loader hook)" } else { ' (no esm loader hook - ESM apps will be reported, not instrumented)' })"
+        }
+    }
 }
 
 if (-not $svcMap -or @($svcMap).Count -eq 0) {
@@ -511,8 +619,75 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
 
     foreach ($r in $svcMap) {
         $appKey = Get-IISAppKey -Site $r.Site -AppPath $r.AppPath
-        Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}] {5}/{6}" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope, $r.DotNetRuntime, $r.Instrumentability)
+        Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}] {5}/{6}{7}" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope, $r.DotNetRuntime, $r.Instrumentability, $(if ($r.NodeHosting -eq 'iisnode') { ' +iisnode' } else { '' }))
         Add-RF (New-IISRuntimeFinding -Record $r -Target $appKey)
+
+        # -- iisnode ---------------------------------------------------------------------
+        # BEFORE the .NET skip below, not after: a pure Node app under iisnode classifies as
+        # NonDotNet/Unsupported (correctly - no CLR profiler applies to it), and that branch
+        # `continue`s. Putting this after it is what would leave every iisnode app dark while the
+        # installer reported success. A hybrid app passes through both branches, which is right:
+        # w3wp gets the profiler, its node.exe child gets the bootstrap.
+        if ($r.NodeHosting -eq 'iisnode') {
+            if ($r.NodeEvidence -match 'nodeProcessCommandLine') {
+                Add-RF (New-IISNodeFinding -Outcome 'customCmdLine' -Record $r -Target $appKey)
+            }
+            if (-not $nodeBoot) {
+                # Reported once per app on purpose: the doctor grades per app, and an operator
+                # scanning output for an app name must find it here too.
+                Add-RF (New-IISNodeFinding -Outcome $(if ($NoIisnode) { 'missing' } else { 'packageMissing' }) -Record $r -Target $appKey -Detail $nodeReason)
+                Write-Host "  [node] $appKey - not instrumented: $nodeReason" -ForegroundColor Yellow
+            }
+            elseif ($r.NodeIsEsm) {
+                # NOT a hook problem, and not conditional on the hook being staged: iisnode cannot
+                # host an ES module at all (its interceptor.js require()s the entry point ->
+                # ERR_REQUIRE_ESM -> HTTP 500 on every request, measured with and without our
+                # bootstrap). Writing a bootstrap onto that pool would produce a host that reports
+                # "instrumented" for an application that cannot serve.
+                Add-RF (New-IISNodeFinding -Outcome 'esmUnsupported' -Record $r -Target $appKey)
+                Write-Warning "[iis-instr] $appKey is an ES module, which iisnode cannot host (ERR_REQUIRE_ESM in its interceptor) - its pool is left alone, because there is no working process to instrument."
+            }
+            else {
+                # A pool-level OTEL_SERVICE_NAME reaches EVERY app in the pool, so it is only
+                # honest when no OTHER instrumented app shares that pool. Two iisnode apps cannot
+                # be told apart by it, and an instrumented .NET app co-hosted with an iisnode app
+                # would be silently RENAMED to the Node app's service name - a worse failure than
+                # not instrumenting, because it corrupts an app that was reporting correctly.
+                # A static or otherwise uninstrumented co-tenant does not care, so it does not block.
+                $poolRivals = @($svcMap | Where-Object {
+                    $_.Pool -eq $r.Pool -and
+                    (Get-IISAppKey -Site $_.Site -AppPath $_.AppPath) -ne $appKey -and
+                    ($_.NodeHosting -eq 'iisnode' -or $_.Instrumentability -eq 'Supported')
+                })
+                if (@($poolRivals).Count -gt 0) {
+                    $rivalKeys = @($poolRivals | ForEach-Object { Get-IISAppKey -Site $_.Site -AppPath $_.AppPath }) -join ', '
+                    Add-RF (New-IISNodeFinding -Outcome 'sharedPool' -Record $r -Target $appKey -Detail "Also instrumented in pool '$($r.Pool)': $rivalKeys")
+                    Write-Warning "[iis-instr] $appKey shares pool '$($r.Pool)' with other instrumented app(s) ($rivalKeys), so a pool-level OTEL_SERVICE_NAME cannot name it - left uninstrumented rather than renaming a working service."
+                } else {
+                    # Always the CommonJS form here: the ESM branch above already refused, because
+                    # iisnode cannot host an ES module at all. HookUrl still goes into $owned so a
+                    # stale ESM loader written by an earlier build of this installer is stripped out
+                    # of the merged value rather than left behind forever.
+                    $bootstrap = $nodeBoot.NodeOptionsCjs
+                    $owned     = @($nodeBoot.RegisterPath, $nodeBoot.HookUrl) | Where-Object { $_ }
+                    $merged    = Merge-CxNodeOptions -Existing (Get-PoolEnvValue -Pool $r.Pool -Name 'NODE_OPTIONS') -Bootstrap $bootstrap -OwnedTargets $owned
+
+                    Grant-PoolReadAccess -Pool $r.Pool -Path $NodeInstallPrefix | Out-Null
+                    Set-PoolEnv -Pool $r.Pool -Name 'NODE_OPTIONS'                -Value $merged
+                    Set-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'           -Value $r.ServiceName
+                    Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
+                    Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+                    # The Node SDK reads these three; the .NET profiler does not need them, and on a
+                    # hybrid pool they are harmless to w3wp.
+                    Set-PoolEnv -Pool $r.Pool -Name 'OTEL_TRACES_EXPORTER'        -Value 'otlp'
+                    Set-PoolEnv -Pool $r.Pool -Name 'OTEL_METRICS_EXPORTER'       -Value 'otlp'
+                    Set-PoolEnv -Pool $r.Pool -Name 'OTEL_LOGS_EXPORTER'          -Value 'otlp'
+                    Write-Host "  [node] $appKey -> $($r.ServiceName) $(if ($r.NodeIsEsm) { 'esm+hook' } else { '--require' }) on pool '$($r.Pool)'" -ForegroundColor Green
+                    Add-RF (New-IISNodeFinding -Outcome 'instrumented' -Record $r -Target $appKey)
+                    [void]$iisnodeApps.Add($r)
+                }
+            }
+        }
 
         # WHAT the app is decides whether it is instrumented at all; the pool-arity Scope only
         # decides WHERE the name goes. Conflating the two is the defect this replaces: a static
@@ -619,6 +794,37 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
     [Environment]::SetEnvironmentVariable('CX_IIS_SERVICES', $iisServices, 'Machine')
     $env:CX_IIS_SERVICES = $iisServices
     Write-Host "[iis-instr] set machine CX_IIS_SERVICES=$iisServices (collector stamps it on infra telemetry)" -ForegroundColor Green
+}
+
+# ---- 2b-iii. iisnode service names -> CX_NODE_SERVICES ------------------------
+# CX_NODE_SERVICES, not CX_IIS_SERVICES. The IIS variable is the set of apps instrumented by the
+# .NET profiler, and Test-Agent.ps1 rebuilds it with that same .NET-only filter - adding a Node
+# service to it would produce permanent CX_IIS_SERVICES_DRIFT (the failure documented at the
+# CX_IIS_SERVICES write above). An iisnode app IS a Node service, so it belongs with the PM2 ones,
+# and Install-Agent.ps1 folds both into the CX_SERVICES union the collector actually reads.
+#
+# UNION with what is already there, for the same reason Instrument-NodePM2.ps1 unions on a staged
+# rollout: PM2 apps on this host wrote their names into this variable, and overwriting would strip
+# the ownership label off services that are reporting fine - which reads in Coralogix as those
+# services having gone away.
+if (@($iisnodeApps).Count -gt 0) {
+    $nodeNames = @($iisnodeApps | ForEach-Object { [string]$_.ServiceName } | Where-Object { $_ })
+    $priorNode = [Environment]::GetEnvironmentVariable('CX_NODE_SERVICES', 'Machine')
+    $existingNode = @()
+    if ($priorNode) { $existingNode = @($priorNode -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    $nodeUnion = @(@($existingNode) + @($nodeNames) | Where-Object { $_ } | Select-Object -Unique)
+    $nodeValue = ($nodeUnion -join ',')
+    if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+        Record-EnvChange -Session $Session -Name 'CX_NODE_SERVICES' -PriorValue $priorNode
+    }
+    [Environment]::SetEnvironmentVariable('CX_NODE_SERVICES', $nodeValue, 'Machine')
+    $env:CX_NODE_SERVICES = $nodeValue
+    Write-Host "[iis-instr] set machine CX_NODE_SERVICES=$nodeValue ($(@($nodeNames).Count) iisnode service(s) added to the Node ownership set)" -ForegroundColor Green
+}
+if ($Session) {
+    $Session.Manifest.iisnodeInstrumented = (@($iisnodeApps).Count -gt 0)
+    $Session.Manifest.iisnodeApps         = @($iisnodeApps | ForEach-Object { Get-IISAppKey -Site $_.Site -AppPath $_.AppPath })
+    $Session.Manifest.nodeInstallPrefix   = $NodeInstallPrefix
 }
 
 # ---- 2c. Publish the IIS access-log directories -------------------------------
