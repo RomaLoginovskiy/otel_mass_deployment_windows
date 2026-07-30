@@ -161,6 +161,8 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `IISNODE_CUSTOM_COMMAND_LINE` | The app sets `<iisnode nodeProcessCommandLine>`, which replaces the `node.exe` invocation. Pool `NODE_OPTIONS` still applies, but if that command line preloads its own OTel bootstrap the SDK could load twice. |
 | `IISNODE_ESM_UNDETERMINED` | Graded `unknown`. The bootstrap is present, but `Resolve-NodeServiceNames.ps1` was not next to the doctor, so the app's module system could not be determined and a `--require`-only bootstrap cannot be graded a pass. |
 | `CX_SERVICES_MISSING` | The union variable is unset while per-workload slices exist. |
+| `CX_SERVICES_NOT_CONSUMED` | **warn.** `CX_SERVICES` is set and correct, but the collector config **in force** does not read `${env:CX_SERVICES}` — it stamps host ownership from `CX_IIS_SERVICES` only (the pre-`CX_SERVICES` fallback). Every non-IIS service is therefore published in the variables and **claimed by no host**, while still reporting in APM — which reads as a Coralogix-side problem rather than a config one. Decided from the **effective** config when one exists: that is the base merged with what Fleet Management sends and is literally `otelcol`'s `--config`, so a newer base config on disk does **not** override it. Fix in the remote config for the host, using `deploy/config.supervisor.yaml`'s `transform/iis_service_labels` as the reference. |
+| `CX_SERVICES_CONSUMER_UNKNOWN` | No collector config was readable, so whether ownership is stamped from `CX_SERVICES` could not be determined. Graded `unknown`, not a failure. |
 
 ## `skip` — legitimately not applicable
 

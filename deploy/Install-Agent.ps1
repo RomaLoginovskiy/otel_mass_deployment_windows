@@ -94,6 +94,11 @@ try { Start-Transcript -Path $transcript -Append | Out-Null } catch {}
 # under a single timestamped session dir, and each change recorded, so
 # Uninstall-Agent.ps1 can reverse exactly what this run added.
 . (Join-Path $here 'Backup-Config.ps1')
+# Shared helpers: Update-CxServicesUnion (republish CX_SERVICES) and Restart-CxCollector. Guarded
+# like every other dot-source in this package - a partial copy degrades with a warning rather than
+# failing the install.
+$cxLogHelper = Join-Path $here 'Write-DeployLog.ps1'
+if (Test-Path -LiteralPath $cxLogHelper) { . $cxLogHelper }
 $session = $null
 
 $status = [ordered]@{
@@ -260,33 +265,14 @@ try {
     # impossible. On a Node-only host the collector's guard was false and NO labels were stamped at
     # all. Computed here because this is the first point at which every instrumenter has run; step 4
     # restarts the collector, which is what makes the new value take effect.
-    $svcSeen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    $svcUnion = New-Object System.Collections.Generic.List[string]
-    foreach ($varName in 'CX_IIS_SERVICES', 'CX_NODE_SERVICES', 'CX_DOTNET_SERVICES') {
-        $raw = [Environment]::GetEnvironmentVariable($varName, 'Machine')
-        if (-not $raw) { continue }
-        foreach ($n in ($raw -split ',')) {
-            $t = "$n".Trim()
-            # HashSet.Add returns false for a name another instrumenter already claimed, which is how
-            # an IIS app fronting a PM2 process is counted once rather than twice.
-            if ($t -and $svcSeen.Add($t)) { [void]$svcUnion.Add($t) }
-        }
-    }
-    if ($svcUnion.Count) {
-        $cxServices = ($svcUnion.ToArray() -join ',')
-        # Record BEFORE writing, so uninstall deletes a variable we created and restores one that was
-        # already set. Without this the manifest has nothing to reverse and the value survives the
-        # uninstall, leaving the host claiming ownership of services that are gone.
-        if ($session) {
-            try { Record-EnvChange -Session $session -Name 'CX_SERVICES' -PriorValue ([Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')) } catch {}
-        }
-        [Environment]::SetEnvironmentVariable('CX_SERVICES', $cxServices, 'Machine')
-        Write-Host "[agent] set machine CX_SERVICES=$cxServices ($($svcUnion.Count) service(s) claimed for host ownership)" -ForegroundColor Green
-    } elseif ([Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')) {
-        # Nothing instrumented, or everything was refused. Clear the stale value instead of leaving
-        # the host advertising ownership of services it no longer runs.
-        [Environment]::SetEnvironmentVariable('CX_SERVICES', $null, 'Machine')
-        Write-Host '[agent] no instrumented services on this host; cleared stale CX_SERVICES'
+    # The union itself lives in Update-CxServicesUnion (Write-DeployLog.ps1) because every writer of
+    # a slice has to republish it - an instrumenter run on its own would otherwise add a name to its
+    # slice and leave CX_SERVICES stale, which is invisible until you notice the host claims no
+    # ownership for that service. No -RestartCollector here: step 4 below restarts it anyway.
+    if (Get-Command Update-CxServicesUnion -ErrorAction SilentlyContinue) {
+        Update-CxServicesUnion -Session $session | Out-Null
+    } else {
+        Write-Warning '[agent] Write-DeployLog.ps1 is missing, so CX_SERVICES was not republished - non-IIS services will not be claimed for host ownership.'
     }
 
     # -- 4. Restart collector to pick up OTEL_RESOURCE_ATTRIBUTES ----------------

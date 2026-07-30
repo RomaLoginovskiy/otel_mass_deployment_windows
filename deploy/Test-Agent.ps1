@@ -384,6 +384,66 @@ if (Use-Check 'env') {
             Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_SERVICES' -Message $cxServices `
                 -Data @{ value = $haveSet })
         }
+
+        # MEMBERSHIP is not enough - the variable only does anything if the RUNNING config reads it.
+        #
+        # This gap was found on a real host: CX_SERVICES was set, correct, and graded pass, and the
+        # collector process even had it in its environment - but the effective config predated
+        # CX_SERVICES support and stamped ownership from CX_IIS_SERVICES alone. So a Node service
+        # was published in every variable, appeared in APM, and was never claimed by the host
+        # entity, with nothing anywhere reporting a problem. The config template in this repo reads
+        # CX_SERVICES (transform/iis_service_labels) and falls back to CX_IIS_SERVICES; a host whose
+        # remote Fleet config or staged base config is older silently gets the fallback.
+        #
+        # Only worth reporting when the union actually has names the IIS fallback would MISS: on an
+        # IIS-only host the fallback is equivalent and there is nothing to fix.
+        $iisSet   = @($cxIisServices -split ',' | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+        $beyondIis = @($haveSet | Where-Object { $iisSet -notcontains $_ })
+        if ($cxServices -and $beyondIis.Count) {
+            # THE EFFECTIVE CONFIG DECIDES ALONE when it exists.
+            #
+            # Not "any config that mentions it", which is what this check did first and why it
+            # passed on the very host that has the problem: the supervisor's BASE collector.yaml
+            # had been updated and reads CX_SERVICES, while the effective config - the merge of
+            # base and REMOTE, and literally otelcol's --config - is the older remote Fleet
+            # version that reads CX_IIS_SERVICES only. The remote config wins, so consulting the
+            # base masks the live behaviour exactly when it matters. Base/local are consulted only
+            # when there is no effective config to read (local, non-supervisor mode).
+            $readCfg  = $null
+            $consumes = $false
+            $fromEffective = $false
+            $order = @($EffectiveConfig) + @($BaseCollectorConfig, $LocalCollectorConfig)
+            foreach ($cfg in ($order | Where-Object { $_ })) {
+                if (-not (Test-Path -LiteralPath $cfg -ErrorAction SilentlyContinue)) { continue }
+                try {
+                    # Ignore commented lines so a mention in a comment is not mistaken for a use.
+                    $live = (Get-Content -LiteralPath $cfg -ErrorAction Stop | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+                } catch { continue }
+                $readCfg  = $cfg
+                $consumes = [bool]($live -match 'CX_SERVICES')
+                $fromEffective = ($cfg -eq $EffectiveConfig)
+                break   # first READABLE config in precedence order is the verdict, match or not
+            }
+
+            if (-not $readCfg) {
+                Add-F (New-Finding -Check 'env' -Severity 'unknown' -Code 'CX_SERVICES_CONSUMER_UNKNOWN' -Target 'CX_SERVICES' `
+                    -Message "no collector config could be read, so whether the running config stamps host Service ownership from CX_SERVICES could not be determined. $($beyondIis.Count) non-IIS service(s) depend on it: $($beyondIis -join ', ')." `
+                    -Data @{ beyondIis = $beyondIis })
+            } elseif (-not $consumes) {
+                $where = if ($fromEffective) {
+                    'That file is the EFFECTIVE config - the merge of the staged base with the config Fleet Management sends - so this is what the collector is running right now. A newer base config on disk does not change it: the remote config wins. Fix it in Fleet Management (the remote config for this host), using the current template as the reference'
+                } else {
+                    'No effective config was readable, so this is the base/local config the collector starts from. Fix: re-deploy the current template'
+                }
+                Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_NOT_CONSUMED' -Target 'CX_SERVICES' `
+                    -Message "the collector config in force ($readCfg) does not read `${env:CX_SERVICES} - it stamps host Service ownership from CX_IIS_SERVICES only, which is the pre-CX_SERVICES fallback. So $($beyondIis.Count) service(s) published here are NOT claimed by this host however correct the variables look: $($beyondIis -join ', '). They still report in APM, which is why this reads as a Coralogix-side problem rather than a config one. $where - deploy\config.supervisor.yaml's transform/iis_service_labels reads CX_SERVICES and keeps CX_IIS_SERVICES as a fallback." `
+                    -Data @{ config = $readCfg; fromEffectiveConfig = $fromEffective; beyondIis = $beyondIis; cxServices = $haveSet })
+            } else {
+                Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_SERVICES consumer' `
+                    -Message "the $(if ($fromEffective) { 'effective' } else { 'base' }) config in force reads `${env:CX_SERVICES}, so all $($haveSet.Count) service(s) - including $($beyondIis.Count) non-IIS - are claimed for host ownership" `
+                    -Data @{ config = $readCfg; fromEffectiveConfig = $fromEffective })
+            }
+        }
     }
 } else {
     Add-F (New-Finding -Check 'env' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')

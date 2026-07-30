@@ -379,6 +379,35 @@ try {
     }
 
     Write-Host ''
+    Write-Host '== CX_SERVICES union (the variable the collector actually reads) ==' -ForegroundColor Cyan
+
+    # Instrumenting an application is only half the job: the collector stamps host Service ownership
+    # from CX_SERVICES, so a writer that updates only its own slice leaves the service reporting in
+    # APM with no host ownership - and every variable still looking correct. Pure function, so the
+    # rule is testable without touching the machine environment.
+    if (Get-Command Get-CxServicesUnionValue -ErrorAction SilentlyContinue) {
+        Assert-Eq 'order is IIS, then Node, then .NET' 'shop,api,cxnodesvc,worker' `
+            ((Get-CxServicesUnionValue -Iis 'shop,api' -Node 'cxnodesvc' -DotNet 'worker') -join ',')
+        Assert-Eq 'a name in two slices is claimed once' 'shop,api' `
+            ((Get-CxServicesUnionValue -Iis 'shop,api' -Node 'shop') -join ',')
+        # Case-insensitive, first spelling wins: the collector stamps the literal string, and two
+        # spellings of one service would claim it twice.
+        Assert-Eq 'dedup is case-insensitive, first spelling wins' 'MyApp,other' `
+            ((Get-CxServicesUnionValue -Iis 'MyApp' -Node 'myapp,other') -join ',')
+        Assert-Eq 'whitespace around names is trimmed' 'a,b,c' `
+            ((Get-CxServicesUnionValue -Iis ' a , b ' -Node 'c ') -join ',')
+        Assert-Eq 'empty slices produce an empty union' 0 `
+            (@(Get-CxServicesUnionValue -Iis '' -Node $null -DotNet '').Count)
+        Assert-Eq 'a Node-only host still gets a union' 'cxnodesvc' `
+            ((Get-CxServicesUnionValue -Node 'cxnodesvc') -join ',')
+        # The helper's whole reason for existing: the instrumenters and Install-Agent must agree.
+        Assert-True 'Update-CxServicesUnion exists for the writers to call' ([bool](Get-Command Update-CxServicesUnion -ErrorAction SilentlyContinue))
+        Assert-True 'Restart-CxCollector exists (env is read at process start)' ([bool](Get-Command Restart-CxCollector -ErrorAction SilentlyContinue))
+    } else {
+        Write-Host '  (skipped: Write-DeployLog.ps1 not available)' -ForegroundColor DarkGray
+    }
+
+    Write-Host ''
     Write-Host '== pool identity mapping ==' -ForegroundColor Cyan
 
     # Get-PoolIdentityAccount shells out to appcmd, which is absent on a dev box: what is testable

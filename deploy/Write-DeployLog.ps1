@@ -16,7 +16,9 @@
   Instrument-NodePM2.ps1, scripts/deploy-app.ps1), which is here rather than in a
   fourth file because it is the only helper all three of them need:
 
-     Resolve-CxOtlpEndpoint - rewrite a `localhost` OTLP host to 127.0.0.1
+     Resolve-CxOtlpEndpoint  - rewrite a `localhost` OTLP host to 127.0.0.1
+     Update-CxServicesUnion  - republish machine CX_SERVICES from the per-runtime slices
+     Restart-CxCollector     - restart the collector so it re-reads the machine environment
 
   Severity model (a finding carries exactly one):
 
@@ -41,6 +43,146 @@
   before the caller's try/catch. A stray pipeline object or an exception here
   would corrupt a caller or destroy its error handling.
 #>
+
+function Get-CxServicesUnionValue {
+    <#
+      The union itself, as a PURE function: three comma-joined slice values in, the ordered
+      de-duplicated name array out. Separate from Update-CxServicesUnion so the rule can be tested
+      without touching the machine environment - and because Test-Agent.ps1 asserts the same rule
+      from the other side, so the two must not drift.
+
+      Order is IIS, then Node, then .NET. De-duplication is case-INSENSITIVE and keeps the
+      FIRST-SEEN spelling, so an IIS 'MyApp' and a Node 'myapp' collapse to one entry rather than
+      claiming the same service twice under two spellings.
+    #>
+    [CmdletBinding()]
+    param([string] $Iis, [string] $Node, [string] $DotNet)
+
+    $seen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $union = New-Object System.Collections.Generic.List[string]
+    foreach ($raw in @($Iis, $Node, $DotNet)) {
+        if (-not $raw) { continue }
+        foreach ($n in ($raw -split ',')) {
+            $t = "$n".Trim()
+            if ($t -and $seen.Add($t)) { [void]$union.Add($t) }
+        }
+    }
+    # Plain return, NOT `,@(...)`: the comma-prefix form stops PowerShell unrolling a single-element
+    # array, but it also turns an EMPTY array into a one-element array CONTAINING an empty array. A
+    # caller doing @(...).Count then sees 1 on a host with nothing instrumented, takes the
+    # "has services" branch, and reports "1 service(s) claimed" while writing an empty value. Every
+    # caller wraps the result in @() anyway, which handles the single-element case correctly.
+    return @($union.ToArray())
+}
+
+function Update-CxServicesUnion {
+    <#
+    .SYNOPSIS
+      Republish the machine variable CX_SERVICES from the per-runtime slices. Returns the value
+      written, or $null when there was nothing to claim.
+
+    .DESCRIPTION
+      CX_SERVICES is the ONLY one of these variables the collector reads for host Service
+      ownership (transform/iis_service_labels in config.supervisor.yaml reads
+      ${env:CX_SERVICES}, falling back to CX_IIS_SERVICES only for a host whose deploy predates
+      it). CX_IIS_SERVICES / CX_NODE_SERVICES / CX_DOTNET_SERVICES are its INPUTS.
+
+      This lives here, shared, because every writer of a slice has to republish the union or its
+      work does not reach the host entity. Install-Agent.ps1 recomputes it at the end of a full
+      install, which is why the gap only shows up when an instrumenter runs on its own: the slice
+      gains a name, CX_SERVICES keeps the old value, and the new service has spans in APM while
+      Infrastructure Explorer shows no ownership for it - with every variable looking correct.
+
+      Ordering and de-duplication match what Test-Agent.ps1 asserts: IIS, then Node, then .NET,
+      de-duplicated case-INSENSITIVELY keeping the first-seen spelling, so an IIS 'MyApp' and a
+      Node 'myapp' collapse to one entry.
+
+      The collector reads its environment at PROCESS START, so a changed value does nothing until
+      it restarts - hence -RestartCollector. Never throws (see this file's NOTES).
+    #>
+    [CmdletBinding()]
+    param(
+        # Optional backup/manifest session, so an uninstall can put the prior value back.
+        $Session,
+        [switch] $RestartCollector,
+        # Prefix for the one status line this writes, so it reads as coming from its caller.
+        [string] $LogPrefix = '[agent]'
+    )
+
+    try {
+        $union = @(Get-CxServicesUnionValue `
+            -Iis    ([Environment]::GetEnvironmentVariable('CX_IIS_SERVICES',    'Machine')) `
+            -Node   ([Environment]::GetEnvironmentVariable('CX_NODE_SERVICES',   'Machine')) `
+            -DotNet ([Environment]::GetEnvironmentVariable('CX_DOTNET_SERVICES', 'Machine')))
+
+        $prior = [Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')
+        if ($union.Count) {
+            $value = ($union -join ',')
+            if ($value -eq $prior) {
+                Write-Host "$LogPrefix CX_SERVICES already current ($($union.Count) service(s))"
+                if ($RestartCollector) { Restart-CxCollector -LogPrefix $LogPrefix | Out-Null }
+                return $value
+            }
+            # Record BEFORE writing, so uninstall deletes a variable we created and restores one
+            # that was already set.
+            if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+                try { Record-EnvChange -Session $Session -Name 'CX_SERVICES' -PriorValue $prior } catch { }
+            }
+            [Environment]::SetEnvironmentVariable('CX_SERVICES', $value, 'Machine')
+            $env:CX_SERVICES = $value
+            Write-Host "$LogPrefix set machine CX_SERVICES=$value ($($union.Count) service(s) claimed for host ownership)" -ForegroundColor Green
+            if ($RestartCollector) { Restart-CxCollector -LogPrefix $LogPrefix | Out-Null }
+            return $value
+        }
+        elseif ($prior) {
+            # Nothing instrumented, or everything was refused. Clear the stale value rather than
+            # leaving the host claiming ownership of services that are gone.
+            if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+                try { Record-EnvChange -Session $Session -Name 'CX_SERVICES' -PriorValue $prior } catch { }
+            }
+            [Environment]::SetEnvironmentVariable('CX_SERVICES', $null, 'Machine')
+            $env:CX_SERVICES = $null
+            Write-Host "$LogPrefix no instrumented services on this host; cleared stale CX_SERVICES"
+            if ($RestartCollector) { Restart-CxCollector -LogPrefix $LogPrefix | Out-Null }
+        }
+        return $null
+    } catch {
+        Write-Warning "$LogPrefix could not republish CX_SERVICES: $($_.Exception.Message). Host Service ownership may be missing the services instrumented by this run."
+        return $null
+    }
+}
+
+function Restart-CxCollector {
+    <#
+      Restart the collector so it re-reads the MACHINE environment (it reads it at process start,
+      so a changed CX_SERVICES / OTEL_RESOURCE_ATTRIBUTES does nothing until then).
+
+      In supervisor mode there is no 'otelcol-contrib' service - the collector is a CHILD of
+      'opampsupervisor', so restarting the supervisor is what relaunches it. Falls back to the
+      collector service for local (non-supervisor) mode. Returns $true if something was restarted.
+    #>
+    [CmdletBinding()]
+    param([string] $LogPrefix = '[agent]')
+
+    try {
+        $sup = Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue
+        $col = Get-Service -Name 'otelcol-contrib' -ErrorAction SilentlyContinue
+        if ($sup) {
+            Write-Host "$LogPrefix restarting opampsupervisor so the collector re-reads the machine environment"
+            Restart-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
+            return $true
+        } elseif ($col) {
+            Write-Host "$LogPrefix restarting otelcol-contrib so it re-reads the machine environment"
+            Restart-Service -Name 'otelcol-contrib' -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+        Write-Host "$LogPrefix no collector service found, so nothing was restarted - the new value applies when one starts"
+        return $false
+    } catch {
+        Write-Warning "$LogPrefix could not restart the collector: $($_.Exception.Message). It keeps the OLD environment until it restarts, so the change has not taken effect yet."
+        return $false
+    }
+}
 
 function Resolve-CxOtlpEndpoint {
     <#
