@@ -140,6 +140,33 @@ management, give it a dedicated application pool so the pool variable can carry 
 
 See the shared-pool constraints in [single-host.md](single-host.md#known-limitations).
 
+> **Known gap: a Core app on an out-of-support runtime is claimed but can never report.**
+> MEASURED on a Server 2025 host with auto-instrumentation **1.16.0-beta.1** and an ASP.NET Core
+> app targeting **.NET 6.0.36**: the native profiler attaches to `w3wp` (both
+> `OpenTelemetry.AutoInstrumentation.Native.dll` and `...StartupHook.dll` load), and the StartupHook
+> then refuses the runtime —
+>
+> ```
+> Rule Engine: Error in StartupHook initialization: 6.0.36 is not supported
+> Rule 'Minimum Supported Framework Version Validator' failed
+> Automatic Instrumentation won't be loaded.
+> ```
+>
+> (in `%ProgramData%\OpenTelemetry .NET AutoInstrumentation\logs\*-StartupHook-*.log`). .NET 6 went
+> out of support in November 2024 and the module enforces the .NET support lifecycle, so **no
+> configuration on our side can make such an app report** — the app itself is unaffected and serves
+> normally.
+>
+> The gap is that `Resolve-IISAppRuntime.ps1` still classifies it `AspNetCore`/`Supported`, so it is
+> named and **claimed in `CX_IIS_SERVICES`** — the host advertises ownership of a service that never
+> reports, which is exactly what the membership rule above exists to prevent. It is the same shape as
+> `FRAMEWORK_CLR2_NOT_INSTRUMENTABLE`, which already refuses a CLR-2 Framework app for the same
+> reason, and the fix is the same: read the target version from the app's `runtimeconfig.json`,
+> refuse below the module's minimum, and change `Test-Agent.ps1`'s rebuild filter **in the same
+> commit** — the two must agree or every host reports `CX_IIS_SERVICES_DRIFT` that no re-run clears.
+> Until then, exclude such an app with
+> `-RuntimeOverrides @{'<Site><path>'='NonDotNet'}` so the host stops claiming it.
+
 ## Where the processor lives
 
 ```yaml
