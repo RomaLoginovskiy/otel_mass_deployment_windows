@@ -1,8 +1,8 @@
-# Fleet Deployment Runbook — Coralogix OTel Collector (Supervisor Mode) for Linux machines
+# Linux supervisor install by app type
 
-# Supervisor install by app type — customer guide
-
-Step-by-step guide for **`install-supervisor-by-apptype.sh`**.
+Step-by-step guide for **`install-supervisor-by-apptype.sh`** and the per-database config
+templates beside it. The single-host walkthrough of the default installer is
+[`docs/linux.md`](../../docs/linux.md).
 
 This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector** so you can manage collector configuration **remotely from Fleet Management**. Fleet Management owns the live config via `/var/lib/opampsupervisor/effective.yaml`.
 

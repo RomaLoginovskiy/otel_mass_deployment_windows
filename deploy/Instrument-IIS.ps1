@@ -4,7 +4,7 @@
   fleet-wide, and point every app pool at the local collector.
 
 .DESCRIPTION
-  Follows docs/iis-instrumentation.md Part 3/4. Runs only on hosts where IIS was
+  Follows docs/single-host.md Part 3/4. Runs only on hosts where IIS was
   detected (the orchestrator gates this). Steps:
     1. Download OpenTelemetry.DotNet.Auto.psm1, Import-Module, Install-OpenTelemetryCore,
        Register-OpenTelemetryForIIS  (STRICT order - the register step fails if run

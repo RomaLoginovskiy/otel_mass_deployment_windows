@@ -104,7 +104,7 @@ function Note {
     <#
       Record something the run discovered that a human has to act on: an
       unsupported IIS shape, a needed non-default setting, a workaround. These are
-      printed at the end and are the raw material for docs/iis-e2e-matrix.md.
+      printed at the end and are the raw material for test/iis-e2e-matrix.md.
     #>
     param([string] $Topic, [string] $Text)
     [void]$script:Notes.Add([pscustomobject]@{ Topic = $Topic; Text = $Text })
@@ -569,7 +569,7 @@ Write-Host ''
 if ($script:Notes.Count) {
     Write-Host '== cases needing a fix or non-default configuration ==' -ForegroundColor Yellow
     foreach ($n in $script:Notes) { Write-Host ("  - [{0}] {1}" -f $n.Topic, $n.Text) }
-    Write-Host '  (record these in docs/iis-e2e-matrix.md)' -ForegroundColor DarkGray
+    Write-Host '  (record these in test/iis-e2e-matrix.md)' -ForegroundColor DarkGray
     Write-Host ''
 }
 Write-Host ("== RESULT: {0} passed, {1} failed ==" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

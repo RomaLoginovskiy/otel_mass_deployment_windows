@@ -1,10 +1,11 @@
 # Windows collector templates (per-workload fragments)
 
 Optional collector configs that layer a single workload's monitoring on top of the supervisor
-base (`deploy/config.supervisor.yaml`). Use one **only on a host that actually runs that
-workload** — same convention as `deploy-linux/templates/` and the guidance in
-`docs/iis-instrumentation.md` ("keep components as separate template fragments layered on the
-vanilla config only where that component actually runs").
+base ([`../config.supervisor.yaml`](../config.supervisor.yaml)). Use one **only on a host that
+actually runs that workload** — the same convention as
+[`../../deploy-linux/templates/`](../../deploy-linux/templates/) and the guidance in
+[`../../docs/single-host.md`](../../docs/single-host.md): keep optional components as separate
+fragments layered onto the base config only where that component actually runs.
 
 The supervisor base (host + IIS + Windows signals) is left intact in each template; the fragment
 only **adds** a receiver + pipeline. Deploy a template the same way as the base config — pass it
@@ -34,15 +35,6 @@ Supervisor base **+ RabbitMQ logs and metrics**.
 | `RABBITMQ_USERNAME` | `guest` | Monitoring user. |
 | `RABBITMQ_PASSWORD` | `guest` | Monitoring password. |
 | `RABBITMQ_LOG_GLOB` | `C:\rabbitmq\log\*.log` | Log files to tail. |
-
-### Test
-End-to-end (self-contained Windows container that installs RabbitMQ + runs the collector against
-this config, then verifies logs + metrics landed in Coralogix):
-```powershell
-# from the repo root
-./test/docker-win/Run-RabbitmqTest.ps1
-```
-See `test/docker-win/README.md` (RabbitMQ variant).
 
 > Version note: the OTel `rabbitmqreceiver` README lists tested RabbitMQ 3.8/3.9. The `/api/nodes`
 > metrics endpoint is stable on 4.x, but if node metrics come back empty, pin an older RabbitMQ in
