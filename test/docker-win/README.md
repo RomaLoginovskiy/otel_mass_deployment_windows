@@ -171,6 +171,26 @@ Pass criteria (confirm in Coralogix via DataPrime, not the UI):
 - `scripts\Verify-CoralogixNodeSpans.ps1` → **PASS**: each service has spans > 0 and logs > 0, and
   `nodeapp-cluster` shows **≥ 2 distinct `process.pid`** (per-worker telemetry under one service name).
 
+### Not covered here: iisnode
+
+**No container variant covers iisnode** (Node hosted *by* IIS, `node.exe` as a child of `w3wp`).
+The image has IIS and it has Node, but not the iisnode module, so nothing in this harness exercises
+the pool-environment write path in `Instrument-IIS.ps1` or
+`misc\Enable-IisnodeInstrumentation.ps1`. Stated rather than left implied: a green E2E run here says
+nothing about iisnode.
+
+What does gate it today:
+
+- `test\Test-IisnodeInstrumentation.ps1` — fixture-only, ~1s, no IIS. Covers classification
+  (including that a hybrid app keeps its .NET verdict), ESM detection, the `NODE_OPTIONS`
+  merge/strip round trip, and drift between the patch script's standalone fallbacks and the deploy
+  libraries.
+- A real host. The pool identity ACL grant, the recycle, and whether the ESM loader hook still
+  works on the host's Node major are only provable there — verify by DataPrime query, not the UI.
+
+Adding iisnode to the image (an MSI install plus a site whose `web.config` wires the handler) would
+close the gap and is the obvious next step for this harness.
+
 ---
 
 ## RabbitMQ variant

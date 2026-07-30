@@ -403,6 +403,17 @@ if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) 
 $env:CX_NODE_SERVICES = $nodeServices
 Write-Host "[node-instr] set machine CX_NODE_SERVICES=$nodeServices" -ForegroundColor Green
 
+# CX_NODE_SERVICES is an INPUT; the collector reads CX_SERVICES. A standalone run of this script
+# (the staged `-Apps <app>` rollout, or closing a gap on one host) would otherwise leave the union
+# stale, and a stale union is invisible: the app reports spans in APM while the host entity claims
+# no ownership for it. Under the orchestrator ($Session set) Install-Agent.ps1 recomputes the union
+# and restarts the collector itself, so the restart here is standalone-only.
+if (Get-Command Update-CxServicesUnion -ErrorAction SilentlyContinue) {
+    Update-CxServicesUnion -Session $Session -RestartCollector:(-not $Session) -LogPrefix '[node-instr]' | Out-Null
+} else {
+    Write-Warning '[node-instr] Write-DeployLog.ps1 is missing, so CX_SERVICES was not republished. The collector reads THAT variable for host Service ownership.'
+}
+
 if ($Session) {
     $Session.Manifest.nodeInstrumented        = (@($instrumented).Count -gt 0)
     $Session.Manifest.nodeInstrumentedApps    = @($instrumented | ForEach-Object { $_.Name })

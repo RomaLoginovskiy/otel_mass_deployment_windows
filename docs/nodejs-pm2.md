@@ -173,10 +173,84 @@ instrumentation reaches the process at all:
   finding says so, because a dump is a snapshot and can disagree with what will run next.
 - **Node as a Windows service without PM2** (`winsw`, `nssm`, or a bare SCM command line) — covered
   by `Instrument-NodeService.ps1`.
-- **Bare `node.exe`** from a scheduled task, **iisnode**, and **IIS ARR in front of PM2** — reported
-  as out of scope rather than silently assumed. For the ARR case the IIS side is deliberately not
-  claimed: the pool's environment never reaches the backend process, so the backend has to be
-  instrumented where it runs.
+- **iisnode** (Node hosted *by* IIS) — covered, but by `Instrument-IIS.ps1`, not this path. See
+  [Node under iisnode](#node-under-iisnode) below.
+- **Bare `node.exe`** from a scheduled task and **IIS ARR in front of PM2** — reported as out of
+  scope rather than silently assumed. For the ARR case the IIS side is deliberately not claimed:
+  the pool's environment never reaches the backend process, so the backend has to be instrumented
+  where it runs (PM2, or `Instrument-NodeService.ps1`).
+
+## Node under iisnode
+
+`iisnode` is a native IIS module that spawns `node.exe` as a **child of `w3wp`**. The only
+environment that reaches that child is the **app pool's**, which has two consequences:
+
+- **`Instrument-NodePM2.ps1` can never instrument such an app.** PM2 does not manage it, so it
+  never appears in `pm2 jlist` and no amount of `pm2 restart --update-env` touches it. On the host
+  this was built for, three apps that read as dark PM2 apps in the doctor output were iisnode pools
+  all along — same-named PM2 entries existed too, which is what made it look like a PM2 problem.
+- **Nothing about the .NET profiler applies.** An iisnode app is frequently *also* an ASP.NET
+  Framework app in the same pool (managed modules for some paths, an iisnode handler for others):
+  `w3wp` hosts the CLR, its `node.exe` child runs the JavaScript. Two processes, two
+  instrumentations.
+
+So classification treats iisnode as a **third axis**, never a `DotNetRuntime` value: a record
+carries `NodeHosting = 'iisnode'` alongside whatever `DotNetRuntime` it already had.
+
+| Where | What |
+| --- | --- |
+| Detection | `deploy\Resolve-IISAppRuntime.ps1` — a `<handlers>` entry with `modules="iisnode"` or `scriptProcessor=…iisnode.dll`, or an `<iisnode>` element. Inherited from a parent application when the app has no `web.config` of its own. |
+| Writing | `deploy\Instrument-IIS.ps1` — `NODE_OPTIONS` (merged, the app's own flags kept) plus `OTEL_SERVICE_NAME`, endpoint, protocol and the three exporter vars, **on the app pool**. On by default; `-NoIisnode` suppresses it. |
+| Already-deployed host | `misc\Enable-IisnodeInstrumentation.ps1` — pool env only, dry-run by default, per-pool recycle on `-Apply`. One copyable file. |
+| Grading | `deploy\Test-IISInstrumentation.ps1` (`IISNODE_*` codes) |
+| Ownership | the service names join `CX_NODE_SERVICES`, **not** `CX_IIS_SERVICES` |
+
+An **ARR rewrite to `127.0.0.1` is not iisnode** and is never claimed as such: a reverse proxy says
+nothing about what the backend is or where it runs, and the pool's environment does not reach it.
+
+Three things that decide whether it works:
+
+1. **The pool identity must be able to read the package.** It is not the deploying account and not
+   `LOCAL SERVICE` — by default it is the virtual account `IIS AppPool\<pool>`. Both writers grant
+   read+execute on the install prefix; without it `node` fails the preload and keeps serving,
+   uninstrumented.
+2. **The environment only takes effect on a recycle**, which is a request-path restart. Between the
+   write and the recycle the host reads as instrumented and emits nothing.
+3. **Two iisnode apps in one pool are left alone.** One pool-level `OTEL_SERVICE_NAME` cannot name
+   them apart, and a name that maps to two services is worse than no name
+   (`IISNODE_SHARED_POOL_AMBIGUOUS`). Same for an iisnode app sharing a pool with an instrumented
+   .NET app: writing the pool name would silently *rename* a service that was reporting correctly.
+   Give the app its own pool, or set the bootstrap per app via `<iisnode nodeProcessCommandLine>`.
+
+### ESM is different here, and it is not our limitation
+
+On the PM2 path an ES module needs the `--experimental-loader` hook. Under iisnode that fix does not
+apply, because **iisnode cannot host an ES module at all**:
+
+```
+Error [ERR_REQUIRE_ESM]: require() of ES Module ...\server.js
+from C:\Program Files\iisnode\interceptor.js not supported.
+```
+
+iisnode's `interceptor.js` does a CommonJS `require()` of the application's entry point, and a
+`require` can never load an ESM graph. Measured on a real host (iisnode 0.2.26, Node 20.11,
+Server 2025): every request returns **HTTP 500 / `HRESULT 0x2`**, and it does so identically
+
+- with our bootstrap **and with it removed**, and
+- for an `.mjs` entry **and** for a `"type":"module"` package.json.
+
+So it is a property of the host, not of instrumentation, and no loader hook can rescue it — the app
+never gets far enough to load one. Both writers therefore **refuse ESM apps outright**, and the
+doctor grades them `IISNODE_ESM_NOT_HOSTABLE` (**warn**, never pass — an app that 500s on every
+request must not be reported as instrumented). The fix is application-side: a CommonJS entry point
+that `import()`s the ESM app, or host it under PM2 / a Windows service instead.
+
+iisnode 0.2.26 (2015) is the last release, so this will not change upstream.
+
+> **Another APM agent on the host?** The Node side is additive, but the CLR loads exactly **one**
+> `ICorProfiler`. If something else already occupies that slot in `w3wp`, attaching the OTel .NET
+> profiler to those pools is a conflict, not double telemetry. `misc\Enable-IisnodeInstrumentation.ps1`
+> never touches the profiler variables for exactly this reason.
 
 ## Verify on the host
 

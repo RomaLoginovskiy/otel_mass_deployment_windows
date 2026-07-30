@@ -174,7 +174,16 @@ a distinct `OTEL_SERVICE_NAME` per app, points pools at the local collector, and
 | `-OverridesJson` | string | none | Path to a JSON file of the same `{ autoName = overrideName }` shape. |
 | `-RuntimeOverrides` | hashtable | `@{}` | Force an app's runtime when detection cannot decide, keyed by **application identity**: `@{ 'Wallet/api' = 'AspNetCore'; 'Static/' = 'NonDotNet' }`. Allowed values `AspNetCore`, `AspNetFramework`, `NonDotNet`; anything else fails the run. |
 | `-RuntimeOverridesJson` | string | `CX_RUNTIME_OVERRIDES_JSON` | Path to a JSON file of `{ "Site/AppPath": "AspNetCore" }` pairs, optionally wrapped as `{ "runtimeOverrides": { … } }`. |
+| `-NodeInstallPrefix` | string | `C:\cx\otel-node` | Where the OTel **Node** package is staged, for iisnode apps. Same package and default as `Instrument-NodePM2.ps1 -InstallPrefix`. Never installed by this script — see below. |
+| `-NoIisnode` | switch | off | Leave iisnode applications alone. They are still classified and reported; only the writing is suppressed. |
 | `-Session` | object | none | Open backup session. |
+
+**iisnode applications** are instrumented **by default**: `NODE_OPTIONS` (merged with the app's own
+flags), `OTEL_SERVICE_NAME`, endpoint, protocol and the three exporter variables go on the **app
+pool**, because iisnode's `node.exe` is a child of `w3wp` and inherits the pool's environment. Their
+names join `CX_NODE_SERVICES`, not `CX_IIS_SERVICES`. This path never runs `npm install` — the
+package must already be staged, or the app is reported `IISNODE_PACKAGE_MISSING` and left alone.
+Full behaviour: [nodejs-pm2.md](../nodejs-pm2.md#node-under-iisnode).
 
 The two override parameters use **different key spaces**, differing by one character for a root
 app: service-name keys are `Wallet` / `Wallet/api`, runtime keys are `Wallet/` / `Wallet/api`. The
@@ -479,6 +488,7 @@ they cannot be rolled back the way `Uninstall-Agent.ps1` rolls back an install.
 | `uninstall-coralogix-collector.ps1` | Removes it. | `-RemoveConfig` also deletes the config. |
 | `apply-config.ps1` | Applies a local collector config and restarts the service. | none |
 | `Set-CxServiceLabels.ps1` | Self-contained setup and diagnosis of `CX_IIS_SERVICES` for IIS **and** PM2 apps on one host. | `-Apply` (write, otherwise report only), `-RestartCollector` (default `$true`), `-NoUnion`, `-SkipIis`, `-SkipNode`, `-ServiceNameOverrides`, `-OverridesJson`, `-LogPath` |
+| `Enable-IisnodeInstrumentation.ps1` | Turns on zero-code OTel for **iisnode** apps on an already-deployed host, without re-running `Instrument-IIS.ps1`. App pool environment only: no `npm install`, no PM2, no `CX_*` labels, no collector, no .NET profiler. Recycles only the pools it changed — never `iisreset`. | `-Apply` (write + recycle, otherwise report only), `-Recycle` (default `$true`), `-Pools`, `-Apps`, `-InstallPrefix` (default `C:\cx\otel-node`), `-OtlpEndpoint`, `-ServiceNameOverrides`, `-OverridesJson`, `-LogPath` |
 | `Test-CxInstrumentation.ps1` | Read-only validator: is auto-instrumentation configured, and is every receiver in the config producing data? | `-Only`, `-CollectorConfig`, `-SampleSeconds` (default `35`), `-Fast`, `-ProbeEndpoints`, `-SendTestSpan`, `-JsonPath`, `-Quiet`, `-PassThru` |
 | `wire-db.ps1` | Wires database receivers into a local collector config. | none |
 

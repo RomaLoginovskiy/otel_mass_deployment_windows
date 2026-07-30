@@ -289,19 +289,73 @@ function Get-CxPm2Apps {
     return ,@($apps | Where-Object { $_.Name })
 }
 
-function Get-CxRegisterPathFromNodeOptions {
+# Fallback only. The canonical definition lives in Resolve-NodeServiceNames.ps1, dot-sourced above
+# when present, so the two doctors and the instrumenter parse a bootstrap the same way. This copy
+# keeps the check working when this file is run out of a partial package.
+if (-not (Get-Command Get-CxRegisterPathFromNodeOptions -ErrorAction SilentlyContinue)) {
+    function Get-CxRegisterPathFromNodeOptions {
+        [CmdletBinding()]
+        param([string] $NodeOptions)
+
+        if (-not $NodeOptions) { return $null }
+        $m = [regex]::Match($NodeOptions, '--require(?:=|\s+)(?:"([^"]+)"|(\S+))')
+        if (-not $m.Success) { return $null }
+        if ($m.Groups[1].Success) { return $m.Groups[1].Value }
+        return $m.Groups[2].Value
+    }
+}
+
+function Get-CxIisnodePoolServiceNames {
     <#
-      Extract the --require target from a NODE_OPTIONS value. Handles both the
-      quoted and unquoted forms.
+      Service names carried by APP POOLS that preload a Node bootstrap - i.e. iisnode
+      applications, Node hosted by IIS.
+
+      Why this lives in the PM2 doctor: CX_NODE_SERVICES is the Node ownership set for the whole
+      host, and since Instrument-IIS.ps1 also writes into it, "the variable must equal the PM2 apps"
+      became wrong. Left alone, every iisnode host would report NODE_SERVICE_NAME_DRIFT forever and
+      re-running Instrument-NodePM2.ps1 - which the message tells the operator to do - could never
+      clear it. That exact permanent-drift shape is documented at the CX_IIS_SERVICES write in
+      Instrument-IIS.ps1 and is worth not repeating.
+
+      Read straight out of applicationHost.config: no WebAdministration module, no IIS
+      enumeration, and it works when this doctor runs on a host whose IIS tooling is absent. A pool
+      qualifies on evidence, not on trust - it must carry BOTH a NODE_OPTIONS with a --require
+      target and an OTEL_SERVICE_NAME - so a pool someone else configured still counts, and a pool
+      with only an OTLP endpoint (inherited from applicationPoolDefaults) does not.
+
+      Returns @() on any failure. This is an accuracy improvement to another check's expected set,
+      never a reason to fail.
     #>
     [CmdletBinding()]
-    param([string] $NodeOptions)
+    param([string] $AppHostConfig)
 
-    if (-not $NodeOptions) { return $null }
-    $m = [regex]::Match($NodeOptions, '--require(?:=|\s+)(?:"([^"]+)"|(\S+))')
-    if (-not $m.Success) { return $null }
-    if ($m.Groups[1].Success) { return $m.Groups[1].Value }
-    return $m.Groups[2].Value
+    if (-not $AppHostConfig) {
+        # Sysnative, not System32: under a 32-bit PowerShell the System32 path is redirected to
+        # SysWOW64, where inetsrv\config does not exist.
+        $inetsrv = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+            Join-Path $env:windir 'Sysnative\inetsrv'
+        } else {
+            Join-Path $env:windir 'System32\inetsrv'
+        }
+        $AppHostConfig = Join-Path $inetsrv 'config\applicationHost.config'
+    }
+    if (-not (Test-Path -LiteralPath $AppHostConfig -ErrorAction SilentlyContinue)) { return @() }
+
+    $names = @()
+    try {
+        [xml]$c = Get-Content -LiteralPath $AppHostConfig -Raw -ErrorAction Stop
+        foreach ($pool in @($c.SelectNodes('/configuration/system.applicationHost/applicationPools/add'))) {
+            $envRoot = $pool.SelectSingleNode('environmentVariables')
+            if (-not $envRoot) { continue }
+            $nodeOpts = $envRoot.SelectSingleNode("add[@name='NODE_OPTIONS']")
+            $svc      = $envRoot.SelectSingleNode("add[@name='OTEL_SERVICE_NAME']")
+            if (-not $nodeOpts -or -not $svc) { continue }
+            if (-not (Get-CxRegisterPathFromNodeOptions -NodeOptions ([string]$nodeOpts.GetAttribute('value')))) { continue }
+            $v = [string]$svc.GetAttribute('value')
+            if ($v) { $names += $v }
+        }
+    } catch { return @() }
+    return @($names)
 }
 
 # ---------------------------------------------------------------------------
@@ -521,7 +575,17 @@ function Test-NodeInstrumentation {
     }
 
     # -- c (continued): CX_NODE_SERVICES must match the app service names ----
-    $expected = @($seenServiceNames | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+    # PM2 apps AND iisnode apps. The variable is the host's NODE ownership set, and
+    # Instrument-IIS.ps1 unions iisnode service names into it - so comparing against PM2 alone
+    # would report drift on every iisnode host, permanently, with a remediation
+    # ("re-run Instrument-NodePM2.ps1") that cannot clear it.
+    $iisnodeNames = @(Get-CxIisnodePoolServiceNames)
+    if (@($iisnodeNames).Count -gt 0) {
+        Add-F (New-Finding -Check 'nodeService' -Severity 'info' -Code 'IISNODE_SERVICES_INCLUDED' -Target 'CX_NODE_SERVICES' `
+            -Message "$(@($iisnodeNames).Count) iisnode application(s) also publish into CX_NODE_SERVICES (Node hosted by IIS, bootstrap on the app pool): $($iisnodeNames -join ', '). Test-IISInstrumentation.ps1 grades those." `
+            -Data @{ iisnodeServices = @($iisnodeNames) })
+    }
+    $expected = @(@($seenServiceNames) + @($iisnodeNames) | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
     $actual   = @()
     if ($cxNodeServices) {
         $actual = @($cxNodeServices -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
@@ -531,7 +595,7 @@ function Test-NodeInstrumentation {
         # already reported per app
     } elseif ($actual.Count -eq 0) {
         Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_MISSING' -Target 'CX_NODE_SERVICES' `
-            -Message "machine CX_NODE_SERVICES is not set, but $($expected.Count) PM2 app(s) carry a service name - host Service-ownership will be blank" `
+            -Message "machine CX_NODE_SERVICES is not set, but $($expected.Count) Node service name(s) exist on this host (PM2 apps and/or iisnode pools) - host Service-ownership will be blank" `
             -Data @{ expected = $expected })
     } elseif (Compare-Object $expected $actual -CaseSensitive) {
         # Set comparison, not string: app add/remove reorders the join and would
@@ -543,7 +607,7 @@ function Test-NodeInstrumentation {
         # label and the app's own service name was reported as a pass. The collector stamps the literal
         # string, so the casing has to match for host<->APM correlation to resolve.
         Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' -Target 'CX_NODE_SERVICES' `
-            -Message "CX_NODE_SERVICES does not match the running apps. var=[$($actual -join ', ')] apps=[$($expected -join ', ')] - re-run Instrument-NodePM2.ps1" `
+            -Message "CX_NODE_SERVICES does not match this host's Node services. var=[$($actual -join ', ')] apps=[$($expected -join ', ')] - re-run Instrument-NodePM2.ps1 (PM2 apps) and/or Instrument-IIS.ps1 (iisnode pools), whichever the missing names belong to" `
             -Data @{ cxNodeServices = $actual; appServiceNames = $expected })
     } else {
         Add-F (New-Finding -Check 'nodeService' -Severity 'pass' -Target 'CX_NODE_SERVICES' `

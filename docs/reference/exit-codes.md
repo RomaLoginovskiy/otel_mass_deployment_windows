@@ -60,7 +60,8 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `HEALTH_UNHEALTHY` | The endpoint answered with a non-200 (commonly 503 during a crash-loop). | Same as above; the event log carries the reason. |
 | `PROFILER_REGISTRY_MALFORMED` | An empty element in the W3SVC/WAS `Environment` REG_MULTI_SZ. **Prevents IIS from starting** — act-now severity, which is why it outranks every other instrumentation finding. | Repair the REG_MULTI_SZ, or restore it from the install backup. |
 | `NODE_PM2_DAEMON_OWNER_MISMATCH` | The PM2 daemon is owned by another account (typically `NT AUTHORITY\LOCAL SERVICE`, PM2 installed as a Windows service) and its apps have been **proven** to exist. Nothing this account does with `pm2` can reach them: `pm2` answers for an empty daemon of its own and exits 0. | Run `pm2` as the owning account — `Instrument-NodePM2.ps1` does this automatically; see [../nodejs-pm2.md](../nodejs-pm2.md). |
-| `NODE_ESM_REQUIRE_MISMATCH` | The app is an ES module but `NODE_OPTIONS` uses `--require`, which cannot load the instrumentation into an ESM graph. The app starts normally and emits nothing, with no error anywhere. | Re-run the Node instrumenter so it emits `--import` (Node ≥ 20). |
+| `NODE_ESM_REQUIRE_MISMATCH` | The app is an ES module but `NODE_OPTIONS` carries no `--experimental-loader` hook, so nothing patches its import graph. The app starts normally and emits nothing, with no error anywhere. | Re-run the Node instrumenter: it adds the loader hook for ESM apps. Note `--import` alone is **not** the fix — measured against a real ESM app, both `--require` and `--import` yield zero spans; only `--experimental-loader=file:///…/hook.mjs` plus `--require` produces telemetry. |
+| `IISNODE_ESM_NOT_HOSTABLE` | **warn, not fail.** An **iisnode** app that is an ES module. iisnode's `interceptor.js` does a CommonJS `require()` of the entry point, so an ESM app fails with `ERR_REQUIRE_ESM` and returns HTTP 500 on **every** request — measured on iisnode 0.2.26 / Node 20, with and without instrumentation, for both an `.mjs` entry and a `"type":"module"` package.json. Not instrumented and not claimed: there is no working process to instrument. The loader hook cannot help here (unlike the PM2 path) because the app never gets far enough to load one. | Application-side and unrelated to telemetry: give it a CommonJS entry point that `import()`s the ESM app, or host it under PM2 / a Windows service instead of iisnode. |
 
 ## `warn` — exit 2
 
@@ -121,6 +122,11 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `NODE_PACKAGE_MISSING` | The OTel Node package is not staged under the install prefix. | Re-run `Instrument-NodePM2.ps1` without `-SkipInstall`, or pre-stage the package. |
 | `NODE_OPTIONS_MISSING` | A PM2 app carries no `NODE_OPTIONS` bootstrap — it is not instrumented. | Re-run the Node instrumenter. |
 | `NODE_REGISTER_PATH_STALE` | `NODE_OPTIONS` points at a register bootstrap that no longer exists. | Re-run the Node instrumenter. |
+| `IISNODE_NODE_OPTIONS_MISSING` | An **iisnode** application's app pool carries no bootstrap, so it emits nothing. iisnode spawns `node.exe` as a child of `w3wp`, so the environment must be on the **pool** — `Instrument-NodePM2.ps1` cannot reach these apps however healthy PM2 looks. | `Instrument-IIS.ps1`, or `misc\Enable-IisnodeInstrumentation.ps1 -Apply` on an already-deployed host. |
+| `IISNODE_REGISTER_PATH_STALE` | The pool's `NODE_OPTIONS` points at a register bootstrap that is gone, so `node` fails the preload and serves uninstrumented. | Re-run either writer. |
+| `IISNODE_SHARED_POOL_AMBIGUOUS` | Two or more iisnode applications share one pool. Their `node.exe` children inherit **one** environment, so a single `OTEL_SERVICE_NAME` cannot name them apart and none is written. | Give each application its own pool, or set the bootstrap per app via `<iisnode nodeProcessCommandLine>`. |
+| `IISNODE_PACKAGE_MISSING` | An iisnode app was found but the OTel Node package is not staged. The IIS path deliberately does not run `npm install` — IIS hosts are frequently offline. | Stage it with `Instrument-NodePM2.ps1`, or copy a prepared `node_modules` tree into the prefix. |
+| `IISNODE_SERVICE_NAME_MISSING` | The bootstrap is on the pool but `OTEL_SERVICE_NAME` is not, so spans land under the SDK default (`unknown_service:node`). | Re-run either writer. |
 
 ### IIS access logs
 
@@ -150,7 +156,13 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `NODE_PM2_SERVICE_HOSTED` | PM2 runs as a Windows service. Reports the owning account, `PM2_HOME` and the worker count. Context for how instrument and uninstall have to invoke `pm2`. |
 | `NODE_PM2_APPS_FROM_DUMP` | `dump.pm2` lists apps the live daemon did not. Either they are stopped, or a second daemon owns them. |
 | `NODE_SERVICES_NOT_CONSUMED` | `CX_NODE_SERVICES` is set but no processor in the effective config reads it, so Node host Service ownership stays blank. Decided by looking at the effective config, so it disappears on its own once a processor is added. |
+| `IISNODE_APP_INSTRUMENTED` | Graded `pass`. The pool carries the bootstrap, so `w3wp`'s `node.exe` child loads the SDK. |
+| `IISNODE_SERVICES_INCLUDED` | The Node doctor found iisnode service names published into `CX_NODE_SERVICES` by the IIS path. Reported so the set is not mistaken for PM2 drift — `Test-IISInstrumentation.ps1` grades those apps. |
+| `IISNODE_CUSTOM_COMMAND_LINE` | The app sets `<iisnode nodeProcessCommandLine>`, which replaces the `node.exe` invocation. Pool `NODE_OPTIONS` still applies, but if that command line preloads its own OTel bootstrap the SDK could load twice. |
+| `IISNODE_ESM_UNDETERMINED` | Graded `unknown`. The bootstrap is present, but `Resolve-NodeServiceNames.ps1` was not next to the doctor, so the app's module system could not be determined and a `--require`-only bootstrap cannot be graded a pass. |
 | `CX_SERVICES_MISSING` | The union variable is unset while per-workload slices exist. |
+| `CX_SERVICES_NOT_CONSUMED` | **warn.** `CX_SERVICES` is set and correct, but the collector config **in force** does not read `${env:CX_SERVICES}` — it stamps host ownership from `CX_IIS_SERVICES` only (the pre-`CX_SERVICES` fallback). Every non-IIS service is therefore published in the variables and **claimed by no host**, while still reporting in APM — which reads as a Coralogix-side problem rather than a config one. Decided from the **effective** config when one exists: that is the base merged with what Fleet Management sends and is literally `otelcol`'s `--config`, so a newer base config on disk does **not** override it. Fix in the remote config for the host, using `deploy/config.supervisor.yaml`'s `transform/iis_service_labels` as the reference. |
+| `CX_SERVICES_CONSUMER_UNKNOWN` | No collector config was readable, so whether ownership is stamped from `CX_SERVICES` could not be determined. Graded `unknown`, not a failure. |
 
 ## `skip` — legitimately not applicable
 

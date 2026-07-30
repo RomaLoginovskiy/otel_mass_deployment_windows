@@ -92,7 +92,7 @@ scope — so each workload reports under its own name.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | pool / service | `http://127.0.0.1:4318`. The IPv4 literal is deliberate: `localhost` resolves to `::1` first on a dual-stack Windows host and export is dropped with no error. |
 | `OTEL_SERVICE_NAME` | pool or `web.config` / service | Per-app name — site name for a root app, `Site/api` for a nested one; the Windows service name for a service; the PM2 app name for a PM2 app. |
 | `OTEL_DOTNET_AUTO_HOME` + `CORECLR_*` / `COR_*` profiler variables | W3SVC/WAS service `Environment`, or the target service | Written by the .NET auto-instrumentation module. An empty element in this REG_MULTI_SZ **stops IIS starting** (`PROFILER_REGISTRY_MALFORMED`). |
-| `NODE_OPTIONS` | per PM2 app / Node service | Loads the OTel bootstrap — `--require` for CommonJS, `--import` for ESM. The wrong form starts the app and emits nothing. |
+| `NODE_OPTIONS` | per PM2 app / Node service / **iisnode app pool** | Loads the OTel bootstrap — `--require` for CommonJS, plus `--experimental-loader=file:///…/hook.mjs` for ESM. The wrong form starts the app and emits nothing. Always **merged** with the app's own flags, never overwritten: an app that sets `--max-old-space-size` for a reason keeps its heap ceiling. For iisnode the value goes on the **app pool**, because `node.exe` is a child of `w3wp` and inherits the pool's environment. |
 
 ## Where a value lives, and which copy wins
 
