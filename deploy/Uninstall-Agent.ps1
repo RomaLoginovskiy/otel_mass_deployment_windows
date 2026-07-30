@@ -484,8 +484,12 @@ try {
         # Ownership-checked: entries are removed only when a path-bearing value resolves under a
         # directory this purge is about to delete. A service instrumented by something else keeps its
         # own configuration.
+        # Includes the bitness-specific PATH names the service instrumenter now writes: the CLR
+        # prefers *_PATH_64, so one left behind pointing into a removed payload is not cosmetic.
         $ourSvcNames = @('CORECLR_ENABLE_PROFILING','CORECLR_PROFILER','CORECLR_PROFILER_PATH',
+                         'CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32',
                          'COR_ENABLE_PROFILING','COR_PROFILER','COR_PROFILER_PATH',
+                         'COR_PROFILER_PATH_64','COR_PROFILER_PATH_32',
                          'OTEL_DOTNET_AUTO_HOME','DOTNET_ADDITIONAL_DEPS','DOTNET_SHARED_STORE',
                          'DOTNET_STARTUP_HOOKS','OTEL_DOTNET_AUTO_PLUGINS','NODE_OPTIONS',
                          'OTEL_EXPORTER_OTLP_ENDPOINT','OTEL_EXPORTER_OTLP_PROTOCOL','OTEL_SERVICE_NAME')
