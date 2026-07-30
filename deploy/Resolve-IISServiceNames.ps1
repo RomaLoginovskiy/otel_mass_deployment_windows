@@ -103,6 +103,14 @@ function Get-IISServiceMap {
             PoolManagedRuntimeVersion = $null
             PoolClrLoads              = $null
             RuntimeReason             = $null
+            # Node axis, same reason as above: declared for every record so a caller can test
+            # $r.NodeHosting without first testing whether the property exists.
+            NodeHosting               = $null
+            NodeEvidence              = @()
+            NodeEntryScript           = $null
+            NodeIsEsm                 = $false
+            NodeInheritedFrom         = $null
+            NodePoolShared            = $false   # filled in by the pool tally below
         })
 
         foreach ($app in (Get-WebApplication -Site $siteName)) {
@@ -131,6 +139,12 @@ function Get-IISServiceMap {
                 PoolManagedRuntimeVersion = $null
                 PoolClrLoads              = $null
                 RuntimeReason             = $null
+                NodeHosting               = $null
+                NodeEvidence              = @()
+                NodeEntryScript           = $null
+                NodeIsEsm                 = $false
+                NodeInheritedFrom         = $null
+                NodePoolShared            = $false
             })
         }
     }
@@ -187,6 +201,11 @@ function Get-IISServiceMap {
                 $r.PoolManagedRuntimeVersion = $rt.PoolManagedRuntimeVersion
                 $r.PoolClrLoads              = $rt.PoolClrLoads
                 $r.RuntimeReason             = $rt.RuntimeReason
+                $r.NodeHosting               = $rt.NodeHosting
+                $r.NodeEvidence              = @($rt.NodeEvidence)
+                $r.NodeEntryScript           = $rt.NodeEntryScript
+                $r.NodeIsEsm                 = [bool]$rt.NodeIsEsm
+                $r.NodeInheritedFrom         = $rt.NodeInheritedFrom
             } catch {
                 # One unclassifiable app must not take the whole enumeration down. Unknown is
                 # the honest answer and the installer already declines to write for it.
@@ -208,13 +227,25 @@ function Get-IISServiceMap {
     }
 
     # Tally applications per pool, then stamp the scope on each record.
-    $poolCounts = @{}
+    #
+    # Two tallies, not one. Scope answers "can a pool-level OTEL_SERVICE_NAME name this app", which
+    # is about ALL apps in the pool. NodePoolShared answers "can a pool-level NODE_OPTIONS +
+    # OTEL_SERVICE_NAME name this iisnode app", which is about the IISNODE apps in the pool only -
+    # an iisnode app co-hosted with a static app is still the pool's only Node service and can be
+    # named, while two iisnode apps in one pool cannot be told apart by any pool-level variable.
+    $poolCounts     = @{}
+    $poolNodeCounts = @{}
     foreach ($r in $records) {
         if ($poolCounts.ContainsKey($r.Pool)) { $poolCounts[$r.Pool]++ }
         else { $poolCounts[$r.Pool] = 1 }
+        if ($r.NodeHosting -eq 'iisnode') {
+            if ($poolNodeCounts.ContainsKey($r.Pool)) { $poolNodeCounts[$r.Pool]++ }
+            else { $poolNodeCounts[$r.Pool] = 1 }
+        }
     }
     foreach ($r in $records) {
         $r.Scope = if ($poolCounts[$r.Pool] -eq 1) { 'pool' } else { 'webconfig' }
+        $r.NodePoolShared = [bool]($poolNodeCounts.ContainsKey($r.Pool) -and $poolNodeCounts[$r.Pool] -gt 1)
     }
 
     return $records
