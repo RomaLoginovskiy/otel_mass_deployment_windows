@@ -75,7 +75,7 @@ function Get-ScriptFunctionText {
 }
 
 Invoke-Expression (Get-ScriptFunctionText -Path $patch -Names @(
-    'Get-LocalIisnodeEvidence','Test-LocalAppIsEsm','Resolve-LocalNodeBootstrap','Merge-LocalNodeOptions','Get-PoolIdentityAccount','Get-PoolNameConflict'))
+    'Get-LocalIisnodeEvidence','Test-LocalAppIsEsm','Resolve-LocalNodeBootstrap','Merge-LocalNodeOptions','Get-PoolIdentityAccount','Get-PoolNameConflict','Test-CxBootstrapInValue'))
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-True {
@@ -232,6 +232,26 @@ try {
     Assert-Eq 'stripping ours from a value that is only ours leaves nothing' '' (Remove-CxNodeOptionsBootstrap -Existing $esm -OwnedTargets @($reg, $hook))
     Assert-Eq "an app's own --require is never removed" '--require C:/app/patch.js' (Remove-CxNodeOptionsBootstrap -Existing '--require C:/app/patch.js' -OwnedTargets @($reg, $hook))
     Assert-Eq 'a marker-bearing legacy hook is still recognised' '-X' (Remove-CxNodeOptionsBootstrap -Existing '--require D:/old/opentelemetry/register.js -X' -OwnedTargets @())
+
+    Write-Host ''
+    Write-Host '== the write gate: does the merged value actually carry the bootstrap? ==' -ForegroundColor Cyan
+
+    # This gate is the difference between a run that FAILS loudly and one that writes a service name
+    # onto 35 pools with no --require among them. It exists because a drifted library returned a
+    # bootstrap object the patch script could not read, $merged came out empty, and every OTEL_*
+    # variable was written anyway - so the empty and whitespace cases are pinned, not assumed.
+    Assert-True 'a merged CommonJS value passes'        (Test-CxBootstrapInValue -Value "$own $cjs" -RegisterPath $reg)
+    Assert-True 'a merged ESM value passes'             (Test-CxBootstrapInValue -Value "$esm $own"  -RegisterPath $reg)
+    Assert-True 'backslashes still match'               (Test-CxBootstrapInValue -Value "--require $($reg -replace '/','\')" -RegisterPath $reg)
+    Assert-True 'case differences still match'          (Test-CxBootstrapInValue -Value "--require $($reg.ToUpperInvariant())" -RegisterPath $reg)
+    Assert-True 'an empty value is refused'        (-not (Test-CxBootstrapInValue -Value ''    -RegisterPath $reg))
+    Assert-True 'a null value is refused'          (-not (Test-CxBootstrapInValue -Value $null -RegisterPath $reg))
+    Assert-True 'whitespace only is refused'       (-not (Test-CxBootstrapInValue -Value '   ' -RegisterPath $reg))
+    Assert-True "the app's own flags alone are refused" (-not (Test-CxBootstrapInValue -Value $own -RegisterPath $reg))
+    Assert-True 'a DIFFERENT register.js is refused'    (-not (Test-CxBootstrapInValue -Value '--require C:/app/patch.js' -RegisterPath $reg))
+    Assert-True 'the path present without a preload flag is refused' (-not (Test-CxBootstrapInValue -Value "--stack-size=2000 $reg" -RegisterPath $reg))
+    # A bootstrap-less merge and an unresolvable package are the same refusal: nothing gets written.
+    Assert-True 'no RegisterPath to compare against is refused' (-not (Test-CxBootstrapInValue -Value "$own $cjs" -RegisterPath ''))
 
     Write-Host ''
     Write-Host '== bootstrap resolution against a staged package ==' -ForegroundColor Cyan

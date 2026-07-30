@@ -55,14 +55,20 @@
   With -Apply, recycle each pool whose environment changed, so its node.exe children come back
   with the bootstrap. Default $true. Suppress with -Recycle:$false to apply in a maintenance
   window - but note that until the recycle happens the host reads as instrumented and emits
-  nothing, which is the silent state this tooling exists to remove. NEVER runs iisreset: only the
-  pools that changed are recycled.
+  nothing, which is the silent state this tooling exists to remove. NEVER runs iisreset: only pools
+  whose BOOTSTRAP write succeeded are recycled. A pool whose NODE_OPTIONS write failed is left
+  running and named in the report - restarting it would interrupt the request path and bring its
+  node.exe children back just as unable to emit anything.
 
 .PARAMETER RefreshServiceLabels
   With -Apply, add the instrumented application names to machine CX_NODE_SERVICES, republish
   CX_SERVICES (the union the collector actually reads for host Service ownership), and restart the
   collector so it re-reads them. Default $true. Suppress with -RefreshServiceLabels:$false to leave
   every machine variable alone and touch only the app pools.
+
+  Only applications whose bootstrap actually reached their pool are published. A name published for
+  an application that emits nothing is worse than no name: the host entity claims a service with no
+  telemetry behind it while every variable involved still reads as correct.
 
   Why on by default: the collector's transform reads `${env:CX_SERVICES}`, not the per-runtime
   slices. An application instrumented without that update reports spans in APM while the HOST
@@ -379,6 +385,25 @@ function Merge-LocalNodeOptions {
     return (($kept | Where-Object { $_ }) -join ' ').Trim()
 }
 
+function Test-CxBootstrapInValue {
+    <#
+      Does a merged NODE_OPTIONS actually preload OUR register.js?
+
+      Asserted rather than assumed because every silent failure this script exists to prevent has the
+      same shape: the six OTEL_* variables land, the bootstrap does not, and the host reads as
+      instrumented while its applications emit nothing. Measured on a real host, where a foreign
+      deploy library returned a bootstrap object this script could not read: the merged value came out
+      empty, 35 pools were written and recycled, and the only complaint was a read-back mismatch with
+      a guess about file locks attached.
+    #>
+    param([string] $Value, [string] $RegisterPath)
+    if (-not $Value -or -not $RegisterPath) { return $false }
+    $v = ($Value -replace '\\','/').ToLowerInvariant()
+    $t = ($RegisterPath -replace '\\','/').ToLowerInvariant()
+    if (-not $v.Contains($t)) { return $false }
+    return [bool]($v -match '--(require|import)')
+}
+
 # ---------------------------------------------------------------------------------------------
 # Stage 0 - preflight
 # ---------------------------------------------------------------------------------------------
@@ -453,6 +478,19 @@ if (-not $boot.RegisterPath) {
     exit 2
 }
 Write-Step OK "bootstrap: $($boot.RegisterPath)"
+# RegisterPath being present is NOT enough to write anything: the string that reaches the pool is
+# $boot.Cjs. When this script runs next to a deploy checkout it takes that string from the library's
+# Resolve-CxNodeBootstrap ($b.NodeOptionsCjs), so a library that names the property differently -
+# or does not return it at all - leaves Cjs empty while RegisterPath, and therefore the OK line
+# above, still reads healthy. Measured on a real host: the run then wrote the six OTEL_* variables
+# to 35 pools with an EMPTY NODE_OPTIONS among them and recycled every one of them, producing
+# exactly the reads-instrumented-emits-nothing state this tooling exists to remove. Preflight abort,
+# because there is no application on this host it could be written correctly for.
+if (-not $boot.Cjs) {
+    Write-Step FAIL "the bootstrap FLAG came back empty even though register.js was found at $($boot.RegisterPath) - $(if ($haveLibs) { "the deploy libraries in use ($libMode) returned a shape this script could not read" } else { 'the standalone resolver in this file produced no --require flag' })" `
+        -Fix $(if ($haveLibs) { "that library's Resolve-CxNodeBootstrap must expose NodeOptionsCjs - check with: . <deploy>\Resolve-NodeServiceNames.ps1 ; Resolve-CxNodeBootstrap -InstallPrefix $InstallPrefix | Format-List * . Or copy this ONE file to a directory with no deploy\ beside or above it, which forces the standalone fallbacks this script's own tests pin against the repository libraries" } else { 'this is a bug in Resolve-LocalNodeBootstrap in this file, not a host problem' })
+    exit 2
+}
 # The ESM loader hook is deliberately NOT required here. It is the fix on the PM2 path, where node
 # runs the app directly; under iisnode an ES module cannot start at all (its interceptor require()s
 # the entry point), so ESM apps are refused regardless and the hook is only tracked so a stale one
@@ -682,6 +720,18 @@ foreach ($r in $selected) {
         Merge-LocalNodeOptions -Existing $existing -Bootstrap $bootstrap -OwnedTargets $owned
     }
 
+    # The merge is checked, not trusted. $ErrorActionPreference is 'Continue' here (a classifier that
+    # cannot read one web.config must not abort a host-wide run), which means a failed call to a
+    # drifted library function - a missing -OwnedTargets parameter, say - only writes an error to the
+    # console and leaves $merged null. Without this gate the six OTEL_* variables below are still
+    # written, and a pool carrying a service name and no --require is an application that reports
+    # nothing while every variable on it reads as configured.
+    if (-not (Test-CxBootstrapInValue -Value $merged -RegisterPath $boot.RegisterPath)) {
+        Write-Step FAIL "$label - the merged NODE_OPTIONS does not carry the bootstrap, so NOTHING is written for this application (its pool is left exactly as it was). Merged value: '$merged'" `
+            -Fix $(if ($haveLibs) { "Merge-CxNodeOptions from $libMode returned a value without $($boot.RegisterPath) - check its signature accepts -OwnedTargets: (Get-Command Merge-CxNodeOptions).Parameters.Keys . Or copy this ONE file to a directory with no deploy\ beside or above it to force the fallbacks in this file" } else { 'this is a bug in Merge-LocalNodeOptions in this file, not a host problem' })
+        continue
+    }
+
     $vars = [ordered]@{
         NODE_OPTIONS                = $merged
         OTEL_SERVICE_NAME           = $r.ServiceName
@@ -746,8 +796,17 @@ try {
     Write-Step WARN "could not back up applicationHost.config: $($_.Exception.Message) - continuing, the writes below are individually reversible with appcmd"
 }
 
-$touchedPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $grantedPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+# Pools whose BOOTSTRAP is on disk when this run ends - the only pools worth recycling, and the only
+# applications this host may claim. Deliberately NOT "pools where some write succeeded": any one of
+# the seven variables landing used to mark a pool as changed, so a run whose NODE_OPTIONS write
+# failed still recycled every pool - a request-path restart for applications that came back just as
+# unable to emit anything - and still published their names for host ownership.
+$bootstrapPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$brokenPools    = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$claimNames     = New-Object System.Collections.Generic.List[string]
+$brokenApps     = New-Object System.Collections.Generic.List[string]
 
 foreach ($w in $work) {
     $r = $w.Record
@@ -766,22 +825,50 @@ foreach ($w in $work) {
         }
     }
 
+    # NODE_OPTIONS absent from the change set means the pool already carried this exact bootstrap -
+    # Stage 2 refuses to plan a value without it - so "landed" is the correct default.
+    $bootstrapLanded = $true
+
     foreach ($k in $w.Changes.Keys) {
         $v = [string]$w.Changes[$k]
         # Idempotent: remove any existing entry, then add. The removal is best-effort - a pool that
         # never had the variable has nothing to remove.
         & $appcmd set config -section:system.applicationHost/applicationPools `
             "/-[name='$($r.Pool)'].environmentVariables.[name='$k']" /commit:apphost 2>$null | Out-Null
-        & $appcmd set config -section:system.applicationHost/applicationPools `
-            "/+[name='$($r.Pool)'].environmentVariables.[name='$k',value='$v']" /commit:apphost 2>&1 | Out-Null
-        $now = Get-PoolEnvValue -Pool $r.Pool -Name $k
+        # appcmd's own output on the ADD is KEPT. Discarding it (2>&1 | Out-Null) is what made this
+        # failure unreadable on a real host: 35 pools reported "did NOT take" with a guess about file
+        # locks attached, while appcmd's actual message - and its exit code - had been thrown away.
+        $addOut  = & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/+[name='$($r.Pool)'].environmentVariables.[name='$k',value='$v']" /commit:apphost 2>&1 | Out-String
+        $addCode = $LASTEXITCODE
+        $now     = Get-PoolEnvValue -Pool $r.Pool -Name $k
         if ([string]$now -eq $v) {
             Write-Step APPLY "$($r.Pool): $k set"
-            [void]$touchedPools.Add($r.Pool)
         } else {
-            Write-Step FAIL "$($r.Pool): $k did NOT take - applicationHost.config still reads '$now'" `
-                -Fix 'check for a locked applicationHost.config, a configuration lock on the section, or a read-only file'
+            # An unreadable config, an absent variable and a wrong value are three different faults
+            # with three different fixes. They used to be reported identically, because
+            # Get-PoolEnvValue returns $null for both "could not read the file" and "no such
+            # variable", and [string]$null renders as '' - so the report read "still reads ''" for a
+            # write that may never have been attempted.
+            $state = if (-not (Get-AppHostXml)) {
+                'applicationHost.config could not be re-read, so this write is UNVERIFIED rather than known-failed'
+            } elseif ($null -eq $now) {
+                'the variable is absent from applicationHost.config'
+            } else {
+                "applicationHost.config reads '$now'"
+            }
+            Write-Step FAIL "$($r.Pool): $k did NOT take - $state. appcmd exit $addCode$(if ($addOut.Trim()) { ": $($addOut.Trim())" } else { ' (appcmd printed nothing)' })" `
+                -Fix 'appcmd''s own message is above - work from it. Otherwise check for a configuration lock on system.applicationHost/applicationPools, a read-only applicationHost.config, or a value appcmd rejected'
+            if ($k -eq 'NODE_OPTIONS') { $bootstrapLanded = $false }
         }
+    }
+
+    if ($bootstrapLanded) {
+        [void]$bootstrapPools.Add($r.Pool)
+        $claimNames.Add([string]$r.ServiceName)
+    } else {
+        [void]$brokenPools.Add($r.Pool)
+        $brokenApps.Add("$($r.Key) [pool '$($r.Pool)']")
     }
 }
 
@@ -798,7 +885,16 @@ foreach ($w in $work) {
 Write-Host ''
 Write-Host '--- host ownership labels ---' -ForegroundColor Cyan
 
-$instrumentedNames = @($work | ForEach-Object { [string]$_.Record.ServiceName } | Where-Object { $_ } | Select-Object -Unique)
+# ONLY applications whose bootstrap landed. Publishing a name for an application that emits nothing
+# produces the exact confusion this variable exists to remove: the host entity claims a service with
+# no telemetry behind it, every variable involved still reads as correct, and the gap presents as a
+# Coralogix-side problem. Measured on a real host, where all 35 names were published in a run whose
+# 35 NODE_OPTIONS writes had every one of them failed.
+$instrumentedNames = @($claimNames | Where-Object { $_ } | Select-Object -Unique)
+if (@($brokenApps).Count) {
+    Write-Step WARN "$(@($brokenApps).Count) application(s) are NOT being claimed, because their bootstrap did not land: $($brokenApps -join ', '). Their pools carry the OTEL_* variables from this run and no --require, so they still emit nothing." `
+        -Fix 'work from the appcmd messages above, then re-run. To put those pools back as they were, restore the applicationHost.config backup named at the start of the apply stage'
+}
 if (-not $RefreshServiceLabels) {
     Write-Step WARN "-RefreshServiceLabels:`$false - CX_NODE_SERVICES / CX_SERVICES were NOT updated, so this host does not claim $(@($instrumentedNames).Count) newly instrumented service(s): $($instrumentedNames -join ', '). They will report in APM with no host ownership." `
         -Fix 'run misc\Set-CxServiceLabels.ps1 -Apply, or re-run this script without -RefreshServiceLabels:$false'
@@ -896,16 +992,29 @@ if (-not $RefreshServiceLabels) {
 Write-Host ''
 Write-Host '--- recycle ---' -ForegroundColor Cyan
 
-if (@($touchedPools).Count -eq 0) {
-    Write-Step INFO 'no pool environment actually changed, so no recycle is needed'
+# A pool with a failed bootstrap write is left running on purpose: a recycle is a request-path
+# restart, and its node.exe children would come back exactly as unable to emit anything. Only pools
+# that actually carry the bootstrap are worth that cost.
+$skippedPools = @($brokenPools | Where-Object { -not $bootstrapPools.Contains($_) })
+
+if (@($bootstrapPools).Count -eq 0) {
+    if (@($skippedPools).Count) {
+        Write-Step WARN "nothing is being recycled: the bootstrap landed on none of the $(@($skippedPools).Count) changed pool(s), so a restart would interrupt the request path and change nothing." `
+            -Fix 'work from the appcmd messages above, then re-run - this script recycles only pools whose bootstrap is on disk'
+    } else {
+        Write-Step INFO 'no pool environment actually changed, so no recycle is needed'
+    }
 } elseif (-not $Recycle) {
-    Write-Step WARN "-Recycle:`$false - $(@($touchedPools).Count) pool(s) still run the OLD environment: $(@($touchedPools) -join ', '). Until they recycle, this host READS as instrumented and emits nothing." `
+    Write-Step WARN "-Recycle:`$false - $(@($bootstrapPools).Count) pool(s) still run the OLD environment: $(@($bootstrapPools) -join ', '). Until they recycle, this host READS as instrumented and emits nothing." `
         -Fix "recycle them in your window: appcmd recycle apppool `"<pool>`""
 } else {
-    foreach ($p in @($touchedPools)) {
+    foreach ($p in @($bootstrapPools)) {
         $out = & $appcmd recycle apppool "$p" 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0) { Write-Step APPLY "recycled pool '$p' - its node.exe children restart with the bootstrap" }
         else { Write-Step FAIL "could not recycle pool '$p': $($out.Trim())" -Fix "recycle it by hand: appcmd recycle apppool `"$p`"" }
+    }
+    if (@($skippedPools).Count) {
+        Write-Step WARN "left $(@($skippedPools).Count) pool(s) un-recycled on purpose - their bootstrap did not land, so a restart would cost a request-path interruption and change nothing: $(@($skippedPools) -join ', ')"
     }
 }
 
