@@ -110,9 +110,20 @@ function Update-CxServicesUnion {
     )
 
     try {
+        # CX_IISNODE_SERVICES is its own slice, and it has to be: iisnode names are written by
+        # Instrument-IIS.ps1, but they are Node services, so they used to be folded into
+        # CX_NODE_SERVICES - a variable a LATER instrumenter owns. MEASURED on cx-e2e-c1: with no
+        # live PM2 apps, Instrument-NodePM2.ps1 took its clear-the-stale-value path, set
+        # CX_NODE_SERVICES empty, and wiped both iisnode names; the two applications were
+        # instrumented and reporting while the host claimed neither, every finding reading PASS.
+        # One slice per writer is what makes that impossible: a writer may only clear its own.
+        $nodeSlices = @(
+            [Environment]::GetEnvironmentVariable('CX_NODE_SERVICES',    'Machine')
+            [Environment]::GetEnvironmentVariable('CX_IISNODE_SERVICES', 'Machine')
+        ) | Where-Object { $_ }
         $union = @(Get-CxServicesUnionValue `
             -Iis    ([Environment]::GetEnvironmentVariable('CX_IIS_SERVICES',    'Machine')) `
-            -Node   ([Environment]::GetEnvironmentVariable('CX_NODE_SERVICES',   'Machine')) `
+            -Node   ($nodeSlices -join ',') `
             -DotNet ([Environment]::GetEnvironmentVariable('CX_DOTNET_SERVICES', 'Machine')))
 
         $prior = [Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')

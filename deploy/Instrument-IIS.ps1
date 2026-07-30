@@ -857,19 +857,37 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
 # rollout: PM2 apps on this host wrote their names into this variable, and overwriting would strip
 # the ownership label off services that are reporting fine - which reads in Coralogix as those
 # services having gone away.
+#
+# CX_IISNODE_SERVICES, not CX_NODE_SERVICES. Unioning into the PM2 variable was not enough, because
+# the next instrumenter OWNS that variable: MEASURED on cx-e2e-c1, Instrument-NodePM2.ps1 found no
+# live PM2 apps, took its clear-the-stale-value path, and set CX_NODE_SERVICES empty - wiping both
+# iisnode names. The two applications stayed instrumented and reporting while the host claimed
+# neither, with every finding in the run reading PASS. Update-CxServicesUnion folds this slice into
+# CX_SERVICES alongside the others, so one slice per writer and a writer may only clear its own.
+$iisnodeValue = ''
 if (@($iisnodeApps).Count -gt 0) {
-    $nodeNames = @($iisnodeApps | ForEach-Object { [string]$_.ServiceName } | Where-Object { $_ })
-    $priorNode = [Environment]::GetEnvironmentVariable('CX_NODE_SERVICES', 'Machine')
-    $existingNode = @()
-    if ($priorNode) { $existingNode = @($priorNode -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    $nodeUnion = @(@($existingNode) + @($nodeNames) | Where-Object { $_ } | Select-Object -Unique)
-    $nodeValue = ($nodeUnion -join ',')
-    if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
-        Record-EnvChange -Session $Session -Name 'CX_NODE_SERVICES' -PriorValue $priorNode
+    $nodeNames = @($iisnodeApps | ForEach-Object { [string]$_.ServiceName } | Where-Object { $_ } | Select-Object -Unique)
+    $priorNode = [Environment]::GetEnvironmentVariable('CX_IISNODE_SERVICES', 'Machine')
+    $iisnodeValue = ($nodeNames -join ',')
+    if ($iisnodeValue -ne [string]$priorNode) {
+        if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+            Record-EnvChange -Session $Session -Name 'CX_IISNODE_SERVICES' -PriorValue $priorNode
+        }
+        [Environment]::SetEnvironmentVariable('CX_IISNODE_SERVICES', $iisnodeValue, 'Machine')
+        $env:CX_IISNODE_SERVICES = $iisnodeValue
+        Write-Host "[iis-instr] set machine CX_IISNODE_SERVICES=$iisnodeValue ($(@($nodeNames).Count) iisnode service(s) claimed)" -ForegroundColor Green
     }
-    [Environment]::SetEnvironmentVariable('CX_NODE_SERVICES', $nodeValue, 'Machine')
-    $env:CX_NODE_SERVICES = $nodeValue
-    Write-Host "[iis-instr] set machine CX_NODE_SERVICES=$nodeValue ($(@($nodeNames).Count) iisnode service(s) added to the Node ownership set)" -ForegroundColor Green
+}
+elseif ([Environment]::GetEnvironmentVariable('CX_IISNODE_SERVICES', 'Machine')) {
+    # This script owns this slice, so it is also the only one that may clear it - a leftover here
+    # would keep the host claiming an iisnode app that no longer exists.
+    $priorNode = [Environment]::GetEnvironmentVariable('CX_IISNODE_SERVICES', 'Machine')
+    if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+        Record-EnvChange -Session $Session -Name 'CX_IISNODE_SERVICES' -PriorValue $priorNode
+    }
+    [Environment]::SetEnvironmentVariable('CX_IISNODE_SERVICES', $null, 'Machine')
+    $env:CX_IISNODE_SERVICES = $null
+    Write-Host "[iis-instr] cleared stale CX_IISNODE_SERVICES (no instrumented iisnode apps)" -ForegroundColor Yellow
 }
 
 # ---- 2b-iv. Republish CX_SERVICES ---------------------------------------------
