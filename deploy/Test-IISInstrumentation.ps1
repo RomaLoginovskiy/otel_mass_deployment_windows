@@ -581,9 +581,59 @@ function Test-IISInstrumentation {
                 -Message "$svc has CORECLR_PROFILER but CORECLR_ENABLE_PROFILING='$clrEnable' (expected '1') - the profiler is registered but switched off" `
                 -Data @{ profiler = $clrGuid; enable = $clrEnable })
         } else {
-            Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
-                -Message "profiler registered (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
-                -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; coreclrEnable = $clrEnable; corEnable = $fwEnable })
+            # WHOSE profiler, not merely whether one is registered. Only ONE CLR profiler can attach
+            # to a process, so a GUID that is not ours means another vendor's agent owns IIS here and
+            # our .NET instrumentation produces NOTHING - while a check that stopped at "a profiler
+            # is registered and enabled" graded that host a pass. That is the reads-healthy /
+            # emits-nothing report this tooling exists to prevent.
+            #
+            # Decided by comparing against OUR CLSID, never by recognising a vendor: an agent we have
+            # never heard of must fail this too. The name is a hint for the operator, nothing more.
+            $otelClsid = '{918728DD-259F-4A6A-AC2B-B85E1B658318}'
+            $foreign = @()
+            foreach ($pair in @(@('CORECLR_PROFILER', $clrGuid), @('COR_PROFILER', $fwGuid))) {
+                $n, $g = $pair
+                if ($g -and $g -ne $otelClsid) { $foreign += "$n=$g" }
+            }
+            if (@($foreign).Count -gt 0) {
+                # Path is the stronger vendor signal than the CLSID, and it is the one an operator can
+                # act on: it names the product and the tree to uninstall or exclude.
+                $paths = @('CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH','COR_PROFILER_PATH_64','COR_PROFILER_PATH' |
+                            ForEach-Object { Get-CxEnvEntry -Entries $entries -Name $_ } | Where-Object { $_ } | Select-Object -Unique)
+                $vendor = switch -Regex ($paths -join ';') {
+                    'dynatrace|oneagent'   { 'Dynatrace OneAgent'; break }
+                    'newrelic'             { 'New Relic'; break }
+                    'appdynamics|appdynam' { 'AppDynamics'; break }
+                    'datadog|dd-trace'     { 'Datadog'; break }
+                    'elastic'              { 'Elastic APM'; break }
+                    'instana'              { 'Instana'; break }
+                    default                { 'an unidentified third-party agent' }
+                }
+                Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_FOREIGN_OWNER' -Target $svc `
+                    -Message "$svc registers a CLR profiler that is NOT the OpenTelemetry one ($($foreign -join ', ')), and only one profiler can attach to a process - so .NET auto-instrumentation emits NOTHING for anything this service starts, however healthy the collector is. The DLL path points at $vendor$(if ($paths) { " ($($paths -join ', '))" }). Decide which agent owns .NET on this host: keep theirs and instrument these applications another way, or remove/exclude theirs and re-run the install." `
+                    -Data @{ foreign = $foreign; expected = $otelClsid; paths = @($paths); vendorHint = $vendor })
+            } else {
+                Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
+                    -Message "profiler registered and it is ours (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
+                    -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; coreclrEnable = $clrEnable; corEnable = $fwEnable })
+            }
+
+            # Our GUID with somebody else's library is the subtler half, and it is silent: the CLR
+            # loads that DLL, asks it for our CLSID, gets nothing, and attaches no profiler. It
+            # happens when a bitness-specific path from another agent outranks the unsuffixed one.
+            if (@($foreign).Count -eq 0) {
+                $home = Get-CxEnvEntry -Entries $entries -Name 'OTEL_DOTNET_AUTO_HOME'
+                foreach ($pn in @('CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32','CORECLR_PROFILER_PATH',
+                                  'COR_PROFILER_PATH_64','COR_PROFILER_PATH_32','COR_PROFILER_PATH')) {
+                    $dll = Get-CxEnvEntry -Entries $entries -Name $pn
+                    if (-not $dll -or -not $home) { continue }
+                    if ($dll -notlike "$home*") {
+                        Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_PATH_FOREIGN' -Target "$svc/$pn" `
+                            -Message "$pn points outside OTEL_DOTNET_AUTO_HOME while CORECLR_PROFILER is ours: '$dll' is not under '$home'. The CLR loads that library, asks it for our CLSID and gets nothing, so no profiler attaches and no spans are produced - with every variable reading as configured. The CLR prefers the *_PATH_64 name over the unsuffixed one, so this is what a leftover from another agent looks like." `
+                            -Data @{ path = $dll; home = $home; name = $pn })
+                    }
+                }
+            }
         }
 
         # (b) does the DLL the registry points at still exist? A stale path lets
