@@ -19,14 +19,14 @@ exactly which files are tracked.
 > `Run-E2ELoop.ps1` is the only harness that exercises the **real** `deploy.bat` path
 > rather than re-implementing it. It found three defects in shipped scripts that the
 > offline diagnostics matrix could not — see
-> [`docs/iis-e2e-matrix.md`](../../docs/iis-e2e-matrix.md). Note the container cannot
+> [`iis-e2e-matrix.md`](../iis-e2e-matrix.md). Note the container cannot
 > install a collector (Server Core .NET cannot fetch the MSI); those phases skip.
 
 All require Docker Desktop in **Windows-container** mode and build from the **repo root**.
 
 ---
 
-# IIS + Coralogix supervisor E2E — Service-ownership tags
+## IIS + Coralogix supervisor E2E — Service-ownership tags
 
 End-to-end test that proves the deploy automation's **`CX_IIS_SERVICES`** env var populates the
 Coralogix **Service ownership** tags through the real **OpAMP supervisor + IIS** path, with the
@@ -162,7 +162,8 @@ The same image now also installs **Node.js + PM2** and runs the sample app in
 On start, `entrypoint.ps1` runs `pm2 start ecosystem.config.js`, then the real
 `deploy/Instrument-NodePM2.ps1` (npm-installs `@opentelemetry/auto-instrumentations-node`, sets
 per-app `NODE_OPTIONS`/`OTEL_*` via `pm2 restart --update-env`, `pm2 save`), then generates HTTP
-load against both ports in the keep-alive loop. See `docs/nodejs-pm2-instrumentation.md`.
+load against both ports in the keep-alive loop. See
+[`docs/nodejs-pm2.md`](../../docs/nodejs-pm2.md).
 
 Pass criteria (confirm in Coralogix via DataPrime, not the UI):
 - Container log `[node] pm2_pids=...` shows 3 PIDs (1 fork + 2 cluster workers) and
@@ -256,4 +257,4 @@ docker exec cx-doctor powershell -File C:\cx\break-state.ps1 -Case inspect
 docker exec cx-doctor powershell -File C:\cx\deploy\Test-Agent.ps1 -Only iisInstrumentation
 ```
 
-See [`docs/agent-diagnostics.md`](../../docs/agent-diagnostics.md) for every finding code.
+See [`docs/reference/exit-codes.md`](../../docs/reference/exit-codes.md) for every finding code.
