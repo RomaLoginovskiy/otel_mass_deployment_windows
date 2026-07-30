@@ -356,10 +356,17 @@ if (Use-Check 'env') {
     # variables are only its inputs. A host that publishes CX_NODE_SERVICES or CX_DOTNET_SERVICES but
     # no union silently falls back to IIS names, so those services are never claimed by the host
     # entity - the exact failure that looks like "APM has spans, Infra Explorer shows no ownership".
+    # Unlike the per-runtime checks below, this one is deliberately case-INSENSITIVE on both sides:
+    # Install-Agent.ps1 de-duplicates the union with an OrdinalIgnoreCase comparer and keeps the
+    # first-seen spelling, so an IIS 'MyApp' and a Node 'myapp' legitimately collapse to one entry and
+    # a case-sensitive comparison here would report drift on a correct host. Sort-Object -Unique is
+    # case-insensitive (Select-Object -Unique is not), which is why it is used. What this check owns is
+    # MEMBERSHIP - is every instrumented service in the union; the exact spelling that ends up on the
+    # telemetry is graded against the app names by the CX_IIS_SERVICES / CX_NODE_SERVICES checks.
     $cxServices = Get-MachineVar 'CX_SERVICES'
     $unionSet = @(@($cxIisServices, (Get-MachineVar 'CX_NODE_SERVICES'), (Get-MachineVar 'CX_DOTNET_SERVICES')) |
         Where-Object { $_ } | ForEach-Object { $_ -split ',' } | ForEach-Object { "$_".Trim() } |
-        Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+        Where-Object { $_ } | Sort-Object -Unique)
     if (-not $unionSet.Count) {
         Add-F (New-Finding -Check 'env' -Severity 'info' -Target 'CX_SERVICES' `
             -Message 'not set, and no IIS/Node/.NET service names are published either - nothing is instrumented on this host to claim')
@@ -368,7 +375,7 @@ if (Use-Check 'env') {
             -Message "not set, but $($unionSet.Count) service name(s) are published across CX_IIS_SERVICES/CX_NODE_SERVICES/CX_DOTNET_SERVICES. The collector falls back to IIS names only, so non-IIS services are not claimed for host ownership. Re-deploy: Install-Agent.ps1 publishes the union." `
             -Data @{ expected = $unionSet })
     } else {
-        $haveSet = @($cxServices -split ',' | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+        $haveSet = @($cxServices -split ',' | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Sort-Object -Unique)
         if (Compare-Object -ReferenceObject $unionSet -DifferenceObject $haveSet) {
             Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_DRIFT' -Target 'CX_SERVICES' `
                 -Message "set to '$cxServices', which is not the union of the per-runtime variables ($($unionSet -join ',')) - a partial or stale deploy. Re-run the installer to republish it." `
@@ -583,6 +590,13 @@ if (Use-Check 'iisServiceName') {
             # CX_IIS_SERVICES must equal the SET of per-app names. Compare as sets:
             # adding or removing a site reorders the comma-join and would otherwise
             # look like drift.
+            #
+            # CASING IS PART OF THE COMPARISON. Select-Object -Unique is case-SENSITIVE (it keeps both
+            # 'MyApp' and 'myapp') while Compare-Object defaults to case-INSENSITIVE, so a casing-only
+            # mismatch used to dedupe into two entries and then compare as equal - reported as a pass.
+            # It is not one: the collector stamps this literal string for Infrastructure Service
+            # ownership, and it has to match the APM service name character for character or the
+            # correlation the label exists to provide silently does not resolve. Hence -CaseSensitive.
             $expSet = @($actualNames | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
             $varSet = @()
             if ($cxIisServices) {
@@ -593,7 +607,7 @@ if (Use-Check 'iisServiceName') {
                 Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_MISSING' -Target 'CX_IIS_SERVICES' `
                     -Message "not set at machine scope, but $($expSet.Count) instrumented app(s) exist - host Service ownership in Infrastructure Explorer will be BLANK. Re-run Instrument-IIS.ps1 (elevated) and restart the collector." `
                     -Data @{ appServiceNames = $expSet })
-            } elseif ($varSet.Count -gt 0 -and $expSet.Count -gt 0 -and (Compare-Object $expSet $varSet)) {
+            } elseif ($varSet.Count -gt 0 -and $expSet.Count -gt 0 -and (Compare-Object $expSet $varSet -CaseSensitive)) {
                 Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_DRIFT' -Target 'CX_IIS_SERVICES' `
                     -Message "does not match the apps on this host. var=[$($varSet -join ', ')] apps=[$($expSet -join ', ')] - re-run Instrument-IIS.ps1 and restart the collector. apps[] lists only INSTRUMENTABLE applications (ASP.NET Core or ASP.NET Framework); static, native, reverse-proxied and undeterminable apps are excluded by design, so a name here that is missing from apps[] is usually a leftover the re-run will remove." `
                     -Data @{ cxIisServices = $varSet; appServiceNames = $expSet })
