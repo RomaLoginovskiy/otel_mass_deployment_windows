@@ -533,9 +533,15 @@ function Test-NodeInstrumentation {
         Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_MISSING' -Target 'CX_NODE_SERVICES' `
             -Message "machine CX_NODE_SERVICES is not set, but $($expected.Count) PM2 app(s) carry a service name - host Service-ownership will be blank" `
             -Data @{ expected = $expected })
-    } elseif (Compare-Object $expected $actual) {
+    } elseif (Compare-Object $expected $actual -CaseSensitive) {
         # Set comparison, not string: app add/remove reorders the join and would
         # otherwise look like drift.
+        #
+        # -CaseSensitive because both sides are deduped with Select-Object -Unique, which IS
+        # case-sensitive, while Compare-Object defaults to case-insensitive: 'MyApp' vs 'myapp' used to
+        # survive as two entries and then compare equal, so a casing mismatch between the published
+        # label and the app's own service name was reported as a pass. The collector stamps the literal
+        # string, so the casing has to match for host<->APM correlation to resolve.
         Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' -Target 'CX_NODE_SERVICES' `
             -Message "CX_NODE_SERVICES does not match the running apps. var=[$($actual -join ', ')] apps=[$($expected -join ', ')] - re-run Instrument-NodePM2.ps1" `
             -Data @{ cxNodeServices = $actual; appServiceNames = $expected })
