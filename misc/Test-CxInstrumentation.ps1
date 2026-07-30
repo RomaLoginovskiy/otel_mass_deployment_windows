@@ -2485,11 +2485,28 @@ function Resolve-CxAppRuntime {
         }
     }
 
+    # The .NET auto-instrumentation supports .NET Framework 4.6.2+; the desktop CLR 2 (.NET 2.0/3.5) is
+    # out of scope for it, so such an app is Unsupported - the app itself runs perfectly well. Keep this
+    # identical to Get-IISAppInstrumentability in deploy/Resolve-IISAppRuntime.ps1: this file is a
+    # standalone FORK of that classifier, and when it lacked this branch it reported a CLR-2 pool as
+    # Supported/pass, so an operator using the standalone doctor instrumented an app that can never
+    # report.
+    $isClr2 = ($null -ne $PoolManagedRuntimeVersion) -and (([string]$PoolManagedRuntimeVersion) -match '^v?2(\.|$)')
+
     $instr = switch ($runtime) {
         'AspNetCore'      { if ($poolClrLoads) { 'Misconfigured' } else { 'Supported' } }
-        'AspNetFramework' { if ($poolClrLoads) { 'Supported' }     else { 'Misconfigured' } }
+        'AspNetFramework' {
+            if (-not $poolClrLoads) { 'Misconfigured' }   # No Managed Code: the app is DOWN
+            elseif ($isClr2)        { 'Unsupported'   }   # runs, but nothing can instrument it
+            else                    { 'Supported'     }
+        }
         'NonDotNet'       { 'Unsupported' }
         default           { 'RequiresOverride' }
+    }
+
+    if ($instr -eq 'Unsupported' -and $runtime -eq 'AspNetFramework') {
+        $shownClr = if ($null -eq $PoolManagedRuntimeVersion) { '<inherited default, v4.0>' } else { [string]$PoolManagedRuntimeVersion }
+        $reason = "$reason, but its pool has managedRuntimeVersion=$shownClr. The .NET OpenTelemetry automatic instrumentation supports .NET Framework 4.6.2+, so a CLR 2.0 pool cannot be instrumented at all. The application itself runs normally. Fix: move the app to a v4.0 pool if it needs telemetry."
     }
 
     if ($instr -eq 'Misconfigured') {
@@ -2533,11 +2550,16 @@ function New-CxRuntimeFinding {
         'AspNetCore/Misconfigured'      { $code = 'POOL_NOT_NO_MANAGED_CODE';        $sev = 'warn' }
         'AspNetFramework/Supported'     { $code = 'FRAMEWORK_POOL_OK';               $sev = 'pass' }
         'AspNetFramework/Misconfigured' { $code = 'FRAMEWORK_POOL_NO_MANAGED_CLR';   $sev = 'warn' }
+        # info, not warn - the application is healthy and this is a property of its pool's CLR, not a
+        # defect to act on. Its own code so it never reads as "we think this is static".
+        'AspNetFramework/Unsupported'   { $code = 'FRAMEWORK_CLR2_NOT_INSTRUMENTABLE'; $sev = 'info' }
         'NonDotNet/Unsupported'         { $code = 'NON_DOTNET_APP_NOT_INSTRUMENTED'; $sev = 'info' }
         default                         { $code = 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE';  $sev = 'unknown' }
     }
     $msg = $Record.RuntimeReason
-    if ($code -eq 'NON_DOTNET_APP_NOT_INSTRUMENTED') {
+    if ($code -eq 'FRAMEWORK_CLR2_NOT_INSTRUMENTABLE') {
+        $msg = "$msg. No OTEL_SERVICE_NAME is written and the app is not claimed in CX_IIS_SERVICES, because a name that never reports is worse than no name."
+    } elseif ($code -eq 'NON_DOTNET_APP_NOT_INSTRUMENTED') {
         $msg = "$msg. The .NET OpenTelemetry automatic instrumentation does not apply, so no OTEL_SERVICE_NAME is written and the app is not claimed in CX_IIS_SERVICES. If IIS reverse-proxies to a backend process, instrument that backend where it runs."
     } elseif ($code -eq 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE') {
         $msg = "$msg. Not instrumented and not claimed in CX_IIS_SERVICES rather than guessed. Resolve it with -RuntimeOverrides @{'$Target'='AspNetCore'|'AspNetFramework'|'NonDotNet'}."

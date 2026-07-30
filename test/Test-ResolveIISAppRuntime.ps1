@@ -286,6 +286,14 @@ if (-not (Test-Path -LiteralPath $clone)) {
             @{ n = 'core+absent';  p = $P.core;    mrv = $null },
             @{ n = 'fw+v4';        p = $P.fw;      mrv = 'v4.0' },
             @{ n = 'fw+nmc';       p = $P.fw;      mrv = '' },
+            # CLR 2 pools. These are here because their ABSENCE let the clone ship wrong: the shared
+            # classifier gained the Framework-on-CLR-2 -> Unsupported rule, the assertions above pinned
+            # it, the clone never got it, and this parity loop passed anyway because no case below
+            # exercised a v2.0 pool. A rule that only one of the two implementations has must fail here.
+            @{ n = 'fw+v2';        p = $P.fw;      mrv = 'v2.0' },
+            @{ n = 'fw+v2-bare';  p = $P.fw;      mrv = '2.0' },
+            @{ n = 'fw+v4-full';  p = $P.fw;      mrv = 'v4.0.30319' },
+            @{ n = 'core+v2';      p = $P.core;    mrv = 'v2.0' },
             @{ n = 'handler-type'; p = $P.handler; mrv = 'v4.0' },
             @{ n = 'static-wc';    p = $P.static;  mrv = '' },
             @{ n = 'hollow';       p = $P.hollow;  mrv = 'v4.0' },
