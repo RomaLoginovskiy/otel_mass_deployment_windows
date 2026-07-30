@@ -212,8 +212,30 @@ if ($haveSame) {
         }
         # An out-of-process ASP.NET Core app keeps its own dotnet.exe, which also holds the DLLs and
         # does not always exit with the pool.
-        foreach ($p in @(Get-Process dotnet -ErrorAction SilentlyContinue)) {
-            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { }
+        #
+        # SCOPED TO IIS-OWNED PROCESSES ONLY. ANCM launches the out-of-process worker as a direct
+        # CHILD of w3wp, and the W3SVC/WAS restart in the finally block brings those back. Matching on
+        # the process NAME alone also killed every unrelated dotnet.exe on the host - standalone
+        # Windows services (including the ones Instrument-DotNetService.ps1 instruments), console
+        # apps, scheduled tasks - and nothing restarted them, on every routine version-bump re-deploy.
+        # Anything not owned by IIS is reported instead: if it holds a profiler DLL open the install
+        # below fails on a locked file, which is recoverable, whereas killing it was not.
+        $w3wpPids = @(Get-Process -Name 'w3wp' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+        $foreign  = @()
+        foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='dotnet.exe'" -ErrorAction SilentlyContinue)) {
+            if ($w3wpPids -contains $p.ParentProcessId) {
+                try {
+                    Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop
+                    Write-Host "[iis-instr] stopped IIS-owned dotnet.exe pid=$($p.ProcessId) (out-of-process worker of w3wp pid=$($p.ParentProcessId))"
+                } catch {
+                    Write-Warning "[iis-instr] could not stop dotnet.exe pid=$($p.ProcessId) ($($_.Exception.Message)) - the install may fail on a locked DLL"
+                }
+            } else {
+                $foreign += "pid=$($p.ProcessId)$(if ($p.ExecutablePath) { " $($p.ExecutablePath)" })"
+            }
+        }
+        if ($foreign.Count) {
+            Write-Warning ("[iis-instr] leaving {0} dotnet.exe process(es) that IIS does not own: {1}. They are NOT stopped - if one of them has the auto-instrumentation DLLs open, the install below fails on a locked file; stop it yourself and re-run." -f $foreign.Count, ($foreign -join '; '))
         }
         Start-Sleep -Seconds 3
     }
