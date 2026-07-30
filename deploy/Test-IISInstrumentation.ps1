@@ -841,13 +841,36 @@ function Test-IISInstrumentation {
                 $nodeCount  = if ($iisnodePools.ContainsKey($app.Pool)) { [int]$iisnodePools[$app.Pool] } else { 0 }
                 $claimCount = if ($claimPools.ContainsKey($app.Pool))   { [int]$claimPools[$app.Pool]   } else { 0 }
 
-                if ($nodeCount -gt 1 -or $claimCount -gt 1) {
-                    $detail = if ($nodeCount -gt 1) {
-                        "$nodeCount iisnode applications share pool '$($app.Pool)'"
-                    } else {
-                        "pool '$($app.Pool)' hosts $claimCount applications that read OTEL_SERVICE_NAME (this one plus at least one instrumented .NET application), so a pool-level name would rename one of them"
-                    }
-                    Add-F (New-IISNodeFinding -Outcome 'sharedPool' -Record $rt -Target $label -Detail $detail)
+                # Sharing a pool is no longer a verdict on its own. The NAME can live in the
+                # application's own web.config <appSettings>, which iisnode promotes into the node
+                # child's environment, so a shared pool is instrumentable - the pool just must not
+                # carry an OTEL_SERVICE_NAME of its own. Read both sides before deciding.
+                $isShared = ($nodeCount -gt 1 -or $claimCount -gt 1)
+                $poolSvc  = if ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_SERVICE_NAME')) { [string]$poolEnvEff['OTEL_SERVICE_NAME'] } else { '' }
+                $perAppSvc = if (Get-Command Get-CxWebConfigAppSetting -ErrorAction SilentlyContinue) {
+                    Get-CxWebConfigAppSetting -PhysicalPath $app.PhysicalPath -Key 'OTEL_SERVICE_NAME'
+                } else { $null }
+                # iisnode copies the pool environment first and appends appSettings after it, and
+                # Windows resolves the FIRST entry - so the pool value wins wherever both exist.
+                $effSvc   = if ($poolSvc) { $poolSvc } else { $perAppSvc }
+                $sharedDetail = if ($nodeCount -gt 1) {
+                    "$nodeCount iisnode applications share pool '$($app.Pool)'"
+                } else {
+                    "pool '$($app.Pool)' hosts $claimCount applications that read OTEL_SERVICE_NAME (this one plus at least one instrumented .NET application)"
+                }
+
+                if ($isShared -and $rt.DotNetRuntime -eq 'AspNetFramework' -and $rt.Instrumentability -eq 'Supported') {
+                    Add-F (New-IISNodeFinding -Outcome 'sharedPoolFw' -Record $rt -Target $label -Detail $sharedDetail)
+                }
+                elseif ($isShared -and $poolSvc) {
+                    # Either a name we left behind before per-app naming existed, or one someone
+                    # else set. Both shadow the per-app value, and both mis-name a shared pool.
+                    Add-F (New-IISNodeFinding -Outcome 'poolNameShadow' -Record $rt -Target $label `
+                        -Detail "$sharedDetail, and that pool carries OTEL_SERVICE_NAME='$poolSvc'$(if ($perAppSvc) { " while this application's own web.config asks for '$perAppSvc' - the pool value is what takes effect" })")
+                }
+                elseif ($isShared -and -not $perAppSvc) {
+                    Add-F (New-IISNodeFinding -Outcome 'sharedPool' -Record $rt -Target $label `
+                        -Detail "$sharedDetail, and no per-app OTEL_SERVICE_NAME is set in this application's own web.config <appSettings>")
                 }
                 elseif ($rt.NodeIsEsm) {
                     # Checked BEFORE the bootstrap checks, and it outranks them: an ESM app under
@@ -872,7 +895,10 @@ function Test-IISInstrumentation {
                         -Message "the bootstrap is present on pool '$($app.Pool)', but Resolve-NodeServiceNames.ps1 was not next to this script, so this application's module system could not be determined. iisnode cannot host an ES module at all (ERR_REQUIRE_ESM), so if this one is ESM it is returning HTTP 500 rather than reporting telemetry. Copy the full package and re-run.")
                 }
                 else {
-                    Add-F (New-IISNodeFinding -Outcome 'instrumented' -Record $rt -Target $label)
+                    # Same bootstrap, two naming shapes: on a dedicated pool the name is on the
+                    # pool, on a shared one it is in the app's own web.config. Grading them with
+                    # one code would hide which mechanism is actually carrying the name.
+                    Add-F (New-IISNodeFinding -Outcome $(if ($isShared) { 'perAppNamed' } else { 'instrumented' }) -Record $rt -Target $label)
                     # Same localhost trap as everywhere else: ::1 first, export silently dropped.
                     $nodeEp = if ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_EXPORTER_OTLP_ENDPOINT')) { [string]$poolEnvEff['OTEL_EXPORTER_OTLP_ENDPOINT'] } else { '' }
                     if ($nodeEp -match 'localhost') {
@@ -880,9 +906,9 @@ function Test-IISInstrumentation {
                             -Message "pool '$($app.Pool)' exports to '$nodeEp'; localhost resolves to ::1 first and the OTLP export is silently dropped. Use http://127.0.0.1:4318." `
                             -Data @{ endpoint = $nodeEp })
                     }
-                    if (-not ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_SERVICE_NAME') -and $poolEnvEff['OTEL_SERVICE_NAME'])) {
+                    if (-not $effSvc) {
                         Add-F (New-Finding -Check 'iisnode' -Severity 'warn' -Code 'IISNODE_SERVICE_NAME_MISSING' -Target $label `
-                            -Message "the bootstrap is on pool '$($app.Pool)' but no OTEL_SERVICE_NAME is - its spans land under the SDK default (unknown_service:node)")
+                            -Message "the bootstrap is on pool '$($app.Pool)' but no OTEL_SERVICE_NAME is - not on the pool, and not in this application's own web.config <appSettings> either, which is where a pool-sharing application carries it. Its spans land under the SDK default (unknown_service:node)")
                     }
                 }
             }

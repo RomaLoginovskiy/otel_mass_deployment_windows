@@ -197,7 +197,12 @@ function Get-LocalIisnodeEvidence {
     # IsDotNet is the co-tenancy question, not a runtime verdict: it only has to answer "would this
     # application be instrumented by the .NET profiler, and therefore care what OTEL_SERVICE_NAME
     # its pool carries". Mirrors the positive-evidence rules in Get-CxWebConfigRuntimeState.
-    $out = [pscustomobject]@{ IsIisnode = $false; Entry = $null; CustomCmdLine = $false; IsDotNet = $false; State = 'nopath' }
+    # IsFramework is a NARROWER question than IsDotNet and is asked about the application itself,
+    # not its co-tenants: only classic ASP.NET Framework promotes web.config OTEL_* values to
+    # PROCESS-level environment variables, which is what makes per-app naming unsafe for a hybrid
+    # app on a shared pool. Core reads its own <aspNetCore><environmentVariables> per app and does
+    # not have that problem.
+    $out = [pscustomobject]@{ IsIisnode = $false; Entry = $null; CustomCmdLine = $false; IsDotNet = $false; IsFramework = $false; State = 'nopath' }
     if (-not $PhysicalPath) { return $out }
     $wc = Join-Path $PhysicalPath 'web.config'
     $raw = $null
@@ -229,56 +234,80 @@ function Get-LocalIisnodeEvidence {
                 if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
                 if ('compilation','httpRuntime','httpModules','httpHandlers','authentication','sessionState','pages','customErrors','globalization','identity','machineKey','membership','roleManager','trace' -contains $child.LocalName) {
                     $out.IsDotNet = $true
+                    $out.IsFramework = $true
                 }
             }
         }
         foreach ($n in @($x.SelectNodes('//system.webServer/handlers/add')) + @($x.SelectNodes('//system.webServer/modules/add'))) {
             $t = [string]$n.GetAttribute('type')
-            if ($t -and $t -notmatch 'AspNetCoreModule') { $out.IsDotNet = $true }
-            if (([string]$n.GetAttribute('path')) -match '\.(aspx|asmx|ashx|axd)$') { $out.IsDotNet = $true }
+            if ($t -and $t -notmatch 'AspNetCoreModule') { $out.IsDotNet = $true; $out.IsFramework = $true }
+            if (([string]$n.GetAttribute('path')) -match '\.(aspx|asmx|ashx|axd)$') { $out.IsDotNet = $true; $out.IsFramework = $true }
         }
     } catch { }
     return $out
 }
 
-function Get-PoolNameConflict {
+function Get-LocalIISNodeNamingDecision {
     <#
-      Can a pool-level OTEL_SERVICE_NAME honestly name THIS application? Returns $null when it can,
-      or the reason it cannot.
+      WHERE this application's OTEL_SERVICE_NAME can go. The no-libraries fallback for
+      Get-IISNodeNamingDecision in deploy\Resolve-IISAppRuntime.ps1, and it must agree with it -
+      the unit suite asserts that pair against the same inputs, because a host patched by this
+      script and later re-deployed must not flip between instrumented and not.
 
-      A pool variable reaches every application in the pool and every process those applications
-      start, so there are two ways to get this wrong, and the second is worse than doing nothing:
+      Returns the same shape: .Mode ('pool' | 'perApp' | 'refuse'), .Outcome (a
+      New-IISNodeFinding token), .Rivals, .Reason, .RemovePoolName.
 
-        * two iisnode applications in one pool - one name cannot name both
-        * an iisnode application sharing a pool with an instrumented .NET application - writing the
-          Node service name RENAMES the .NET one, corrupting a service that was reporting correctly
+      Why a shared pool is no longer simply refused: a pool variable reaches every application in
+      the pool, but iisnode ALSO appends each application's own <appSettings> to the environment
+      block it builds for its node.exe child, so the name can be per-app while the pool carries
+      only the shared bootstrap. The two remaining refusals are real:
 
-      A static or otherwise uninstrumented co-tenant does not read OTEL_SERVICE_NAME, so it does
-      not block.
-
-      The last check is the belt-and-braces one: if the pool ALREADY carries a different
-      OTEL_SERVICE_NAME, something (very likely Instrument-IIS.ps1, for the .NET app) has claimed
-      that pool. Overwriting it is exactly the silent rename above, so refuse regardless of what
-      classification concluded.
+        * the application is iisnode AND classic ASP.NET Framework on a shared pool - the
+          Framework SDK promotes web.config OTEL_* values PROCESS-wide, so a per-app name would
+          leak onto its co-tenants through w3wp
+        * the pool carries an OTEL_SERVICE_NAME this installer did not write - iisnode copies the
+          parent environment BEFORE appending appSettings and Windows resolves the first entry, so
+          that pool value shadows the per-app one and the per-app name would do nothing
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] $Record,
         [object[]] $All = @(),
-        [string]   $ExistingPoolServiceName
+        [string]   $ExistingPoolServiceName,
+        [string[]] $PoolOwnNames = @()
     )
 
     $rivals = @($All | Where-Object {
         $_.Pool -eq $Record.Pool -and $_.Key -ne $Record.Key -and ($_.IsIisnode -or $_.IsDotNet)
     })
-    if (@($rivals).Count -gt 0) {
-        $kinds = @($rivals | ForEach-Object { "$($_.Key)$(if ($_.IsIisnode) { ' (iisnode)' } else { ' (.NET)' })" }) -join ', '
-        return "pool '$($Record.Pool)' also hosts instrumented application(s): $kinds. A pool-level OTEL_SERVICE_NAME reaches all of them, so naming this one would mis-name or rename the others"
+    $rivalLabels = @($rivals | ForEach-Object { "$($_.Key)$(if ($_.IsIisnode) { ' (iisnode)' } else { ' (.NET)' })" }) -join ', '
+
+    if (@($rivals).Count -eq 0) {
+        if ($ExistingPoolServiceName -and $ExistingPoolServiceName -ne $Record.ServiceName) {
+            return [pscustomobject]@{
+                Mode = 'refuse'; Outcome = 'poolNameShadow'; Rivals = @(); RemovePoolName = $false
+                Reason = "pool '$($Record.Pool)' already carries OTEL_SERVICE_NAME='$ExistingPoolServiceName', which is not the name for this application - something else has claimed this pool and overwriting it would rename that service"
+            }
+        }
+        return [pscustomobject]@{ Mode = 'pool'; Outcome = 'instrumented'; Rivals = @(); RemovePoolName = $false; Reason = $null }
     }
-    if ($ExistingPoolServiceName -and $ExistingPoolServiceName -ne $Record.ServiceName) {
-        return "pool '$($Record.Pool)' already carries OTEL_SERVICE_NAME='$ExistingPoolServiceName', which is not the name for this application - something else has claimed this pool and overwriting it would rename that service"
+    if ($Record.IsFramework) {
+        return [pscustomobject]@{
+            Mode = 'refuse'; Outcome = 'sharedPoolFw'; Rivals = $rivalLabels; RemovePoolName = $false
+            Reason = "this application is iisnode AND instrumented ASP.NET Framework and shares pool '$($Record.Pool)' with $rivalLabels. The Framework SDK promotes web.config OTEL_* values to PROCESS-level environment variables, so a per-app name would leak through w3wp and rename its co-tenants"
+        }
     }
-    return $null
+    if ($ExistingPoolServiceName -and -not ($PoolOwnNames -contains $ExistingPoolServiceName)) {
+        return [pscustomobject]@{
+            Mode = 'refuse'; Outcome = 'poolNameShadow'; Rivals = $rivalLabels; RemovePoolName = $false
+            Reason = "pool '$($Record.Pool)' carries OTEL_SERVICE_NAME='$ExistingPoolServiceName' that this installer did not write, and a pool value shadows the per-app one, so the per-app name would not take effect"
+        }
+    }
+    return [pscustomobject]@{
+        Mode = 'perApp'; Outcome = 'perAppNamed'; Rivals = $rivalLabels
+        RemovePoolName = [bool]$ExistingPoolServiceName
+        Reason = "shares pool '$($Record.Pool)' with $rivalLabels, so the name goes in this application's own web.config <appSettings>"
+    }
 }
 
 function Test-LocalAppIsEsm {
@@ -576,6 +605,7 @@ foreach ($site in @($xml.SelectNodes('/configuration/system.applicationHost/site
             IsEsm        = $false
             CustomCmdLine = $false
             IsDotNet     = $false
+            IsFramework  = $false
             WcState      = 'nopath'
         })
     }
@@ -600,6 +630,9 @@ foreach ($r in $records) {
         # Positive .NET evidence from the SAME parsed state - the co-tenancy question below needs
         # it for every app in the pool, not just the iisnode ones.
         $r.IsDotNet = [bool]((@($st.CoreEvidence).Count -gt 0) -or (@($st.FrameworkEvidence).Count -gt 0))
+        # Framework specifically, and only about THIS application: it is what decides whether a
+        # per-app name in web.config would leak process-wide onto the pool's other applications.
+        $r.IsFramework = [bool](@($st.FrameworkEvidence).Count -gt 0)
     } else {
         $ev = Get-LocalIisnodeEvidence -PhysicalPath $r.PhysicalPath
         $r.WcState       = $ev.State
@@ -607,6 +640,7 @@ foreach ($r in $records) {
         $r.Entry         = $ev.Entry
         $r.CustomCmdLine = $ev.CustomCmdLine
         $r.IsDotNet      = $ev.IsDotNet
+        $r.IsFramework   = $ev.IsFramework
     }
     if ($r.IsIisnode) {
         $r.IsEsm = if ($haveLibs -and (Get-Command Test-CxNodeAppIsEsm -ErrorAction SilentlyContinue)) {
@@ -652,6 +686,74 @@ function Get-PoolEnvValue {
     return [string]$n.GetAttribute('value')
 }
 
+function Get-LocalWebConfigAppSetting {
+    <#
+      Read one <appSettings> value from an application's own web.config. The no-libraries fallback
+      for Get-CxWebConfigAppSetting. Returns $null for every "not there" case and never throws.
+    #>
+    param([string] $PhysicalPath, [Parameter(Mandatory)][string] $Key)
+    if (-not $PhysicalPath) { return $null }
+    $wc = Join-Path $PhysicalPath 'web.config'
+    if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
+    try { [xml]$x = [System.IO.File]::ReadAllText($wc) } catch { return $null }
+    $n = $x.SelectSingleNode("/configuration/appSettings/add[@key='$Key']")
+    if (-not $n) { return $null }
+    $v = [string]$n.GetAttribute('value')
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    return $v
+}
+
+function Set-LocalWebConfigAppSetting {
+    <#
+      Write one <appSettings> value into an application's own web.config, creating the section if
+      it is absent. The no-libraries fallback for Set-WebConfigAppSettingServiceName.
+
+      This is how a pool-SHARING iisnode application gets its own name: iisnode appends the
+      application's appSettings to the environment block it builds for node.exe, so two
+      applications in one pool can carry different names.
+
+      Backs the file up next to itself first - this script has no manifest session, and an operator
+      running it on a live host must be able to put a web.config back by hand. Returns $true only
+      when the value is readable back from disk afterwards.
+    #>
+    param([string] $PhysicalPath, [Parameter(Mandatory)][string] $Key, [Parameter(Mandatory)][string] $Value)
+    if (-not $PhysicalPath) { return $false }
+    $wc = Join-Path $PhysicalPath 'web.config'
+    if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) {
+        Write-Step FAIL "no web.config at '$wc', so this application cannot be named per-app"
+        return $false
+    }
+    try {
+        # One backup per run, named like the applicationHost.config one. $script:StartedAt is set by
+        # this script's own preamble; the fallback keeps the function usable when it is lifted out of
+        # here (the unit suite does exactly that) instead of failing on a null.
+        $when = if ($script:StartedAt) { $script:StartedAt } else { Get-Date }
+        $bak  = "$wc.{0}.bak" -f $when.ToString('yyyyMMdd-HHmmss')
+        if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $wc -Destination $bak -ErrorAction Stop }
+        [xml]$x = [System.IO.File]::ReadAllText($wc)
+        $app = $x.SelectSingleNode('/configuration/appSettings')
+        if (-not $app) {
+            $app = $x.CreateElement('appSettings')
+            if ($x.DocumentElement.FirstChild) { [void]$x.DocumentElement.InsertBefore($app, $x.DocumentElement.FirstChild) }
+            else                              { [void]$x.DocumentElement.AppendChild($app) }
+        }
+        $n = $app.SelectSingleNode("add[@key='$Key']")
+        if (-not $n) {
+            $n = $x.CreateElement('add')
+            [void]$n.SetAttribute('key', $Key)
+            [void]$app.AppendChild($n)
+        }
+        [void]$n.SetAttribute('value', $Value)
+        $x.Save($wc)
+    } catch {
+        Write-Step FAIL "could not write $Key into '$wc': $_"
+        return $false
+    }
+    # Read back, do not assume. A Save that threw nothing but produced no change would otherwise be
+    # reported as a name that landed.
+    return ([string](Get-LocalWebConfigAppSetting -PhysicalPath $PhysicalPath -Key $Key) -eq $Value)
+}
+
 function Get-PoolIdentityAccount {
     <#
       The account a pool's worker runs as, in a form icacls accepts. The default,
@@ -681,12 +783,23 @@ $work = New-Object System.Collections.ArrayList
 foreach ($r in $selected) {
     $label = "$($r.Key) [pool '$($r.Pool)']"
 
-    # Co-tenancy. Same gate as Instrument-IIS.ps1's $poolRivals check, and it must stay the same:
-    # a host patched here and later re-deployed must not flip between instrumented and not.
-    $conflict = Get-PoolNameConflict -Record $r -All $records -ExistingPoolServiceName (Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME')
-    if ($conflict) {
-        Write-Step WARN "$label - $conflict. Left alone: a name that maps to two services, or that renames a service already reporting, is worse than no name." `
-            -Fix 'give this application its own app pool, or set the bootstrap per application via <iisnode nodeProcessCommandLine>'
+    # WHERE the name can go. The library function when it is next to us, the local fallback
+    # otherwise - and the unit suite asserts the two agree, because a host patched here and later
+    # re-deployed must not flip between instrumented and not.
+    $existingPoolSvc = Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'
+    $poolOwnNames    = @($records | Where-Object { $_.Pool -eq $r.Pool } | ForEach-Object { $_.ServiceName } | Where-Object { $_ })
+    $decision = if ($haveLibs -and (Get-Command Get-IISNodeNamingDecision -ErrorAction SilentlyContinue)) {
+        Get-IISNodeNamingDecision -Key $r.Key -Pool $r.Pool -ServiceName $r.ServiceName `
+            -Peers @($records | ForEach-Object {
+                [pscustomobject]@{ Key = $_.Key; Pool = $_.Pool; IsIisnode = [bool]$_.IsIisnode; IsDotNetInstrumented = [bool]$_.IsDotNet } }) `
+            -ExistingPoolServiceName $existingPoolSvc -PoolOwnNames $poolOwnNames `
+            -IsFrameworkInstrumented ([bool]$r.IsFramework)
+    } else {
+        Get-LocalIISNodeNamingDecision -Record $r -All $records -ExistingPoolServiceName $existingPoolSvc -PoolOwnNames $poolOwnNames
+    }
+    if ($decision.Mode -eq 'refuse') {
+        Write-Step WARN "$label - $($decision.Reason). Left alone: a name that maps to two services, or that renames a service already reporting, is worse than no name." `
+            -Fix $(if ($decision.Outcome -eq 'sharedPoolFw') { 'give this application its own app pool - then the name goes on the pool and there is nobody to leak onto' } else { "remove OTEL_SERVICE_NAME from pool '$($r.Pool)' (it cannot correctly name a shared pool anyway), then re-run" })
         continue
     }
     # ESM: refused outright, NOT conditional on the loader hook being staged.
@@ -732,15 +845,16 @@ foreach ($r in $selected) {
         continue
     }
 
-    $vars = [ordered]@{
-        NODE_OPTIONS                = $merged
-        OTEL_SERVICE_NAME           = $r.ServiceName
-        OTEL_EXPORTER_OTLP_ENDPOINT = $OtlpEndpoint
-        OTEL_EXPORTER_OTLP_PROTOCOL = 'http/protobuf'
-        OTEL_TRACES_EXPORTER        = 'otlp'
-        OTEL_METRICS_EXPORTER       = 'otlp'
-        OTEL_LOGS_EXPORTER          = 'otlp'
-    }
+    # On the per-app path the NAME is deliberately absent from the pool set: a pool value would
+    # shadow the per-app one (iisnode copies the parent environment before appending appSettings,
+    # and Windows resolves the first entry), so writing both would make the appSettings name inert.
+    $vars = [ordered]@{ NODE_OPTIONS = $merged }
+    if ($decision.Mode -eq 'pool') { $vars['OTEL_SERVICE_NAME'] = $r.ServiceName }
+    $vars['OTEL_EXPORTER_OTLP_ENDPOINT'] = $OtlpEndpoint
+    $vars['OTEL_EXPORTER_OTLP_PROTOCOL'] = 'http/protobuf'
+    $vars['OTEL_TRACES_EXPORTER']        = 'otlp'
+    $vars['OTEL_METRICS_EXPORTER']       = 'otlp'
+    $vars['OTEL_LOGS_EXPORTER']          = 'otlp'
 
     # Already correct? Then this app needs no write and, importantly, no RECYCLE.
     $changes = [ordered]@{}
@@ -748,19 +862,41 @@ foreach ($r in $selected) {
         $cur = Get-PoolEnvValue -Pool $r.Pool -Name $k
         if ([string]$cur -ne [string]$vars[$k]) { $changes[$k] = $vars[$k] }
     }
+    # The per-app name is a web.config edit, not a pool variable, so it needs its own
+    # already-correct check - otherwise every run would recycle the pool for a name that is
+    # already in place, or skip a name that is not.
+    $perAppName = $null
+    if ($decision.Mode -eq 'perApp') {
+        $curPerApp = if ($haveLibs -and (Get-Command Get-CxWebConfigAppSetting -ErrorAction SilentlyContinue)) {
+            Get-CxWebConfigAppSetting -PhysicalPath $r.PhysicalPath -Key 'OTEL_SERVICE_NAME'
+        } else {
+            Get-LocalWebConfigAppSetting -PhysicalPath $r.PhysicalPath -Key 'OTEL_SERVICE_NAME'
+        }
+        if ([string]$curPerApp -ne [string]$r.ServiceName) { $perAppName = $r.ServiceName }
+    }
 
     Write-Host ("  {0,-40} -> {1,-28} {2}" -f $r.Key, $r.ServiceName, $(if ($r.IsEsm) { 'esm loader hook + --require' } else { '--require' }))
     if ($existing) { Write-Host "      preserving the application's own NODE_OPTIONS: $existing" -ForegroundColor DarkGray }
     if ($r.ServiceName -ne $r.AutoName) { Write-Host "      name overridden (auto was '$($r.AutoName)')" -ForegroundColor DarkGray }
+    if ($decision.Mode -eq 'perApp') { Write-Host "      $($decision.Reason)" -ForegroundColor DarkGray }
 
-    if ($changes.Count -eq 0) {
+    if ($changes.Count -eq 0 -and -not $perAppName -and -not $decision.RemovePoolName) {
         Write-Step OK "$label already carries this exact bootstrap and service name - no write, no recycle"
         continue
+    }
+    if ($decision.RemovePoolName) {
+        Write-Step $(if ($Apply) { 'APPLY' } else { 'DRYRUN' }) "$($r.Pool): REMOVE OTEL_SERVICE_NAME='$existingPoolSvc' (a pool value shadows the per-app names in this shared pool)"
+    }
+    if ($perAppName) {
+        Write-Step $(if ($Apply) { 'APPLY' } else { 'DRYRUN' }) "$($r.PhysicalPath)\web.config: <appSettings> OTEL_SERVICE_NAME=$perAppName"
     }
     foreach ($k in $changes.Keys) {
         Write-Step $(if ($Apply) { 'APPLY' } else { 'DRYRUN' }) "$($r.Pool): $k=$($changes[$k])"
     }
-    [void]$work.Add([pscustomobject]@{ Record = $r; Changes = $changes })
+    [void]$work.Add([pscustomobject]@{
+        Record = $r; Changes = $changes
+        PerAppName = $perAppName; RemovePoolName = [bool]$decision.RemovePoolName
+    })
 }
 
 if (@($work).Count -eq 0) {
@@ -828,6 +964,43 @@ foreach ($w in $work) {
     # NODE_OPTIONS absent from the change set means the pool already carried this exact bootstrap -
     # Stage 2 refuses to plan a value without it - so "landed" is the correct default.
     $bootstrapLanded = $true
+
+    # Name FIRST, in the order that cannot produce an unattributable service:
+    #
+    #   1. take a pool-level name off a shared pool - it shadows the per-app names, so leaving it
+    #      would make the write below inert while everything read as configured
+    #   2. write the per-app name into the application's own web.config <appSettings>
+    #   3. only then the pool variables, the bootstrap among them
+    #
+    # A failure at 1 or 2 skips this application entirely: instrumenting it without a name that
+    # takes effect produces spans under 'unknown_service:node', which is worse than leaving it dark
+    # because it cannot be attributed to anything and merges with every other unnamed Node service.
+    if ($w.RemovePoolName) {
+        & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/-[name='$($r.Pool)'].environmentVariables.[name='OTEL_SERVICE_NAME']" /commit:apphost 2>$null | Out-Null
+        $still = Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'
+        if ($still) {
+            Write-Step FAIL "$($r.Key) [pool '$($r.Pool)'] - the pool still carries OTEL_SERVICE_NAME='$still', which shadows the per-app name, so NOTHING was written for this application" `
+                -Fix "remove that variable from pool '$($r.Pool)' by hand (appcmd set config -section:system.applicationHost/applicationPools ""/-[name='$($r.Pool)'].environmentVariables.[name='OTEL_SERVICE_NAME']"" /commit:apphost), then re-run"
+            $brokenApps.Add("$($r.Key) [pool '$($r.Pool)']")
+            continue
+        }
+        Write-Step APPLY "$($r.Pool): OTEL_SERVICE_NAME removed (shared pool - names are per-app)"
+    }
+    if ($w.PerAppName) {
+        $named = if ($haveLibs -and (Get-Command Set-WebConfigAppSettingServiceName -ErrorAction SilentlyContinue)) {
+            Set-WebConfigAppSettingServiceName -PhysicalPath $r.PhysicalPath -ServiceName $w.PerAppName
+        } else {
+            Set-LocalWebConfigAppSetting -PhysicalPath $r.PhysicalPath -Key 'OTEL_SERVICE_NAME' -Value $w.PerAppName
+        }
+        if (-not $named) {
+            Write-Step FAIL "$($r.Key) - the per-app OTEL_SERVICE_NAME could not be written into '$($r.PhysicalPath)\web.config', so NOTHING was written for this application (its pool is left exactly as it was)" `
+                -Fix 'check the file exists, is writable and is valid XML, then re-run'
+            $brokenApps.Add("$($r.Key) [pool '$($r.Pool)']")
+            continue
+        }
+        Write-Step APPLY "$($r.PhysicalPath)\web.config: <appSettings> OTEL_SERVICE_NAME=$($w.PerAppName)"
+    }
 
     foreach ($k in $w.Changes.Keys) {
         $v = [string]$w.Changes[$k]

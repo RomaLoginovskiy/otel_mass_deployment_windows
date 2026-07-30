@@ -66,6 +66,11 @@ changed value does nothing until it restarts.
 > disk does not override it. `Test-Agent.ps1` reports this as `CX_SERVICES_NOT_CONSUMED`, decided
 > from the effective config, and says when the fix belongs in the remote config.
 
+> A pool-sharing **iisnode** app is still claimed: its name goes into the app's own `web.config`
+> `<appSettings>`, which iisnode appends to the environment it builds for `node.exe`, so a pool
+> holding a .NET app and a Node app yields two distinct ownership items. See
+> [nodejs-pm2.md](nodejs-pm2.md#a-pool-holding-both-a-net-application-and-a-node-application).
+
 > **iisnode apps land in `CX_NODE_SERVICES`, not `CX_IIS_SERVICES`** — even though
 > `Instrument-IIS.ps1` is what writes them. `CX_IIS_SERVICES` is the set instrumented by the .NET
 > profiler, and `Test-Agent.ps1` rebuilds it with that same .NET-only filter, so a Node service in

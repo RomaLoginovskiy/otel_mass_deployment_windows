@@ -654,16 +654,59 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
                 # would be silently RENAMED to the Node app's service name - a worse failure than
                 # not instrumenting, because it corrupts an app that was reporting correctly.
                 # A static or otherwise uninstrumented co-tenant does not care, so it does not block.
-                $poolRivals = @($svcMap | Where-Object {
-                    $_.Pool -eq $r.Pool -and
-                    (Get-IISAppKey -Site $_.Site -AppPath $_.AppPath) -ne $appKey -and
-                    ($_.NodeHosting -eq 'iisnode' -or $_.Instrumentability -eq 'Supported')
+                # WHERE the name can go, decided by the one function both this script and
+                # misc\Enable-IisnodeInstrumentation.ps1 call, so the two cannot drift: 'pool' when
+                # nothing else in the pool reads OTEL_SERVICE_NAME, 'perApp' when the pool is shared
+                # (the name goes into the app's own web.config <appSettings>, which iisnode appends
+                # to the environment block it builds for node.exe), 'refuse' when neither is honest.
+                $peers = @($svcMap | ForEach-Object {
+                    [pscustomobject]@{
+                        Key                  = Get-IISAppKey -Site $_.Site -AppPath $_.AppPath
+                        Pool                 = $_.Pool
+                        IsIisnode            = ($_.NodeHosting -eq 'iisnode')
+                        IsDotNetInstrumented = ($_.Instrumentability -eq 'Supported')
+                    }
                 })
-                if (@($poolRivals).Count -gt 0) {
-                    $rivalKeys = @($poolRivals | ForEach-Object { Get-IISAppKey -Site $_.Site -AppPath $_.AppPath }) -join ', '
-                    Add-RF (New-IISNodeFinding -Outcome 'sharedPool' -Record $r -Target $appKey -Detail "Also instrumented in pool '$($r.Pool)': $rivalKeys")
-                    Write-Warning "[iis-instr] $appKey shares pool '$($r.Pool)' with other instrumented app(s) ($rivalKeys), so a pool-level OTEL_SERVICE_NAME cannot name it - left uninstrumented rather than renaming a working service."
-                } else {
+                $decision = Get-IISNodeNamingDecision -Key $appKey -Pool $r.Pool -ServiceName $r.ServiceName `
+                    -Peers $peers -ExistingPoolServiceName (Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME') `
+                    -PoolOwnNames @($svcMap | Where-Object { $_.Pool -eq $r.Pool } | ForEach-Object { $_.ServiceName } | Where-Object { $_ }) `
+                    -IsFrameworkInstrumented ($r.DotNetRuntime -eq 'AspNetFramework' -and $r.Instrumentability -eq 'Supported')
+
+                if ($decision.Mode -eq 'refuse') {
+                    Add-RF (New-IISNodeFinding -Outcome $decision.Outcome -Record $r -Target $appKey -Detail $decision.Reason)
+                    Write-Warning "[iis-instr] $appKey - not instrumented: $($decision.Reason)."
+                }
+                elseif ($decision.Mode -eq 'perApp') {
+                    # Name FIRST, bootstrap second. The reverse order is what produces an
+                    # instrumented app reporting as 'unknown_service:node' when the web.config write
+                    # fails - telemetry that cannot be attributed to anything.
+                    if ($decision.RemovePoolName) {
+                        $stale = Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'
+                        if (Remove-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME' -ExpectedValue $stale) {
+                            Write-Host "  [pool] removed OTEL_SERVICE_NAME=$stale from shared pool '$($r.Pool)' - a pool value shadows the per-app names" -ForegroundColor Yellow
+                        }
+                    }
+                    if (Set-WebConfigAppSettingServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName -Session $Session) {
+                        $bootstrap = $nodeBoot.NodeOptionsCjs
+                        $owned     = @($nodeBoot.RegisterPath, $nodeBoot.HookUrl) | Where-Object { $_ }
+                        $merged    = Merge-CxNodeOptions -Existing (Get-PoolEnvValue -Pool $r.Pool -Name 'NODE_OPTIONS') -Bootstrap $bootstrap -OwnedTargets $owned
+
+                        Grant-PoolReadAccess -Pool $r.Pool -Path $NodeInstallPrefix | Out-Null
+                        Set-PoolEnv -Pool $r.Pool -Name 'NODE_OPTIONS'                -Value $merged
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_TRACES_EXPORTER'        -Value 'otlp'
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_METRICS_EXPORTER'       -Value 'otlp'
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_LOGS_EXPORTER'          -Value 'otlp'
+                        Write-Host "  [node] $appKey -> $($r.ServiceName) --require, per-app name in web.config <appSettings>, bootstrap on shared pool '$($r.Pool)' (with $($decision.Rivals))" -ForegroundColor Green
+                        Add-RF (New-IISNodeFinding -Outcome 'perAppNamed' -Record $r -Target $appKey -Detail $decision.Reason)
+                        [void]$iisnodeApps.Add($r)
+                    } else {
+                        Add-RF (New-IISNodeFinding -Outcome 'sharedPool' -Record $r -Target $appKey -Detail "Shares pool '$($r.Pool)' with $($decision.Rivals); the per-app write into its web.config <appSettings> did not succeed")
+                        Write-Warning "[iis-instr] $appKey shares pool '$($r.Pool)' with $($decision.Rivals) and its per-app name could not be written into web.config, so no bootstrap was written either - an instrumented app with no name reports as 'unknown_service:node'."
+                    }
+                }
+                else {
                     # Always the CommonJS form here: the ESM branch above already refused, because
                     # iisnode cannot host an ES module at all. HookUrl still goes into $owned so a
                     # stale ESM loader written by an earlier build of this installer is stripped out

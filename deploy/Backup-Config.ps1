@@ -166,6 +166,13 @@ function Record-WebConfigEdit {
       Record a web.config OTEL_SERVICE_NAME edit. addedNode=$true means the
       installer created the node (uninstall removes it); otherwise priorValue
       holds the value to restore.
+
+      -Kind says WHICH element carries the name, because the two live in different
+      places and reverse with different functions:
+        aspNetCore   <aspNetCore><environmentVariables> - an ASP.NET Core app
+        appSettings  <appSettings><add key=...>         - an iisnode app named per-app
+      It defaults to aspNetCore so a manifest written before this field existed still
+      replays correctly.
     #>
     [CmdletBinding()]
     param(
@@ -173,10 +180,11 @@ function Record-WebConfigEdit {
         [Parameter(Mandatory)][string] $Path,
         [bool]   $AddedNode = $true,
         [AllowNull()][string] $PriorValue,
-        [string] $SetValue
+        [string] $SetValue,
+        [ValidateSet('aspNetCore','appSettings')][string] $Kind = 'aspNetCore'
     )
     if (-not $Session) { return }
-    $Session.Manifest.webConfig += [ordered]@{ path = $Path; addedNode = $AddedNode; priorValue = $PriorValue; setValue = $SetValue }
+    $Session.Manifest.webConfig += [ordered]@{ path = $Path; addedNode = $AddedNode; priorValue = $PriorValue; setValue = $SetValue; kind = $Kind }
 }
 
 function Save-Manifest {
