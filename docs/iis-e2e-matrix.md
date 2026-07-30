@@ -39,20 +39,14 @@ deploy code handles it somewhere and nothing exercised it end to end.
 
 | # | Shape | Where the name lands | Why it is in the matrix |
 | --- | --- | --- | --- |
-| 1 | `Default Web Site`, stock | **nowhere, by design** | Static content: `C:\inetpub\wwwroot` ships `iisstart.htm` and no `web.config`, so .NET auto-instrumentation produces nothing for it. It used to be named purely because it had a pool to itself, which made the host claim ownership of a service that emits nothing. Now `NON_DOTNET_APP_NOT_INSTRUMENTED` (info) and absent from `CX_IIS_SERVICES`. |
+| 1 | `Default Web Site`, stock | pool | The site omits `applicationPool` and inherits it from `<sites><applicationDefaults>`. Getting this wrong reports "not configured" for a correctly-instrumented app on essentially every real host — it has broken once already. |
 | 2 | `shop` — dedicated pool, ASP.NET Core | pool | The ordinary case. |
 | 3 | `shop/api` — nested app, own pool | pool | Name must be `shop/api`, not `shop`. |
 | 4 | `shared` + `/api` + `/admin` on one pool | **web.config** | One pool cannot carry three different names, so the per-app name has to go in each app's `web.config`. |
-| 5 | `legacy` — ASP.NET **Framework**, dedicated `v4.0` pool | pool | Fully supported: classified `AspNetFramework` from `<system.web>`, named on its pool, and **claimed** in `CX_IIS_SERVICES`. The shared-pool limitation below does not apply to it. |
+| 5 | `legacy` — ASP.NET **Framework** pool (`v4.0`) | pool only | ⚠️ See below. |
 | 6 | `wrapped` — `<aspNetCore>` inside `<location path=".">` | pool | The shape `dotnet publish` actually emits. A reader looking for a direct child of `<system.webServer>` finds nothing; the code matches `//aspNetCore`. |
 | 7 | `nocfg` — shared pool, **no** `web.config` | nowhere | ⚠️ See below. |
 | 8 | `shop/assets` — a virtual **directory** | nowhere, by design | It is not an application: no pool of its own, shares the parent's process. Naming it would invent an app that does not exist. |
-| 9 | `brownfield` + `/admin` — shared pool that already owned an `<environmentVariables>` block | **web.config** | The pool never sees `applicationPoolDefaults`, so the OTLP vars must be stamped on it directly (`POOL_LOST_INHERITANCE`). |
-| 10 | `defaults-core` — ASP.NET Core, `applicationPool` attribute **omitted** | pool/web.config | Carries the `<sites><applicationDefaults>` resolution pin that shape 1 can no longer hold. Also the Core-on-a-managed-CLR case: `DefaultAppPool` has no `managedRuntimeVersion` attribute, which IIS reads as `v4.0`, so this app is named and claimed **and** warned about (`POOL_NOT_NO_MANAGED_CODE`). |
-| 11 | `staticwc` — a `web.config` with only `<staticContent>` | nowhere, by design | Kills the "it has a `web.config`, so it is .NET" heuristic. Very common on asset origins. |
-| 12 | `arrproxy` — URL-Rewrite reverse proxy to `localhost:5000` | nowhere, by design | The pool's environment never reaches a separate backend process, so instrumenting the IIS pool achieves nothing — the backend has to be instrumented where it runs. |
-| 13 | `oop-core` — ASP.NET Core, `hostingModel="outofprocess"` | pool | Looks like shape 12 from outside and is the **opposite** verdict: the ASP.NET Core Module launches `dotnet.exe` as a *child* of `w3wp`, which does inherit the pool environment. |
-| 14 | `binonly` — `bin\*.dll`, no `web.config` | nowhere, pending an override | Deliberately ambiguous: static sites carry stray `bin` folders and an out-of-process publish puts DLLs in the app root. Reports `RUNTIME_UNKNOWN_NEEDS_OVERRIDE` rather than guessing, because a wrong guess puts a non-reporting name into `CX_IIS_SERVICES`. Resolved with `-RuntimeOverrides`. |
 
 ## Log layout matrix
 
@@ -142,22 +136,8 @@ with a warning.
 On a **dedicated** pool this does not matter — the name goes on the pool. It only
 bites when a Framework app **shares** a pool with another app.
 
-**`appSettings` does not fix the shared-pool case.** On .NET Framework the `OTEL_*`
-values in `Web.config` are promoted to *process-level* environment variables at
-startup and the SDK initialises once per worker process, so in a shared pool the
-first application to start decides the service name for every app in it. Writing
-`appSettings` would hand you a name chosen by a startup race — which is also why the
-writer must keep returning `$false` here: counting the app as named would put that
-race result into `CX_IIS_SERVICES` and reintroduce permanent
-`CX_IIS_SERVICES_DRIFT`.
-
-**Not silent, though.** With nothing configured the instrumentation auto-detects
-`SiteName\VirtualPath`, so the app *does* report — it is simply named by the SDK
-rather than by us, and excluded from `CX_IIS_SERVICES`.
-
 **Remediation:** give the app its own pool (then the pool carries the name), or set
-`OTEL_SERVICE_NAME` from application code. `appSettings` is valid only when the app
-already has a **dedicated** pool, where the pool variable is the simpler route anyway.
+`OTEL_SERVICE_NAME` from application code / `appSettings`.
 
 ### ⚠️ App with no `web.config` on a shared pool cannot be named
 
@@ -165,94 +145,6 @@ Same shape, different cause: the pool is shared so it cannot disambiguate, and t
 is no file to write the name into.
 
 **Remediation:** add a `web.config`, or move the app to its own pool.
-
-### ⚠️ An app whose runtime cannot be determined is left alone
-
-`binonly` (shape 14) has managed assemblies in `bin\` and no `web.config`. That is genuinely
-ambiguous — static sites carry stray `bin` folders, and an out-of-process `dotnet publish`
-puts DLLs in the app root — so the installer reports `RUNTIME_UNKNOWN_NEEDS_OVERRIDE` and
-writes nothing at all.
-
-Not writing is deliberate rather than cautious. Writing `OTEL_SERVICE_NAME` while declining to
-claim the app would leave a name readable on the host that `Test-Agent.ps1` then counts as
-present and missing from `CX_IIS_SERVICES` — permanent `CX_IIS_SERVICES_DRIFT`, the exact
-failure the "subset wins" rule exists to avoid.
-
-**Remediation:** decide it explicitly and give the same answer to the install and the doctor:
-
-```
-set CX_RUNTIME_OVERRIDES_JSON=C:\cx\runtimes.json && deploy.bat
-```
-
-Keys are app identity (`Site/`, `Site/api`) — the string the doctor prints in its `Target`
-column — which is a *different* key space from `-ServiceNameOverrides`. A key matching no app
-is reported as `RUNTIME_OVERRIDE_UNMATCHED` rather than ignored.
-
-### ✅ Non-.NET apps no longer claimed as Services — FIXED
-
-Shapes 1, 11 and 12 (static content, a `<staticContent>`-only `web.config`, and a URL-Rewrite
-reverse proxy) were each named and added to `CX_IIS_SERVICES` whenever they happened to have a
-pool to themselves, because the installer decided naming from **pool arity** alone and never
-looked at what the application was. The host then advertised Service ownership for names no
-APM telemetry ever arrives under.
-
-Fixed by classifying the runtime of every application before deciding anything. A pre-existing
-name left on such a pool by an older installer is actively **removed** on the next run, not
-merely skipped — skipping would leave the stale value on disk forever.
-
-### ✅ "cannot read web.config" on a host where nothing was wrong — FIXED
-
-Reported from a real host, on the app every host has:
-
-```
-[UNKNOWN] poolRuntime[Default Web Site/]  cannot read web.config, so it is unknown
-                                          whether this is an ASP.NET Core app
-                                          needing 'No Managed Code'  (WEBCONFIG_UNREADABLE)
-```
-
-Nothing was wrong. Stock IIS ships `C:\inetpub\wwwroot` with `iisstart.htm` and
-`iisstart.png` and **no `web.config` at all**, and the reader returned the same
-"unknown" for a file that is missing as for one it could not open:
-
-```powershell
-if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
-[xml]$x = Get-Content -LiteralPath $wc -Raw -ErrorAction Stop
-```
-
-So the default site read as a permissions problem on essentially every host in the
-fleet — noise that trains people to ignore the check, right next to the codes that
-do matter.
-
-Those are different answers. ANCM is wired *by* `web.config`, so no `web.config`
-means the app is not ASP.NET Core and the pool's `managedRuntimeVersion` is
-irrelevant — determinate, not unknown.
-
-| State | Code | Severity |
-| --- | --- | --- |
-| no `web.config` (or the physical directory is gone) | `WEBCONFIG_ABSENT` | info |
-| present but unopenable/unparsable, or the app has no `physicalPath` | `WEBCONFIG_UNREADABLE` | unknown, message carries the reason |
-
-Two details the fix depends on:
-
-- **Read through `[System.IO.File]`, not `Test-Path`.** Under
-  `-ErrorAction SilentlyContinue` a `Test-Path` returns `$false` for an
-  access-denied path exactly as it does for a missing one, so keeping it would
-  have inverted the confusion instead of removing it. The .NET exceptions
-  (`FileNotFoundException` / `DirectoryNotFoundException` / everything else)
-  separate the cases cleanly.
-- **Absent does not always mean "not Core".** `<system.webServer>` inherits into
-  child applications, so an app with no `web.config` under a parent that declares
-  `<aspNetCore>` *is* ANCM-hosted. `dotnet publish` emits
-  `<location path="." inheritInChildApplications="false">` precisely to stop this,
-  but hand-written configs often omit it. The check now walks the URL hierarchy —
-  not the filesystem, which is not what IIS inherits along — to the nearest
-  ancestor application that has a `web.config`, and if that one is inheritable
-  Core the child is treated as Core and its pool runtime is still checked. The
-  finding then says `(<aspNetCore> inherited from 'shop/')`.
-
-Pinned by five cases in group C2 of `Run-DoctorTest.ps1`, including the same site
-flipped between `absent` and `unreadable`, and the same child app flipping to Core
-when only the parent's `<location>` wrapper is removed.
 
 ### ⚠️ Re-running the deploy fails while IIS is up — profiler DLLs are locked
 
@@ -409,7 +301,7 @@ The diagnostics do not take a mode flag — they report whichever collector is a
 on the host, and search the supervisor's effective config, then its base config, then
 the plain service's `%ProgramData%\OpenTelemetry\Collector\config.yaml`.
 
-## Status — 2026-07-28, 60 passed / 0 failed
+## Status — 2026-07-27, 24 passed / 0 failed
 
 `Run-E2ELoop.ps1 -SkipTelemetry`, container `cx-e2e-<stamp>`, Windows containers under
 Hyper-V isolation.
@@ -418,26 +310,17 @@ Hyper-V isolation.
 | --- | --- |
 | P0 premises | curl.exe HTTP 200 / `Invoke-WebRequest` intermittent — informational |
 | P1 install | flag contract PASS; collector service assertions **skipped** (image cannot fetch the MSI) |
-| P2 shapes | **14/14**, plus the exact-set `CX_IIS_SERVICES` pin and the "no name on an unsupported pool" probes |
-| P3 failures | F2–F6 and F8–F10 break→diagnose→fix→green all PASS; F7 skipped (needs a collector) |
+| P2 shapes | **8/8**, plus the `CX_IIS_SERVICES` alignment pin |
+| P3 failures | F2–F6 break→diagnose→fix→green all PASS; F7 skipped (needs a collector) |
 | P4 telemetry | not run (`-SkipTelemetry`; needs a collector — run on the POC VM) |
-| P5 idempotency | PASS — value stable, no duplicate pool entries, **no drift**, and the same classification twice |
+| P5 idempotency | PASS — value stable, no duplicate pool entries after two runs |
 
-Alongside it: `Run-DoctorTest.ps1` 54/54 and `test/Test-ResolveIISAppRuntime.ps1` 54/54 (the
-latter includes 16 cases asserting `misc/Test-CxInstrumentation.ps1`'s inlined copy of the
-classifier still agrees with the shared one).
+`Run-DoctorTest.ps1` (the offline matrix) stayed green alongside these changes.
 
-**Four defects in shipped scripts were found by this loop.** Three are fixed and pinned by
+**Three defects in shipped scripts were found by this loop.** Two are fixed and pinned by
 regression cases (`CX_IIS_SERVICES` including un-nameable apps; `applicationPoolDefaults`
-being write-once; and non-.NET apps being named and claimed purely for having a dedicated
-pool). The fourth — profiler DLLs locked on re-deploy — is **open**, because the only fix
-stops IIS and that is a downtime decision.
-
-> The harness now pins `CX_OTEL_DOTNET_MODULE` at the module the first run installs. The
-> container's `Invoke-WebRequest` fails intermittently with *"The decryption operation
-> failed"* (same TLS-stack problem P0 records for the collector MSI), and when it landed on a
-> re-instrument case the script died before reaching anything under test. The first run still
-> exercises the real download; every run after it is deterministic.
+being write-once). The third — profiler DLLs locked on re-deploy — is **open**, because
+the only fix stops IIS and that is a downtime decision.
 
 Every one of them was invisible to the offline diagnostics matrix: each needs the real
 `Instrument-IIS.ps1` to run twice against a real `applicationHost.config`, which is

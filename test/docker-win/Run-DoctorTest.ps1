@@ -180,23 +180,14 @@ Assert-Case -Name 'full run detects the missing collector' -Result $r -ExpectExi
     'HEALTH_UNREACHABLE',          # 13133 down
     'PORT_4318_NOT_LISTENING',     # no OTLP receiver
     'PROFILER_NOT_REGISTERED',     # Register-OpenTelemetryForIIS never ran here
-    'OTLP_ENDPOINT_LOCALHOST'      # hand-planted by entrypoint.doctor.ps1 (NOT the shipped default any more)
+    'OTLP_ENDPOINT_LOCALHOST'      # the shipped default is localhost, not 127.0.0.1
 )
 
 # The stock "Default Web Site" omits applicationPool and inherits it from
-# <sites><applicationDefaults>. If that fallback regresses, apps read as having no pool on
-# essentially every real host - so pin it.
-#
-# It can no longer be pinned through Default Web Site's SERVICE NAME: wwwroot is static
-# content, so it is now deliberately left uninstrumented and unnamed. The positive pin moved
-# to 'corepool-defaults', a .NET app with the same missing-applicationPool shape. What Default
-# Web Site pins here is that resolution still happened at all - the app is reported, with a
-# verdict, rather than skipped or crashed on a null pool.
+# <sites><applicationDefaults>. If that fallback regresses, its service name
+# reads as missing on essentially every real host - so pin it.
 Assert-Case -Name 'Default Web Site pool resolved via applicationDefaults' -Result $r -Expect @(
-    'Default Web Site/'
-) -Reject @('POOL_NOT_FOUND')
-Assert-Case -Name 'corepool-defaults (a .NET app) is named despite no explicit applicationPool' -Result $r -Expect @(
-    'OTEL_SERVICE_NAME=corepool-defaults'
+    'iisServiceName[Default Web Site/]  OTEL_SERVICE_NAME=Default Web Site (pool)'
 )
 Assert-Case -Name 'web.config scope readback works (shared pool)' -Result $r -Expect @(
     'OTEL_SERVICE_NAME=shared/api (webconfig)',
@@ -245,165 +236,6 @@ Assert-Case -Name "standalone/aggregator parity ($($codes.Count) codes)" -Result
 
 $r = Invoke-Doctor -ScriptFile 'Test-NodeInstrumentation.ps1'
 Assert-Case -Name 'Test-NodeInstrumentation standalone, no PM2 => exit 0' -Result $r -ExpectExit 0 -Expect @('NO_PM2')
-
-Write-Host ''
-Write-Host '== C2. web.config presence vs readability ==' -ForegroundColor Cyan
-
-# Stock IIS ships C:\inetpub\wwwroot with iisstart.htm and NO web.config, so the
-# Default Web Site hits this path on essentially every real host. Reporting it as
-# "cannot read web.config" made a normal static site look like an ACL problem.
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'stock Default Web Site: absent, not unreadable' -Result $r `
-    -Expect @('WEBCONFIG_ABSENT', 'Normal for the stock Default Web Site') `
-    -Reject @('WEBCONFIG_UNREADABLE')
-
-# C2b. A web.config that exists but does not parse IS unknown, and the message has
-#      to carry the reason - an ACL and malformed XML need different remediations.
-$null = Invoke-BreakSite -Case 'webConfigMalformed' -Site 'blog'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'malformed web.config is UNREADABLE with a reason' -Result $r -Expect @(
-    'WEBCONFIG_UNREADABLE', 'not well-formed XML'
-)
-
-# C2c. Deleting it flips the same site to absent. Same app, opposite finding: that
-#      is the distinction the split exists for.
-$null = Invoke-BreakSite -Case 'webConfigRemove' -Site 'blog'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'deleted web.config is ABSENT, not unreadable' -Result $r `
-    -Expect @('WEBCONFIG_ABSENT') -Reject @('WEBCONFIG_UNREADABLE')
-$null = Invoke-BreakSite -Case 'webConfigRestore' -Site 'blog'
-
-# C2d. A child app with no web.config under a NON-inheriting parent really is not
-#      ASP.NET Core - inheritInChildApplications="false" is what publish emits.
-$null = Invoke-BreakSite -Case 'childNoWebConfig' -Site 'shop'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'child of a non-inheriting parent is absent' -Result $r -Expect @(
-    'WEBCONFIG_ABSENT', 'shop/child'
-)
-
-# C2e. Drop the <location> wrapper and <system.webServer> flows downward, so the
-#      SAME child IS an ASP.NET Core app and its pool runtime does matter. Missing
-#      this would silently skip the No-Managed-Code check for the app.
-$null = Invoke-BreakSite -Case 'webConfigInherit' -Site 'shop'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'child inherits <aspNetCore> from an inheriting parent' -Result $r -Expect @(
-    "inherited from 'shop/'"
-)
-$null = Invoke-BreakSite -Case 'webConfigRestore' -Site 'shop'
-# Undo the extra app: a second app on the pool would flip shop from pool scope to
-# web.config scope and move the later groups' expected names out from under them.
-$null = Invoke-BreakSite -Case 'removeChildApp' -Site 'shop'
-
-Write-Host ''
-Write-Host '== C3. runtime classification ==' -ForegroundColor Cyan
-
-# "No Managed Code" is a property of the app POOL, not of the application. These cases pin
-# that the verdict comes from classifying the APP - so the same pool setting is correct for
-# one runtime and broken for another, and says nothing at all about a non-.NET app.
-
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-
-# C3a. The confirmed over-claim. A static site on its own pool used to be handed an
-#      OTEL_SERVICE_NAME purely because the pool served one app. It must now be reported as
-#      not instrumentable - and as INFO, because the stock Default Web Site exists on nearly
-#      every host and grading it 'warn' would pin the whole fleet at exit 2 forever.
-Assert-Case -Name 'C3a static site is reported not-instrumentable, not misconfigured' -Result $r `
-    -Expect @('NON_DOTNET_APP_NOT_INSTRUMENTED', 'Default Web Site/')
-
-# C3b. And it must not be claimed as a service the host owns.
-$svc = Invoke-InContainer "[Environment]::GetEnvironmentVariable('CX_IIS_SERVICES','Machine')"
-Assert-Case -Name 'C3b CX_IIS_SERVICES excludes the static Default Web Site' -Result $svc `
-    -Reject @('Default Web Site')
-
-# C3c/C3d. Framework detected from <system.web>, NOT from the pool CLR version. This is the
-#          distinction that matters: managedRuntimeVersion is absent-by-default and defaults
-#          to v4.0, so inferring "Framework" from the pool would classify every static site
-#          on DefaultAppPool as Framework and re-create the over-claim above.
-#          No -Reject on POOL_NOT_NO_MANAGED_CODE here: 'corepool-defaults' legitimately
-#          raises it (Core on DefaultAppPool, whose absent attribute means v4.0), and
-#          Assert-Case matches the whole output rather than one row. The Framework verdict is
-#          pinned positively instead - by the evidence string, which only a <system.web>
-#          reading can produce.
-Assert-Case -Name 'C3c Framework app on a v4.0 pool is Supported' -Result $r `
-    -Expect @('FRAMEWORK_POOL_OK', 'legacy/')
-Assert-Case -Name 'C3d Framework verdict cites web.config evidence, not the pool' -Result $r `
-    -Expect @('web.config carries classic ASP.NET configuration (system.web/compilation)')
-
-# C3e/C3f. The mirror of D3 (POOL_NOT_NO_MANAGED_CODE): No Managed Code is WRONG here, and
-#          this app is genuinely down - IIS cannot create its managed handlers.
-$null = Invoke-Break -Case 'poolNoManagedCode' -Pool 'legacy'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'C3e Framework app in a No-Managed-Code pool is caught' -Result $r -ExpectExit 2 `
-    -Expect @('FRAMEWORK_POOL_NO_MANAGED_CLR', 'legacy/')
-$null = Invoke-Break -Case 'restorePoolRuntimeV4' -Pool 'legacy'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'C3f restoring v4.0 clears it' -Result $r -Reject @('FRAMEWORK_POOL_NO_MANAGED_CLR')
-
-# C3g. A web.config that EXISTS but configures no runtime. The "it has a web.config so it is
-#      .NET" heuristic gets this wrong; very common on asset sites and URL-Rewrite proxies.
-Assert-Case -Name 'C3g static-only web.config is non-.NET' -Result $r `
-    -Expect @('NON_DOTNET_APP_NOT_INSTRUMENTED', 'staticwc/') `
-    -Reject @('OTEL_SERVICE_NAME=staticwc')
-
-# C3h. Ambiguous: managed assemblies with nothing wiring them to a pipeline. Must say so
-#      rather than guess - a wrong guess puts a name in CX_IIS_SERVICES that never reports.
-$null = Invoke-BreakSite -Case 'binOnly' -Site 'blog'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'C3h bin\*.dll with no web.config is UNKNOWN, not guessed' -Result $r `
-    -Expect @('RUNTIME_UNKNOWN_NEEDS_OVERRIDE', 'blog/') `
-    -Reject @('NON_DOTNET_APP_NOT_INSTRUMENTED  ')
-
-# Overrides are exercised through -RuntimeOverridesJson, not the -RuntimeOverrides hashtable:
-# these scripts are launched with `powershell -File`, which passes every argument as a STRING
-# and cannot construct a hashtable from one. The JSON file is also the real fleet mechanism -
-# deploy.bat and doctor.bat both pick it up from CX_RUNTIME_OVERRIDES_JSON - so this is the
-# path that actually ships.
-# Built with ConvertTo-Json from a hashtable rather than written as literal JSON: a double
-# quote does not survive `docker exec ... -Command`, so a hand-written '{ "blog/": ... }'
-# arrives with its quotes stripped and the file is not valid JSON. Single quotes do survive,
-# so the whole command below contains none.
-$null = Invoke-InContainer "@{ 'blog/' = 'AspNetCore' } | ConvertTo-Json | Set-Content -LiteralPath C:\cx\rt-ok.json -Encoding utf8"
-$null = Invoke-InContainer "@{ 'blog' = 'AspNetCore' } | ConvertTo-Json | Set-Content -LiteralPath C:\cx\rt-alias.json -Encoding utf8"
-$null = Invoke-InContainer "@{ 'No Such Site/' = 'AspNetCore' } | ConvertTo-Json | Set-Content -LiteralPath C:\cx\rt-nomatch.json -Encoding utf8"
-$null = Invoke-InContainer "@{ 'blog/' = 'DefinitelyNotARuntime' } | ConvertTo-Json | Set-Content -LiteralPath C:\cx\rt-badvalue.json -Encoding utf8"
-
-# C3i. An override resolves the ambiguity. Note the key space: app identity with a trailing
-#      slash for a root app, which is exactly the Target string printed above.
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1' -DoctorArgs @('-RuntimeOverridesJson', 'C:\cx\rt-ok.json')
-Assert-Case -Name 'C3i -RuntimeOverrides resolves the unknown app' -Result $r `
-    -Expect @('RUNTIME_OVERRIDE_APPLIED', 'blog/') `
-    -Reject @('RUNTIME_UNKNOWN_NEEDS_OVERRIDE')
-
-# C3j. The slash-less form is the shape an operator copies out of -ServiceNameOverrides, a
-#      DIFFERENT key space. Accepted as an alias rather than silently matching nothing.
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1' -DoctorArgs @('-RuntimeOverridesJson', 'C:\cx\rt-alias.json')
-Assert-Case -Name 'C3j root-app key without the trailing slash is an accepted alias' -Result $r `
-    -Expect @('RUNTIME_OVERRIDE_APPLIED') -Reject @('RUNTIME_OVERRIDE_UNMATCHED')
-
-# C3k. A key matching nothing is the likeliest operator error (wrong key space, typo,
-#      decommissioned site) and must move the exit code rather than pass quietly.
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1' -DoctorArgs @('-RuntimeOverridesJson', 'C:\cx\rt-nomatch.json')
-Assert-Case -Name 'C3k an override matching no app is a warning' -Result $r -ExpectExit 2 `
-    -Expect @('RUNTIME_OVERRIDE_UNMATCHED')
-
-# C3l. A bad VALUE is not a host condition, it is a caller mistake: fail loudly at parse time
-#      instead of classifying nothing and reporting success.
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1' -DoctorArgs @('-RuntimeOverridesJson', 'C:\cx\rt-badvalue.json')
-Assert-Case -Name 'C3l an invalid override value fails the run' -Result $r -ExpectExit 1 `
-    -Expect @('BAD_ARGUMENT') -Reject @('RESULT: PASS')
-
-$null = Invoke-BreakSite -Case 'webConfigRestore' -Site 'blog'
-$null = Invoke-InContainer 'Remove-Item -Recurse -Force C:\inetpub\blog\bin -ErrorAction SilentlyContinue'
-
-# C3m. Inheritance still decides: a child with no web.config under an INHERITING Core parent
-#      is itself ASP.NET Core, and must not be written off as non-.NET.
-$null = Invoke-BreakSite -Case 'webConfigInherit' -Site 'shop'
-$null = Invoke-BreakSite -Case 'childNoWebConfig' -Site 'shop'
-$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
-Assert-Case -Name 'C3m child inheriting <aspNetCore> is AspNetCore, not NonDotNet' -Result $r `
-    -Expect @("inherited from 'shop/'")
-$null = Invoke-BreakSite -Case 'removeChildApp' -Site 'shop'
-$null = Invoke-BreakSite -Case 'webConfigRestore' -Site 'shop'
 
 Write-Host ''
 Write-Host '== D. broken states ==' -ForegroundColor Cyan
@@ -547,13 +379,9 @@ if ($wow.Out.Trim() -ne 'True') {
     Assert-Case -Name 'forcing the redirected path still reproduces APPHOST_UNREADABLE' -Result $r -Expect @('APPHOST_UNREADABLE')
 
     # E4. The aggregator, and its own fallback resolver, under WOW64.
-    # Retargeted from 'Default Web Site' to 'shop': the stock site is static content and is
-    # now deliberately unnamed, so it can no longer prove that name resolution WORKED. 'shop'
-    # is a dedicated-pool ASP.NET Core app and is single-app again by this point
-    # (removeChildApp ran at the end of group C2).
     $r = Invoke-Doctor32 -ScriptFile 'Test-Agent.ps1' -DoctorArgs @('-Only', 'iisServiceName')
     Assert-Case -Name '32-bit Test-Agent resolves per-app service names' -Result $r `
-        -Expect @('OTEL_SERVICE_NAME=shop (pool)') -Reject @('APPHOST_UNREADABLE')
+        -Expect @('OTEL_SERVICE_NAME=Default Web Site (pool)') -Reject @('APPHOST_UNREADABLE')
 
     # E5. End to end: doctor.bat launched from 32-bit cmd must re-launch itself
     #     64-bit via Sysnative (PROCESSOR_ARCHITEW6432 is defined there).

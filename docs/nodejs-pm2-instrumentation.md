@@ -200,22 +200,24 @@ Exit `0` pass / `1` hard fail / `2` degraded. It is also **dual-mode**: dot-sour
 `Test-NodeInstrumentation` returning finding objects, which is how `Test-Agent.ps1` consumes
 it. Full code list: [`agent-diagnostics.md`](./agent-diagnostics.md).
 
-### The shape matrix
+### The shapes this covers
 
-Every way Node runs on a Windows host — and which ones this tooling covers, which it deliberately
-does not, and why — is tabulated in
-[`nodejs-windows-shape-matrix.md`](./nodejs-windows-shape-matrix.md), with
-[`test/docker-win/Run-NodeShapesTest.ps1`](../test/docker-win/Run-NodeShapesTest.ps1) as its
-executable form: PM2 per-user (fork/cluster), PM2 as a service under `LOCAL SERVICE` / `LocalSystem`
-/ an ordinary account, a stopped daemon with only `dump.pm2`, bare `node.exe` from a scheduled task,
-Node as a service without PM2, iisnode, and IIS ARR in front of PM2.
+Node runs on Windows in more ways than one, and the difference decides whether zero-code
+instrumentation reaches the process at all:
 
-Run it before touching anything in this area:
-
-```powershell
-.\test\docker-win\Run-NodeShapesTest.ps1 -SkipCoralogix       # matrix, local gates only
-.\test\docker-win\Run-NodeShapesTest.ps1 -Region eu1          # + one backend sweep
-```
+* **PM2 per-user**, fork and cluster mode — covered; `NODE_OPTIONS` is written into the app's PM2
+  environment and applied with `pm2 restart --update-env`.
+* **PM2 hosted as a Windows service** under `LOCAL SERVICE`, `LocalSystem` or an ordinary account —
+  covered, but the daemon's `PM2_HOME` and owning account decide which apps are visible, so the
+  instrumenter reports the daemon's topology rather than assuming the per-user default.
+* **A stopped daemon** with only `dump.pm2` on disk — the app list is read from the dump, and the
+  finding says so, because a dump is a snapshot and can disagree with what will run next.
+* **Node as a Windows service without PM2** (`winsw`, `nssm`, or a bare SCM command line) — covered
+  by `Instrument-NodeService.ps1`.
+* **Bare `node.exe`** from a scheduled task, **iisnode**, and **IIS ARR in front of PM2** — reported
+  as out of scope rather than silently assumed. For the ARR case the IIS side is deliberately not
+  claimed: the pool's environment never reaches the backend process, so the backend has to be
+  instrumented where it runs.
 
 ### Verify coverage with no host access at all
 

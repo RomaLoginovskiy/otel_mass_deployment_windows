@@ -41,9 +41,6 @@ param(
     [switch] $Gui,
     [string] $User         = 'Administrator',
     [string] $Password     = 'Otel!Passw0rd2026',
-    # -Action Deploy only: Coralogix region code (eu1/eu2/us1/...) handed to deploy.bat
-    # as CX_REGION. Empty = the package's own region.txt, else eu1.
-    [string] $Region       = '',
     [string] $GuestStageDir= 'C:\cx-deploy',
     [string] $AdditionsIso = (Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxGuestAdditions.iso'),
     [string] $HostOnlyIf   = 'VirtualBox Host-Only Ethernet Adapter'
@@ -157,12 +154,8 @@ switch ($Action) {
         Write-Host "[poc] expanding + running deploy.bat in guest ..."
         VBox @gc run --exe 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' --wait-stdout --wait-stderr `
             '--' -NoProfile -ExecutionPolicy Bypass -Command "Expand-Archive -Path '$guestZip' -DestinationPath '$GuestStageDir\pkg' -Force"
-        # --putenv is how the region reaches deploy.bat: guestcontrol starts the process
-        # with its own environment, so a variable set in THIS shell would not be there.
-        $runArgs = @('run', '--exe', "$GuestStageDir\pkg\deploy.bat", '--wait-stdout', '--wait-stderr')
-        if ($Region) { $runArgs += @('--putenv', "CX_REGION=$Region") }
-        VBox @gc @runArgs
-        Write-Host "[poc] deploy.bat completed in guest$(if ($Region) { " (region $Region)" }). Check Coralogix Fleet Management for the agent."
+        VBox @gc run --exe "$GuestStageDir\pkg\deploy.bat" --wait-stdout --wait-stderr
+        Write-Host "[poc] deploy.bat completed in guest. Check Coralogix Fleet Management for the agent."
     }
 
     'Info' {

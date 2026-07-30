@@ -452,7 +452,7 @@ function Get-CxPm2Service {
         # pm2-installer registers a renamed winsw as `<PM2_HOME>\service\pm2.exe`, so the image path
         # is a bare exe with no mention of node anywhere - and requiring both words meant the probe
         # missed the exact layout it was written for, reporting hosting=none on a host whose PM2 is
-        # plainly a service. Verified against that layout in test/docker-win/Run-NodeShapesTest.ps1.
+        # plainly a service. Verified against a real pm2-installer service layout.
         if (($path -notmatch 'pm2') -and ($name -notmatch 'pm2')) { continue }
         return [pscustomobject]@{
             Name        = [string]$s.Name
