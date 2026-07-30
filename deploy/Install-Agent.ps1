@@ -274,6 +274,12 @@ try {
     }
     if ($svcUnion.Count) {
         $cxServices = ($svcUnion.ToArray() -join ',')
+        # Record BEFORE writing, so uninstall deletes a variable we created and restores one that was
+        # already set. Without this the manifest has nothing to reverse and the value survives the
+        # uninstall, leaving the host claiming ownership of services that are gone.
+        if ($session) {
+            try { Record-EnvChange -Session $session -Name 'CX_SERVICES' -PriorValue ([Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')) } catch {}
+        }
         [Environment]::SetEnvironmentVariable('CX_SERVICES', $cxServices, 'Machine')
         Write-Host "[agent] set machine CX_SERVICES=$cxServices ($($svcUnion.Count) service(s) claimed for host ownership)" -ForegroundColor Green
     } elseif ([Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')) {
