@@ -750,7 +750,14 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             # <aspNetCore><environmentVariables>, so an app can only have one if it had an
             # <aspNetCore> element - and if it no longer classifies as Core, that element is
             # gone and took the name with it. There is no stale-web.config-name case to clean.
-            if ($r.Scope -eq 'pool' -and (Remove-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME' -ExpectedValue $r.ServiceName)) {
+            # NOT when the iisnode branch above just wrote that very name. A pure Node app under
+            # iisnode is correctly Unsupported for the .NET profiler, so it reaches this cleanup -
+            # and the value it would "clean up" is the name its own node.exe needs, written moments
+            # earlier with the identical value the -ExpectedValue guard matches on. MEASURED on
+            # cx-e2e-c1: the installer reported IISNODE_APP_INSTRUMENTED and the pool ended up with
+            # NODE_OPTIONS and no OTEL_SERVICE_NAME, so the app reported as unknown_service:node.
+            if ($r.Scope -eq 'pool' -and -not ($iisnodeApps -contains $r) -and
+                (Remove-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME' -ExpectedValue $r.ServiceName)) {
                 Write-Host "  [pool] removed stale OTEL_SERVICE_NAME=$($r.ServiceName) from '$($r.Pool)' (left by an installer that did not classify runtimes)" -ForegroundColor Yellow
             }
             continue
