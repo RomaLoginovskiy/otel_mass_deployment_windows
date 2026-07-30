@@ -178,7 +178,7 @@ pass.
 `web.config`, or an ASP.NET Framework app with no `<aspNetCore>` node. The host
 then advertised Service ownership for a service that emits nothing, breaking the
 `set(CX_IIS_SERVICES) == set(OTEL_SERVICE_NAME across apps)` guarantee in
-[`iis-service-ownership.md`](iis-service-ownership.md).
+[`docs/iis-service-ownership.md`](../docs/iis-service-ownership.md).
 
 The consequence was worse than a cosmetic mismatch: the doctor compares the
 variable against the names actually present, so such a host reported
