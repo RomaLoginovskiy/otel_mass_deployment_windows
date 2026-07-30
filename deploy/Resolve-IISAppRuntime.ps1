@@ -389,6 +389,48 @@ function Get-CxAppFilesystemEvidence {
     return [pscustomobject]@{ Accessible = $accessible; Evidence = @($ev.ToArray()) }
 }
 
+function Get-CxCoreRuntimeMajor {
+    <#
+    .SYNOPSIS
+      An ASP.NET Core app's TARGET .NET major version, from its own runtimeconfig.json. $null when
+      it cannot be determined.
+
+    .DESCRIPTION
+      Reads `<app>.runtimeconfig.json` (`runtimeOptions.tfm` = "net6.0", or the
+      `framework`/`frameworks` version "6.0.0") from the publish output next to the app's DLL. The
+      pool's managedRuntimeVersion cannot answer this: a Core app runs on a No-Managed-Code pool
+      whatever version it targets, which is why an out-of-support Core app read as Supported.
+
+      $null on anything unreadable - no file, bad JSON, no recognisable field. The caller treats
+      $null as undetermined and does NOT refuse the app: guessing "too old" would stop instrumenting
+      apps that work.
+    #>
+    [CmdletBinding()]
+    param([string] $PhysicalPath)
+
+    if (-not $PhysicalPath -or -not (Test-Path -LiteralPath $PhysicalPath -ErrorAction SilentlyContinue)) { return $null }
+    try {
+        $cfg = Get-ChildItem -LiteralPath $PhysicalPath -Filter '*.runtimeconfig.json' -File -ErrorAction Stop |
+                    Select-Object -First 1
+    } catch { return $null }
+    if (-not $cfg) { return $null }
+    try {
+        $j = Get-Content -LiteralPath $cfg.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+    } catch { return $null }
+
+    $ro = $j.runtimeOptions
+    if (-not $ro) { return $null }
+    # tfm first ("net8.0"), then the framework version ("8.0.0"); frameworks[] for a multi-framework
+    # app, where the highest wins - it is the one that has to be supported.
+    if ($ro.tfm -and ([string]$ro.tfm) -match '^net(?:coreapp)?(\d+)\.') { return [int]$Matches[1] }
+    $vers = @()
+    if ($ro.framework -and $ro.framework.version) { $vers += [string]$ro.framework.version }
+    foreach ($f in @($ro.frameworks)) { if ($f.version) { $vers += [string]$f.version } }
+    $majors = @($vers | ForEach-Object { if ($_ -match '^(\d+)\.') { [int]$Matches[1] } } | Where-Object { $_ })
+    if (@($majors).Count -gt 0) { return (@($majors | Sort-Object -Descending)[0]) }
+    return $null
+}
+
 function Get-IISAppInstrumentability {
     <#
     .SYNOPSIS
@@ -412,7 +454,11 @@ function Get-IISAppInstrumentability {
         [bool]   $PoolClrLoads,
         # WHICH CLR, not just whether one loads. Untyped for the same reason as elsewhere: $null
         # (attribute absent) must not collapse to ''.
-        $PoolManagedRuntimeVersion
+        $PoolManagedRuntimeVersion,
+        # The app's TARGET .NET major version, from its runtimeconfig.json, or $null when unknown.
+        # Untyped and null-defaulted for the same reason as above: "not determined" must not collapse
+        # to 0 and start refusing apps we can in fact instrument.
+        $CoreRuntimeMajor
     )
 
     # A v2.0 pool loads a CLR, so PoolClrLoads alone cannot tell it apart from v4.0 - and that is
@@ -422,8 +468,25 @@ function Get-IISAppInstrumentability {
     # of scope for it, so such an app is Unsupported - the app itself runs perfectly well.
     $isClr2 = ($null -ne $PoolManagedRuntimeVersion) -and (([string]$PoolManagedRuntimeVersion) -match '^v?2(\.|$)')
 
+    # The Core counterpart of the CLR-2 rule, and it exists for the identical reason. MEASURED on a
+    # Server 2025 host: an ASP.NET Core app targeting .NET 6.0.36 loads our native profiler into
+    # w3wp, and the StartupHook then refuses the runtime - "6.0.36 is not supported", "Rule 'Minimum
+    # Supported Framework Version Validator' failed", "Automatic Instrumentation won't be loaded"
+    # (%ProgramData%\OpenTelemetry .NET AutoInstrumentation\logs\*-StartupHook-*.log). The module
+    # enforces the .NET support lifecycle and .NET 6 left support in November 2024, so the app can
+    # never report however correct its configuration is - and classifying it Supported is what made a
+    # host claim that service name in CX_IIS_SERVICES, advertising ownership of a service nothing
+    # reports under. The app itself is unaffected and serves normally.
+    #
+    # 8 is the floor because that is the oldest runtime still in support; $null (no runtimeconfig.json
+    # readable) is NOT below it - an undetermined version must not silently refuse an app.
+    $isBelowCoreMinimum = ($null -ne $CoreRuntimeMajor) -and ([int]$CoreRuntimeMajor -gt 0) -and ([int]$CoreRuntimeMajor -lt 8)
+
     switch ($Runtime) {
-        'AspNetCore'      { if ($PoolClrLoads) { return 'Misconfigured' } else { return 'Supported' } }
+        'AspNetCore'      {
+            if ($isBelowCoreMinimum) { return 'Unsupported' }    # runs, but nothing can instrument it
+            if ($PoolClrLoads) { return 'Misconfigured' } else { return 'Supported' }
+        }
         'AspNetFramework' {
             if (-not $PoolClrLoads) { return 'Misconfigured' }   # No Managed Code: the app is DOWN
             if ($isClr2)            { return 'Unsupported'   }   # runs, but nothing can instrument it
@@ -626,8 +689,20 @@ function Resolve-IISAppRuntime {
         try { $nodeIsEsm = [bool](Test-CxNodeAppIsEsm -Script $entryFull -Cwd $PhysicalPath) } catch { $nodeIsEsm = $false }
     }
 
+    # The app's TARGET .NET version, for the Core minimum-runtime rule. Read from the publish
+    # output's own runtimeconfig.json; $null when there is none to read, which the policy treats as
+    # "undetermined" rather than "too old".
+    $coreMajor = Get-CxCoreRuntimeMajor -PhysicalPath $PhysicalPath
+
     $instr = Get-IISAppInstrumentability -Runtime $runtime -PoolClrLoads $poolClrLoads `
-                                         -PoolManagedRuntimeVersion $PoolManagedRuntimeVersion
+                                         -PoolManagedRuntimeVersion $PoolManagedRuntimeVersion `
+                                         -CoreRuntimeMajor $coreMajor
+
+    # Same shape as the CLR-2 wording below, and for the same reason: an operator who reads the
+    # generic NonDotNet text goes looking for a misclassification that is not there.
+    if ($instr -eq 'Unsupported' -and $runtime -eq 'AspNetCore') {
+        $reason = "$reason, but it targets .NET $coreMajor. The OpenTelemetry .NET auto-instrumentation follows the .NET support lifecycle and refuses an out-of-support runtime in its StartupHook ('Automatic Instrumentation won't be loaded'), so this application cannot be instrumented however correct its configuration is - measured on .NET 6.0.36. The minimum is .NET 8"
+    }
 
     # A Framework app on CLR 2 is Unsupported for a reason that has nothing to do with the app being
     # non-.NET, so say which it is - otherwise the operator reads the generic NonDotNet wording and
@@ -716,13 +791,16 @@ function New-IISRuntimeFinding {
         # A real .NET app that simply cannot be instrumented: the profiler needs Framework 4.6.2+.
         # info, not warn - the application is healthy and this is a property of its pool's CLR, not
         # a defect to act on. It gets its own code so it never reads as "we think this is static".
+        'AspNetCore/Unsupported'        { $code = 'ASPNETCORE_RUNTIME_BELOW_MINIMUM';  $sev = 'info' }
         'AspNetFramework/Unsupported'   { $code = 'FRAMEWORK_CLR2_NOT_INSTRUMENTABLE'; $sev = 'info' }
         'NonDotNet/Unsupported'         { $code = 'NON_DOTNET_APP_NOT_INSTRUMENTED';  $sev = 'info' }
         default                         { $code = 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE';   $sev = 'unknown' }
     }
 
     $msg = $Record.RuntimeReason
-    if ($code -eq 'FRAMEWORK_CLR2_NOT_INSTRUMENTABLE') {
+    if ($code -eq 'ASPNETCORE_RUNTIME_BELOW_MINIMUM') {
+        $msg = "$msg. No OTEL_SERVICE_NAME is written and the app is not claimed in CX_IIS_SERVICES, because a name that never reports is worse than no name. The application itself is unaffected and serves normally; upgrade it to a supported .NET version to instrument it."
+    } elseif ($code -eq 'FRAMEWORK_CLR2_NOT_INSTRUMENTABLE') {
         $msg = "$msg. No OTEL_SERVICE_NAME is written and the app is not claimed in CX_IIS_SERVICES, because a name that never reports is worse than no name."
     } elseif ($code -eq 'NON_DOTNET_APP_NOT_INSTRUMENTED') {
         $msg = "$msg. The .NET OpenTelemetry automatic instrumentation does not apply, so no OTEL_SERVICE_NAME is written and the app is not claimed in CX_IIS_SERVICES. If IIS reverse-proxies to a backend process, instrument that backend where it runs."

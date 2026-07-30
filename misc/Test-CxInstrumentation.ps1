@@ -2493,8 +2493,21 @@ function Resolve-CxAppRuntime {
     # report.
     $isClr2 = ($null -ne $PoolManagedRuntimeVersion) -and (([string]$PoolManagedRuntimeVersion) -match '^v?2(\.|$)')
 
+    # The Core counterpart of the CLR-2 rule - MEASURED: the auto-instrumentation StartupHook refuses
+    # an out-of-support runtime ("6.0.36 is not supported", "Automatic Instrumentation won't be
+    # loaded"), so such an app can never report and must not be claimed. $null = undetermined, which
+    # is NOT below the minimum. Keep identical to Get-IISAppInstrumentability in
+    # deploy/Resolve-IISAppRuntime.ps1 - the unit suite asserts this clone has not drifted.
+    $coreMajor = if (Get-Command Get-CxCoreRuntimeMajor -ErrorAction SilentlyContinue) {
+        Get-CxCoreRuntimeMajor -PhysicalPath $PhysicalPath
+    } else { $null }
+    $isBelowCoreMinimum = ($null -ne $coreMajor) -and ([int]$coreMajor -gt 0) -and ([int]$coreMajor -lt 8)
+
     $instr = switch ($runtime) {
-        'AspNetCore'      { if ($poolClrLoads) { 'Misconfigured' } else { 'Supported' } }
+        'AspNetCore'      {
+            if ($isBelowCoreMinimum) { 'Unsupported' }
+            elseif ($poolClrLoads)   { 'Misconfigured' } else { 'Supported' }
+        }
         'AspNetFramework' {
             if (-not $poolClrLoads) { 'Misconfigured' }   # No Managed Code: the app is DOWN
             elseif ($isClr2)        { 'Unsupported'   }   # runs, but nothing can instrument it
