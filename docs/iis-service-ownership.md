@@ -99,9 +99,26 @@ Each host's **Service ownership** items are **exactly the per-app `OTEL_SERVICE_
 > **Succeeded, not merely attempted.** Some apps cannot be named at all: a shared-pool app
 > with no `web.config`, or a classic ASP.NET Framework app with no `<aspNetCore>` element to
 > write into. Those are **excluded** from `CX_IIS_SERVICES`. Including them (which the script
-> used to do) advertised ownership of a service that emits nothing and made the doctor report
+> used to do) advertised ownership of a name nothing reports under and made the doctor report
 > `CX_IIS_SERVICES_DRIFT` **permanently**, since re-running reproduced the same value. See
 > [`iis-e2e-matrix.md`](iis-e2e-matrix.md).
+>
+> **And instrumentable, not merely nameable.** A second exclusion sits in front of the first:
+> an app is only named if its runtime classifies as ASP.NET Core or ASP.NET Framework. A static
+> site, a native/ISAPI handler, PHP or Node behind IIS, a URL-Rewrite reverse proxy, or an app
+> whose runtime cannot be determined is skipped outright — .NET auto-instrumentation emits
+> nothing for it, so claiming it would point Service ownership at telemetry that never arrives.
+> This used to bite whenever such an app had a pool to itself: naming was decided by pool arity
+> alone, so a dedicated pool was enough to get named and claimed. The membership rule is now
+> **named AND .NET**, which is strictly narrower than before — it can only ever under-claim
+> further, never start over-claiming. `Test-Agent.ps1` applies the identical filter when it
+> rebuilds the expected set; the two must change together.
+>
+> **So the ownership list can be a subset.** An excluded ASP.NET Framework app still reports —
+> the instrumentation auto-detects `SiteName\VirtualPath` — so it appears in APM while the host
+> does not claim it. That is deliberate and one-directional: under-claiming costs one missing
+> ownership item, over-claiming costs permanent drift. To bring such an app under management,
+> give it a dedicated app pool so the pool variable can carry a name we chose.
 
 Result: an APM service (e.g. `SimpleWebApp`) always matches one of its host's Service-ownership
 items, so APM ↔ infrastructure resource correlation can select a single service.
@@ -221,6 +238,13 @@ instant on the host.
   **set**. That is the only check that catches sites added or renamed *after* the deploy ran.
   Pass the same `-ServiceNameOverrides` / `-OverridesJson` the install used, or every app
   reports false drift.
+- Pass the same **`-RuntimeOverrides` / `-RuntimeOverridesJson`** too, for the same reason and
+  with a sharper failure mode: they decide which apps are eligible for the list at all, so an
+  install that saw an override and a doctor that did not will disagree about membership and
+  report drift no re-run can clear. All three scripts default that parameter to
+  `CX_RUNTIME_OVERRIDES_JSON`, so setting the variable machine-wide keeps them in step without
+  threading a flag through `deploy.bat` and `doctor.bat`. Note the key space is app identity
+  (`Site/`, `Site/api`) — **not** the service-name keys `-ServiceNameOverrides` uses.
 - A transform processor applies **per-signal** statement blocks — this one covers only the
   logs signal, so it defines only `log_statements`. (If the label is ever needed on spans or
   metrics, add `trace_statements` / `metric_statements` with the same body and wire the

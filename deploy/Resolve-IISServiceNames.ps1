@@ -24,6 +24,23 @@
       A single pool-level env var cannot distinguish co-hosted apps, so the name is
       written into each application's own web.config instead.
 
+  Runtime classification (per app):
+    Each record also carries DotNetRuntime and Instrumentability from
+    Resolve-IISAppRuntime.ps1, so callers can tell an ASP.NET Core app from an ASP.NET
+    Framework app from a static site or a reverse proxy. The installer uses it to decide
+    what to write and what to claim in CX_IIS_SERVICES; the app pool's "No Managed Code"
+    setting is an INPUT to that decision, never the decision itself.
+
+  TWO OVERRIDE KEY SPACES - they look alike and are not:
+    -Overrides         keyed by the auto-derived SERVICE name ("Wallet", "Wallet/api").
+                       Changes the label. Root apps have NO trailing slash.
+    -RuntimeOverrides  keyed by APP IDENTITY ("Wallet/", "Wallet/api"). Changes the
+                       classification. Root apps DO end in '/' (the slash-less form is
+                       accepted as an alias). This is the string the doctor prints in its
+                       Target column, so a key can be copied off the diagnostic output.
+    Runtime overrides are applied during classification, i.e. BEFORE the name overrides
+    and before the scope tally - renaming an app must never change what it is.
+
   Overrides: a hashtable keyed by the auto-derived service name ("Wallet", "Wallet/api")
   whose value is the desired replacement name. Applied after auto-naming, before the
   scope tally (so a rename never changes which pool an app belongs to).
@@ -32,10 +49,28 @@
   Requires the WebAdministration module (IIS management tools). Run elevated.
 #>
 
+# Runtime classification, shared with the doctor so the installer skips exactly the apps the
+# doctor reports as not instrumentable. Guarded: without it every record classifies as Unknown
+# and Get-IISServiceMap says so through RuntimeReason, rather than failing the enumeration.
+$script:CxSvcHere = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+$script:CxRuntimeLib = Join-Path $script:CxSvcHere 'Resolve-IISAppRuntime.ps1'
+if (Test-Path -LiteralPath $script:CxRuntimeLib -ErrorAction SilentlyContinue) {
+    try { . $script:CxRuntimeLib } catch { }
+}
+
 function Get-IISServiceMap {
     [CmdletBinding()]
     param(
-        [hashtable] $Overrides = @{}
+        [hashtable] $Overrides = @{},
+        # Forced runtimes, keyed by APP IDENTITY - see the two-key-spaces note in the file
+        # header. Accepts either a raw hashtable or one already normalized by
+        # Resolve-IISRuntimeOverrides.
+        [hashtable] $RuntimeOverrides = @{},
+        # Skip classification entirely and leave the runtime fields $null. For callers that
+        # must act on EVERY app regardless of what it is - Uninstall-Agent.ps1 has to remove
+        # names written by any prior version of the installer, including names it would no
+        # longer write today.
+        [switch] $SkipRuntimeClassification
     )
 
     Import-Module WebAdministration -ErrorAction Stop
@@ -56,6 +91,18 @@ function Get-IISServiceMap {
             ServiceName  = $siteName
             PhysicalPath = $rootPhys
             Scope        = $null   # filled in by the pool tally below
+            # Declared here, not bolted on later, so every record has the same shape whether
+            # or not classification ran - a caller testing $r.Instrumentability must never
+            # hit a missing property.
+            DotNetRuntime             = $null
+            Instrumentability         = $null
+            RuntimeSource             = $null
+            RuntimeEvidence           = @()
+            InheritedFrom             = $null
+            WebConfigState            = $null
+            PoolManagedRuntimeVersion = $null
+            PoolClrLoads              = $null
+            RuntimeReason             = $null
         })
 
         foreach ($app in (Get-WebApplication -Site $siteName)) {
@@ -75,7 +122,79 @@ function Get-IISServiceMap {
                 ServiceName  = "$siteName$appPath"   # 'Wallet' + '/api' -> 'Wallet/api'
                 PhysicalPath = $phys
                 Scope        = $null
+                DotNetRuntime             = $null
+                Instrumentability         = $null
+                RuntimeSource             = $null
+                RuntimeEvidence           = @()
+                InheritedFrom             = $null
+                WebConfigState            = $null
+                PoolManagedRuntimeVersion = $null
+                PoolClrLoads              = $null
+                RuntimeReason             = $null
             })
+        }
+    }
+
+    # Classify each application's runtime. Runs BEFORE the name overrides below, because a
+    # rename changes the label and must never change what the application IS.
+    if (-not $SkipRuntimeClassification -and (Get-Command Resolve-IISAppRuntime -ErrorAction SilentlyContinue)) {
+
+        # Pool CLR versions, in ONE enumeration. Not one read per app, and not one per pool:
+        # the IIS: provider costs tens of milliseconds per read, so a 200-pool host would add
+        # ten seconds to every deploy for a value that never changes mid-run.
+        #
+        # WebAdministration resolves an ABSENT managedRuntimeVersion to its schema default of
+        # 'v4.0' before we see it, so unlike the doctor's applicationHost.config reader this
+        # path cannot distinguish absent from explicitly-v4.0. It does not need to: both load
+        # a CLR, and Resolve-IISAppRuntime keys its policy on that boolean.
+        $poolClr = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+        try {
+            foreach ($p in (Get-ChildItem 'IIS:\AppPools' -ErrorAction Stop)) {
+                $poolClr[[string]$p.Name] = [string]$p.managedRuntimeVersion
+            }
+        } catch {
+            # Leave it empty. An unknown pool then classifies as CLR-loading, which is IIS's
+            # own default and errs toward reporting a No-Managed-Code mismatch that is not
+            # there - noisy, but it never causes an app to be silently skipped.
+            Write-Warning "  [runtime] could not enumerate IIS:\AppPools ($($_.Exception.Message)); pool CLR versions assumed to be the IIS default (v4.0)"
+        }
+
+        $rtTable = $RuntimeOverrides
+        if ($rtTable -and $rtTable.Count -gt 0 -and (Get-Command Resolve-IISRuntimeOverrides -ErrorAction SilentlyContinue)) {
+            # Idempotent: normalizing an already-normalized table is a no-op, so a caller that
+            # pre-resolved its overrides and one that passes a raw hashtable both work.
+            $rtTable = Resolve-IISRuntimeOverrides -Table $RuntimeOverrides
+        }
+
+        foreach ($r in $records) {
+            try {
+                $anc       = @(Get-CxAppAncestorPaths -Apps $records -Site $r.Site -AppPath $r.AppPath)
+                $ancPaths  = @($anc | ForEach-Object { [string]$_.PhysicalPath })
+                $ancLabels = @($anc | ForEach-Object { Get-IISAppKey -Site $_.Site -AppPath $_.AppPath })
+                $ov        = Get-IISRuntimeOverrideFor -Overrides $rtTable -Site $r.Site -AppPath $r.AppPath
+                $mrv       = if ($poolClr.Contains($r.Pool)) { $poolClr[$r.Pool] } else { $null }
+
+                $rt = Resolve-IISAppRuntime -PhysicalPath $r.PhysicalPath `
+                    -PoolManagedRuntimeVersion $mrv -PoolFound ($poolClr.Contains($r.Pool)) `
+                    -AncestorPhysicalPaths $ancPaths -InheritedFromLabels $ancLabels -Override $ov
+
+                $r.DotNetRuntime             = $rt.DotNetRuntime
+                $r.Instrumentability         = $rt.Instrumentability
+                $r.RuntimeSource             = $rt.RuntimeSource
+                $r.RuntimeEvidence           = @($rt.RuntimeEvidence)
+                $r.InheritedFrom             = $rt.InheritedFrom
+                $r.WebConfigState            = $rt.WebConfigState
+                $r.PoolManagedRuntimeVersion = $rt.PoolManagedRuntimeVersion
+                $r.PoolClrLoads              = $rt.PoolClrLoads
+                $r.RuntimeReason             = $rt.RuntimeReason
+            } catch {
+                # One unclassifiable app must not take the whole enumeration down. Unknown is
+                # the honest answer and the installer already declines to write for it.
+                $r.DotNetRuntime     = 'Unknown'
+                $r.Instrumentability = 'RequiresOverride'
+                $r.RuntimeSource     = 'none'
+                $r.RuntimeReason     = "runtime classification failed: $($_.Exception.Message)"
+            }
         }
     }
 
@@ -166,7 +285,18 @@ function Set-WebConfigServiceName {
     # element (the publish output wraps it in <location path="." ...>). Match anywhere.
     $aspNetCore = $xml.SelectSingleNode('//aspNetCore')
     if (-not $aspNetCore) {
-        Write-Warning "  [webconfig] no <aspNetCore> in '$webConfig' (classic ASP.NET Framework?) - skipping. For Framework apps set OTEL_SERVICE_NAME via <appSettings> instead."
+        # Classic ASP.NET Framework. <appSettings> is NOT a substitute here, and this
+        # function is only reached for pool-SHARING apps: on .NET Framework the OTEL_*
+        # values in web.config are promoted to PROCESS-level environment variables at
+        # startup and the SDK initialises once per worker process, so in a shared pool
+        # the first application to start decides the service name for every app in it.
+        # Writing appSettings would produce a name decided by a startup race, and
+        # counting the app as named would put that race result into CX_IIS_SERVICES.
+        #
+        # Declining is not the same as losing the app: with nothing configured the
+        # instrumentation auto-detects "SiteName\VirtualPath", so it still reports -
+        # just under a name this installer did not choose and must not claim.
+        Write-Warning "  [webconfig] no <aspNetCore> in '$webConfig' (classic ASP.NET Framework) - cannot name '$ServiceName'. On a shared pool, OTEL_* from web.config/appSettings is promoted process-wide and the first app to start wins, so per-app naming is not possible; the app still reports under the auto-detected 'Site\AppPath'. Give it a dedicated app pool to name it."
         return $false
     }
 

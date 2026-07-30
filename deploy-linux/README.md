@@ -65,21 +65,37 @@ On each target host:
 From Coralogix:
 
 - A **Send-Your-Data** API key
-- Correct domain for your region (examples below)
+- The **region** that key belongs to (`CORALOGIX_REGION`, table below)
 - Access to **Integrations → Fleet Management**
 - Permission to manage remote configuration (`REMOTE-CONFIGURATION:MANAGE` for Activate)
 
-### Domain cheat sheet
+### Region cheat sheet
 
-| Region / UI | `CORALOGIX_DOMAIN`  |
-| --- | --- |
-| India | `app.coralogix.in` |
-| US1 | `coralogix.com` |
-| EU2 | `eu2.coralogix.com` |
+Pass `CORALOGIX_REGION=<code>` (or `--region <code>`) and the script resolves the
+domain as `<code>.coralogix.com`:
 
-Use the value that matches your Coralogix account. Wrong domain → agent never appears in Fleet Management.
+| `CORALOGIX_REGION` | Region | Resolved `CORALOGIX_DOMAIN` |
+| --- | --- | --- |
+| `us1` | AWS us-east-2 (Ohio) | `us1.coralogix.com` |
+| `us2` | AWS us-west-2 (Oregon) | `us2.coralogix.com` |
+| `us3` | GCP us-central1 (Iowa) | `us3.coralogix.com` |
+| `eu1` | AWS eu-west-1 (Ireland) | `eu1.coralogix.com` |
+| `eu2` | AWS eu-north-1 (Stockholm) | `eu2.coralogix.com` |
+| `ap1` | AWS ap-south-1 (Mumbai) | `ap1.coralogix.com` |
+| `ap2` | AWS ap-southeast-1 (Singapore) | `ap2.coralogix.com` |
+| `ap3` | AWS ap-southeast-3 (Jakarta) | `ap3.coralogix.com` |
+
+Set `CORALOGIX_DOMAIN` directly only for a private ingress or a legacy per-region
+domain (`app.coralogix.in`, `coralogix.us`, `coralogixsg.com`, ...); it overrides
+`CORALOGIX_REGION` when both are set. An unknown region code aborts the install —
+wrong region → the key authenticates nowhere and the agent never appears in Fleet
+Management. Do not use your team hostname (`<team>.app.eu2.coralogix.com`) here.
 
 OpAMP endpoint becomes: `https://ingress.<CORALOGIX_DOMAIN>/opamp/v1`
+
+The resolved domain is written to `/etc/opampsupervisor/opampsupervisor.conf` and
+passed through to the collector as `CORALOGIX_DOMAIN`, because the config templates in
+this folder reference it as `${env:CORALOGIX_DOMAIN}` instead of hardcoding a domain.
 
 ---
 
@@ -113,7 +129,7 @@ Defaults if unset: both `databases`.
 ```bash
 sudo env \
   CORALOGIX_PRIVATE_KEY="<your-send-your-data-key>" \
-  CORALOGIX_DOMAIN="app.coralogix.in" \
+  CORALOGIX_REGION="ap1" \
   APP_TYPE="postgresql" \
   ENV_TYPE="prod" \
   POSTGRES_OTEL_PASSWORD="<otel_monitor_password>" \
@@ -203,7 +219,8 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | Variable | Description |
 | --- | --- |
 | `CORALOGIX_PRIVATE_KEY` | Send-Your-Data API key |
-| `CORALOGIX_DOMAIN` | Region domain, e.g. `app.coralogix.in` |
+| `CORALOGIX_REGION` | Region code — `us1`/`us2`/`us3`/`eu1`/`eu2`/`ap1`/`ap2`/`ap3` → `<code>.coralogix.com`. Also accepted as `--region <code>`. Required **unless** `CORALOGIX_DOMAIN` is set instead. |
+| `CORALOGIX_DOMAIN` | Full ingress domain; overrides `CORALOGIX_REGION`. Use for a private or legacy per-region domain, e.g. `app.coralogix.in` |
 | `POSTGRES_OTEL_PASSWORD` | Required unless present in `otel-monitor.env` |
 
 ### Fleet labels

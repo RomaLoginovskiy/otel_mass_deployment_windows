@@ -30,8 +30,23 @@
   Sets CORALOGIX_DOMAIN and CORALOGIX_PRIVATE_KEY (persisted as machine env vars so
   the service keeps them across restarts), produces the config, and installs.
 
+.PARAMETER Region
+  Coralogix region code: eu1, eu2, us1, us2, us3, ap1, ap2, ap3. Resolved to the
+  region's domain (<region>.coralogix.com) by Resolve-CxRegion.ps1 and published as
+  CORALOGIX_DOMAIN, which the base config's coralogix exporters and the vendor
+  installer's OpAMP endpoint both read. An unknown code is a hard error - it would
+  otherwise ship telemetry to the wrong account while looking healthy.
+
 .PARAMETER Domain
-  Coralogix domain. Default: eu1.coralogix.com
+  Full Coralogix ingress domain, for a private / non-standard endpoint the region
+  table does not cover. Wins over -Region when both are given.
+
+  When NEITHER is given the domain is resolved, in order, from: the CX_DOMAIN environment
+  variable (the domain-shaped equivalent of this parameter, which deploy.bat forwards), the
+  CX_REGION environment variable, a CORALOGIX_DOMAIN exported for this run, a region.txt
+  file next to this script, the CORALOGIX_DOMAIN a previous install persisted on this host,
+  and finally eu1.coralogix.com. See the block above the resolution for why the same
+  environment variable appears in two different places in that order.
 
 .PARAMETER PrivateKey
   Send-Your-Data API key. If omitted, read from -KeyFile.
@@ -77,7 +92,10 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Domain     = 'eu1.coralogix.com',
+    # Region code (eu1/eu2/us1/...) -> domain. Defaults are resolved below, not here,
+    # because the fallback chain reads the environment and a file on disk.
+    [string] $Region     = $null,
+    [string] $Domain     = $null,
     [string] $PrivateKey = $null,
     [string] $KeyFile    = (Join-Path $PSScriptRoot 'SendDataKey.txt'),
     [switch] $NoSupervisor,
@@ -114,12 +132,134 @@ if (-not $KeyFile)    { $KeyFile    = Join-Path $here 'SendDataKey.txt' }
 $backupHelper = Join-Path $here 'Backup-Config.ps1'
 if (Test-Path $backupHelper) { . $backupHelper }
 
+# Region table. NOT Test-Path guarded like the optional helpers: without it a -Region
+# cannot be resolved, and defaulting to eu1 in that case would send the fleet's data
+# to the wrong account silently. Fail the install instead.
+$regionHelper = Join-Path $here 'Resolve-CxRegion.ps1'
+if (-not (Test-Path $regionHelper)) { throw "Region table not found: $regionHelper (package is incomplete)" }
+. $regionHelper
+
 function Assert-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p  = New-Object Security.Principal.WindowsPrincipal($id)
     if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw "This script must run elevated (Administrator)."
     }
+}
+
+function ConvertTo-SupervisorAttrScalar {
+    <#
+      Render one AgentDescription value as the YAML scalar text that survives the supervisor.
+
+      The supervisor does not parse config.yaml once. It re-serializes
+      agent.description.non_identifying_attributes into the config text it composes for the
+      collector WITHOUT escaping backslashes, and parses that text again - so one level of
+      backslash escaping is consumed per pass. Measured against the real binary on a Windows VM,
+      for the value C:\ProgramData\pm2:
+
+        "C:\ProgramData\pm2"        DEAD  - "load config: retrieved value (type=string) cannot be
+                                    used as a Conf ... found unknown escape character". This is
+                                    the reported OTIOMWQA01 failure.
+        'C:\ProgramData\pm2'        DEAD  - "could not compose initial merged config ... found
+                                    unknown escape character". Quoting style alone is NOT the fix.
+        "C:\\ProgramData\\pm2"      DEAD  - valid YAML, still re-emitted unescaped.
+        "NT AUTHORITY\\LocalService" STARTS but the value is SILENTLY CORRUPTED: on the second
+                                    pass \L is a legal escape (U+2028), giving
+                                    NT AUTHORITY<U+2028>ocalService. "Service is Running" is
+                                    therefore not a sufficient check.
+        'C:/ProgramData/pm2'        STARTS, but the value is lossy - it is no longer the path.
+        'C:\\ProgramData\\pm2'      STARTS and the value arrives EXACT. <- canonical form.
+
+      So: double every backslash, then wrap in single quotes (doubling any apostrophe) so a quote
+      in a value cannot break the document either.
+    #>
+    param([string] $Value)
+    $v = ([string]$Value).Replace('\', '\\')
+    return "'" + ($v -replace "'", "''") + "'"
+}
+
+function Expand-CxBackslashEscapes {
+    <#
+      One lenient backslash-unescaping pass, modelling what the supervisor's SECOND parse does to
+      a value. Escapes we honour are collapsed; anything else keeps its backslash, because an
+      escape the parser would reject is a backslash the writer meant literally.
+    #>
+    param([string] $Text)
+
+    $s = [string]$Text
+    if (-not $s.Contains('\')) { return $s }
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $s.Length; $i++) {
+        if ($s[$i] -ne '\' -or $i -eq $s.Length - 1) { [void]$sb.Append($s[$i]); continue }
+        switch -CaseSensitive ("$($s[$i + 1])") {
+            '\' { [void]$sb.Append('\');      $i++ }
+            '"' { [void]$sb.Append('"');      $i++ }
+            '/' { [void]$sb.Append('/');      $i++ }
+            't' { [void]$sb.Append([char]9);  $i++ }
+            'n' { [void]$sb.Append([char]10); $i++ }
+            'r' { [void]$sb.Append([char]13); $i++ }
+            default { [void]$sb.Append('\') }
+        }
+    }
+    return $sb.ToString()
+}
+
+function Get-SupervisorAttrValue {
+    <#
+      Best-effort recovery of the value the collector would ACTUALLY end up with, given an
+      existing scalar's raw text - so a non-canonical line can be rewritten without changing what
+      it meant.
+
+      Two passes, because the supervisor parses this field twice:
+        1. YAML: a single-quoted scalar is literal apart from '' for an apostrophe; a
+           double-quoted scalar gets its escapes decoded.
+        2. The supervisor re-emits that text unescaped and parses it again - modelled by
+           Expand-CxBackslashEscapes.
+
+      So 'C:\\ProgramData\\pm2' decodes to C:\ProgramData\pm2 (the canonical form round-trips),
+      while both 'C:\ProgramData\pm2' and "C:\ProgramData\pm2" also decode to C:\ProgramData\pm2 -
+      they carry the same intent but do not survive the second pass.
+    #>
+    param([string] $Raw)
+    return (Expand-CxBackslashEscapes -Text (Get-SupervisorAttrFirstPass -Raw $Raw))
+}
+
+function Get-SupervisorAttrFirstPass {
+    <# The value after YAML parses this scalar once - i.e. the text the supervisor then re-emits. #>
+    param([string] $Raw)
+
+    $t = ([string]$Raw).Trim()
+    if ($t.Length -ge 2 -and $t.StartsWith("'") -and $t.EndsWith("'")) {
+        return $t.Substring(1, $t.Length - 2).Replace("''", "'")
+    }
+    if ($t.Length -ge 2 -and $t.StartsWith('"') -and $t.EndsWith('"')) {
+        return (Expand-CxBackslashEscapes -Text $t.Substring(1, $t.Length - 2))
+    }
+    return $t   # a plain scalar carries no escapes at all
+}
+
+function Test-SupervisorAttrScalarNeedsFix {
+    <#
+      Must this existing scalar be rewritten? Yes only when a backslash SURVIVES the first parse
+      and the scalar is not already canonical - because that is precisely the case the supervisor's
+      second parse either rejects (dead service) or silently rewrites (corrupted value).
+
+      A value like "col1\tcol2" is deliberately left alone: its backslash is consumed by the first
+      parse, so the second parse sees a tab and cannot damage it. Rewriting it would be churn on a
+      line we did not author.
+    #>
+    param([string] $Raw)
+
+    if (-not ([string]$Raw).Contains('\')) { return $false }
+    if (-not (Get-SupervisorAttrFirstPass -Raw $Raw).Contains('\')) { return $false }
+    return (-not (Test-SupervisorAttrScalarCanonical -Raw $Raw))
+}
+
+function Test-SupervisorAttrScalarCanonical {
+    <# Is this raw scalar text already exactly what ConvertTo-SupervisorAttrScalar would write? #>
+    param([string] $Raw)
+    $decoded = Get-SupervisorAttrValue -Raw $Raw
+    return (([string]$Raw).Trim() -ceq (ConvertTo-SupervisorAttrScalar $decoded))
 }
 
 function Set-SupervisorDescriptionAttributes {
@@ -161,27 +301,332 @@ function Set-SupervisorDescriptionAttributes {
     $itemIndent = $indent + '  '
 
     # Keys already present in the block (child lines indented under the anchor).
-    $existing = @{}
+    #
+    # The same pass CANONICALIZES any value CONTAINING A BACKSLASH that is not already in the form
+    # ConvertTo-SupervisorAttrScalar would write. Neither half is cosmetic:
+    #
+    #   * un-doubled backslashes kill the service on the supervisor's second parse, and a key that
+    #     is already present is otherwise skipped below - so without this pass a re-deploy is a
+    #     no-op on an already-broken host, which is exactly what happened on OTIOMWQA01.
+    #   * a value whose second-pass escape happens to be LEGAL (\L, \b, \t, \n) starts fine and
+    #     silently rewrites itself, so "the service is Running" cannot be the test. Only "the
+    #     scalar is already exactly canonical" can be.
+    #
+    # Only backslash-bearing values are touched. A value without one cannot be hurt by the second
+    # parse, so the vendor's own double-quoted service.name / cx.agent.type lines are left exactly
+    # as the installer wrote them rather than churned into our quoting style.
+    $existing = @{}; $fixed = @()
     for ($j = $anchor + 1; $j -lt $lines.Count; $j++) {
         if ($lines[$j] -match '^\s*#') { continue }
         if ($lines[$j] -notmatch ("^" + [regex]::Escape($itemIndent) + "\S")) { break }
+        if ($lines[$j] -match '^(\s*)([^:\s]+)\s*:\s*(\S.*?)\s*$') {
+            $indent0 = $Matches[1]; $key0 = $Matches[2]; $raw = $Matches[3]
+            if (Test-SupervisorAttrScalarNeedsFix -Raw $raw) {
+                $intended  = Get-SupervisorAttrValue -Raw $raw
+                $lines[$j] = "{0}{1}: {2}" -f $indent0, $key0, (ConvertTo-SupervisorAttrScalar $intended)
+                $fixed += $key0
+            }
+        }
         if ($lines[$j] -match '^\s*([^:\s]+)\s*:') { $existing[$Matches[1]] = $true }
     }
+    if ($fixed.Count -gt 0) {
+        Write-Warning "[supervisor] canonicalized AgentDescription values whose backslashes would not survive the supervisor's second parse: $($fixed -join ', ')"
+    }
 
-    $insert = @(); $added = @()
+    $insert = @(); $added = @(); $doubled = @()
     foreach ($k in $pairs.Keys) {
         if ($existing.ContainsKey($k)) { continue }
-        $insert += ('{0}{1}: "{2}"' -f $itemIndent, $k, $pairs[$k]); $added += $k
+        $v = [string]$pairs[$k]
+        if ($v.Contains('\')) { $doubled += $k }
+        $insert += ("{0}{1}: {2}" -f $itemIndent, $k, (ConvertTo-SupervisorAttrScalar $v)); $added += $k
     }
-    if ($insert.Count -eq 0) { Write-Host "[supervisor] AgentDescription already carries the selector attributes"; return }
+    if ($doubled.Count -gt 0) {
+        Write-Host "[supervisor] backslashes doubled in AgentDescription values (the supervisor parses this field twice): $($doubled -join ', ')"
+    }
+    if ($insert.Count -eq 0 -and $fixed.Count -eq 0) {
+        Write-Host "[supervisor] AgentDescription already carries the selector attributes"; return
+    }
 
     $new = @($lines[0..$anchor]) + $insert
     if (($anchor + 1) -le ($lines.Count - 1)) { $new += $lines[($anchor + 1)..($lines.Count - 1)] }
     Set-Content -Path $ConfigPath -Value $new -Encoding utf8
-    Write-Host "[supervisor] published selector attributes to AgentDescription ($($insert.Count) added): $($added -join ', ')"
+    Write-Host "[supervisor] published selector attributes to AgentDescription ($($insert.Count) added, $($fixed.Count) canonicalized): $($added -join ', ')"
+}
+
+function Publish-SupervisorAgentDescription {
+    <#
+      Inject the selector attributes into the supervisor's config.yaml and leave the service
+      RUNNING - or leave the config as it was.
+
+      This is a function rather than inline install steps for one reason: it is the only
+      place in the deploy that can take a working agent off the air, and the rollback branch
+      is the part most likely to rot. Inline, it could only be exercised by a full vendor
+      reinstall on a real host, which no harness does; as a function,
+      test\Test-SupervisorConfigWriter.ps1 drives it offline, and a VM loop can drive it
+      against the real supervisor binary - the only thing that can prove go-yaml accepts
+      what we write.
+
+      Returns a result object ($_.Applied / $_.RolledBack / $_.Reason) so a caller - or the
+      VM loop - can assert on the outcome instead of parsing host output.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $ConfigPath,
+        [string] $Attributes
+    )
+
+    $result = [pscustomobject]@{ Applied = $false; RolledBack = $false; Reason = $null; ServiceRunning = $false }
+
+    # A rollback copy taken immediately before OUR edit, independent of the -Session
+    # (uninstall-time) backup: the edit is the last thing between a working supervisor and a
+    # dead one, so the undo has to exist even on a plain install with no session.
+    $preEditCopy = "$ConfigPath.pre-agentdesc"
+    if (Test-Path $ConfigPath) { Copy-Item $ConfigPath $preEditCopy -Force -ErrorAction SilentlyContinue }
+
+    Set-SupervisorDescriptionAttributes -ConfigPath $ConfigPath -Attributes $Attributes
+
+    try {
+        if (-not (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue)) {
+            $result.Reason = 'no opampsupervisor service on this host'
+            return $result
+        }
+
+        # The vendor installer registers the service with StartType=Manual. After a reboot the
+        # supervisor stays Stopped -> the agent silently drops off Fleet Management and no
+        # telemetry ships until someone starts it by hand. Automatic + delayed start + failure
+        # actions together are what actually make it come back (see Set-SupervisorServiceResilience:
+        # Automatic alone was measured to be insufficient).
+        Set-Service -Name 'opampsupervisor' -StartupType Automatic -ErrorAction SilentlyContinue
+        Write-Host "[supervisor] set opampsupervisor StartType=Automatic"
+        Set-SupervisorServiceResilience
+
+        # The restart is VERIFIED, not fire-and-forget. It used to run with -ErrorAction
+        # SilentlyContinue followed by an unconditional "restarted" message, so an edit that
+        # made config.yaml unparseable left the service dead while the install still reported
+        # success - the failure only surfaced the next time an operator ran Restart-Service by
+        # hand. A config we just wrote that the supervisor will not load is our bug, so roll it
+        # back rather than leave the host with no agent.
+        if (Restart-SupervisorVerified) {
+            Write-Host "[supervisor] restarted opampsupervisor and confirmed Running (AgentDescription attributes applied)"
+            Remove-Item $preEditCopy -Force -ErrorAction SilentlyContinue
+            $result.Applied = $true; $result.ServiceRunning = $true
+            return $result
+        }
+
+        $result.Reason = Get-SupervisorStartError
+        Write-Warning "[supervisor] opampsupervisor did not start after the AgentDescription edit$(if ($result.Reason) { ": $($result.Reason)" })"
+        if (Test-Path $preEditCopy) {
+            Copy-Item $preEditCopy $ConfigPath -Force
+            $result.RolledBack = $true
+            if (Restart-SupervisorVerified) {
+                $result.ServiceRunning = $true
+                Write-Warning "[supervisor] rolled back $ConfigPath to the pre-edit copy; service is running WITHOUT the selector attributes (Fleet Management grouping by cx.host.role/workload.* will not work on this host)"
+            } else {
+                Write-Warning "[supervisor] rollback did not start the service either - the failure predates our edit. Inspect: Get-EventLog -LogName Application -Source opampsupervisor -Newest 20"
+            }
+        }
+        return $result
+    } catch {
+        Write-Warning "[supervisor] could not configure/restart opampsupervisor: $_"
+        $result.Reason = "$_"
+        return $result
+    }
+}
+
+function Set-SupervisorServiceResilience {
+    <#
+      Make the supervisor service survive a reboot on its own.
+
+      StartType=Automatic is not enough, and that was measured rather than assumed: on a rebooted
+      Server 2025 test host the service started at boot and exited 27 seconds later, and because
+      the vendor installer configures no recovery actions (sc qfailure shows RESET_PERIOD 0 and no
+      COMMAND_LINE), nothing retried. The host sat with no agent, reporting nothing, until someone
+      ran Start-Service by hand - the exact silent-gap this deploy is supposed to close. Starting it
+      manually a minute later worked, so the boot-time exit is a race with something that is not
+      ready yet, not a bad config.
+
+      Two standard service settings fix it:
+        * delayed auto-start - start after the boot-critical services, once networking has settled
+        * failure actions - let the SCM restart the process if it exits unexpectedly, with backoff
+
+      Both are idempotent, and both are applied through sc.exe because Set-Service in PowerShell 5.1
+      can express neither. Never fatal: a host with a running agent and no recovery actions is worse
+      off than one with them, but still better off than a failed install.
+    #>
+    try {
+        # `start= delayed-auto` - the space after each '=' is required by sc.exe.
+        $null = & sc.exe config opampsupervisor start= delayed-auto
+        if ($LASTEXITCODE -eq 0) { Write-Host "[supervisor] start type = delayed auto-start (starts after networking settles)" }
+        else { Write-Warning "[supervisor] could not set delayed auto-start (sc.exe exit $LASTEXITCODE)" }
+
+        # Restart after 30s, then 60s, then every 2 min; forget the failure count after a day.
+        $null = & sc.exe failure opampsupervisor reset= 86400 actions= restart/30000/restart/60000/restart/120000
+        if ($LASTEXITCODE -eq 0) { Write-Host "[supervisor] failure actions = restart after 30s / 60s / 120s (a boot-time exit no longer leaves the host unmonitored)" }
+        else { Write-Warning "[supervisor] could not set failure actions (sc.exe exit $LASTEXITCODE)" }
+
+        # By default the SCM runs those actions only when a service dies with a failure code. The
+        # supervisor exits cleanly when it gives up, which counts as a NON-crash failure and would
+        # skip recovery entirely - so the flag has to be set as well, or the actions above are
+        # decoration on exactly the case that matters.
+        $null = & sc.exe failureflag opampsupervisor 1
+        if ($LASTEXITCODE -eq 0) { Write-Host "[supervisor] recovery also applies to a clean exit (failureflag=1)" }
+        else { Write-Warning "[supervisor] could not set failureflag (sc.exe exit $LASTEXITCODE)" }
+    } catch {
+        Write-Warning "[supervisor] could not configure service resilience: $_"
+    }
+}
+
+function Restart-SupervisorVerified {
+    <#
+      Restart opampsupervisor and answer whether it is actually RUNNING afterwards.
+      Restart-Service reports success as soon as the SCM accepts the start, and a config the
+      supervisor cannot load makes the process exit right after that - so the status is re-read
+      and confirmed to still be Running a moment later.
+
+      Two details are deliberate:
+
+      * stop-then-start instead of Restart-Service. Observed on a Server 2025 test host: a start
+        that races the previous process's shutdown intermittently fails with "could not compose
+        initial merged config", on a config that loads fine when the binary is run by hand a
+        moment later. Waiting for Stopped before starting removes that race.
+      * one retry before reporting failure. The caller's response to a failure is to ROLL BACK,
+        so a transient start failure would throw away a perfectly good config (and with it this
+        host's Fleet Management grouping). Only a second consecutive failure is treated as a
+        verdict about the config.
+    #>
+    param([int] $TimeoutSeconds = 25, [int] $Attempts = 2)
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            Stop-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
+            $stopBy = (Get-Date).AddSeconds(15)
+            do {
+                $s = Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue
+                if (-not $s -or $s.Status -eq 'Stopped') { break }
+                Start-Sleep -Milliseconds 500
+            } while ((Get-Date) -lt $stopBy)
+
+            Start-Sleep -Seconds 2   # let the old process finish writing its state directory
+            Start-Service -Name 'opampsupervisor' -ErrorAction Stop
+        } catch {
+            if ($attempt -lt $Attempts) { Write-Host "[supervisor] start attempt $attempt failed ($($_.Exception.Message.Trim())); retrying once"; Start-Sleep -Seconds 5; continue }
+            return $false
+        }
+
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        $running  = $false
+        do {
+            $svc = Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') {
+                Start-Sleep -Seconds 3; $svc.Refresh()
+                if ($svc.Status -eq 'Running') { $running = $true; break }
+            }
+            Start-Sleep -Milliseconds 500
+        } while ((Get-Date) -lt $deadline)
+
+        if ($running) { return $true }
+        if ($attempt -lt $Attempts) { Write-Host "[supervisor] service did not stay Running on attempt $attempt; retrying once"; Start-Sleep -Seconds 5 }
+    }
+    return $false
+}
+
+function Get-SupervisorStartError {
+    <#
+      The one line from the supervisor's own event-log entries that says WHY it refused to
+      start. Without this the operator sees only StartServiceFailed from the SCM and has to
+      go digging - the actual cause (e.g. 'yaml: line 33: found unknown escape character')
+      is only ever written here.
+    #>
+    try {
+        $e = Get-EventLog -LogName Application -Source 'opampsupervisor' -EntryType Error -Newest 10 -ErrorAction Stop |
+                Where-Object { $_.Message -match 'failed to start service' } |
+                Select-Object -First 1
+        if (-not $e) { return $null }
+        $m = [regex]::Match($e.Message, 'failed to start service:[^''"]*')
+        if ($m.Success) { return $m.Value.Trim() }
+        return ($e.Message -split "`n" | Select-Object -First 1).Trim()
+    } catch { return $null }
 }
 
 Assert-Admin
+
+# ---- Resolve the region / domain ----------------------------------------------
+# CORALOGIX_DOMAIN appears twice below because the same variable means two different
+# things: a value an operator exported for THIS run is a decision, while the identical
+# variable inherited from what a PREVIOUS install of ours persisted machine-wide is
+# only a leftover. They are told apart by comparing the process value with the machine
+# value - without that, "rebuild the package with -Region eu2 and re-deploy" would be a
+# silent no-op on every host that had already been installed against eu1.
+#
+# Precedence, most explicit first:
+#   1. -Domain              a private or non-standard ingress domain, verbatim.
+#   2. -Region              region code -> <region>.coralogix.com.
+#   3. CX_DOMAIN env        the domain-shaped equivalent of -Domain, e.g. BatchPatch's
+#                           `set CX_DOMAIN=my-ingress.example.com && deploy.bat`. Unlike
+#                           CORALOGIX_DOMAIN this variable is never persisted by us, so
+#                           its presence is always a decision made for this run - which
+#                           is why deploy.bat CAN forward it as a flag. It outranks
+#                           CX_REGION for the same reason -Domain outranks -Region.
+#   4. CX_REGION env        the region-shaped equivalent, e.g. BatchPatch's
+#                           `set CX_REGION=eu2 && deploy.bat`.
+#   5. CORALOGIX_DOMAIN env when it DIFFERS from the machine value, i.e. exported for
+#                           this run: a private ingress chosen at deploy time.
+#   6. region.txt           next to this script - Build-DeploymentPackage.ps1 -Region
+#                           bakes it in so the remote command stays a bare 'deploy.bat'.
+#   7. CORALOGIX_DOMAIN env matching the machine value: no new decision anywhere, so a
+#                           re-run keeps the region this host was installed with instead
+#                           of dropping back to the eu1 default.
+#   8. eu1.coralogix.com    historical default.
+$machineDomain = [Environment]::GetEnvironmentVariable('CORALOGIX_DOMAIN', 'Machine')
+$envDomain     = Normalize-CxDomainString $env:CORALOGIX_DOMAIN
+$envDomainIsNew = $envDomain -and ($envDomain -ne (Normalize-CxDomainString $machineDomain))
+
+$regionSource = $null
+if ($Domain) {
+    if ($Region) { Write-Warning "[collector] both -Domain and -Region given; -Domain '$Domain' wins" }
+    $Domain = Assert-CxDomainNotEmpty (Normalize-CxDomainString $Domain) '-Domain'
+    $regionSource = '-Domain'
+} elseif ($Region) {
+    $Domain = Resolve-CxDomain -Region $Region
+    $regionSource = "-Region $Region"
+} elseif ($env:CX_DOMAIN) {
+    # Deliberately NOT run through Resolve-CxDomain: that validates against the published
+    # region table and throws, which is the opposite of what this variable is for.
+    if ($env:CX_REGION) { Write-Warning "[collector] both CX_DOMAIN and CX_REGION set; CX_DOMAIN '$env:CX_DOMAIN' wins" }
+    $Domain = Assert-CxDomainNotEmpty (Normalize-CxDomainString $env:CX_DOMAIN) 'CX_DOMAIN'
+    $regionSource = 'CX_DOMAIN env'
+} elseif ($env:CX_REGION) {
+    $Domain = Resolve-CxDomain -Region $env:CX_REGION
+    $regionSource = "CX_REGION env ($env:CX_REGION)"
+} elseif ($envDomainIsNew) {
+    $Domain = $envDomain
+    $regionSource = 'CORALOGIX_DOMAIN env (set for this run)'
+} else {
+    $regionFile = Join-Path $here 'region.txt'
+    if (Test-Path $regionFile) {
+        $fileRegion = (Get-Content -Path $regionFile -Raw).Trim()
+        # An empty region.txt means "no region chosen", not "region ''" - fall through.
+        if ($fileRegion) {
+            $Domain = Resolve-CxDomain -Region $fileRegion
+            $regionSource = "region.txt ($fileRegion)"
+        }
+    }
+    if (-not $Domain -and $envDomain) {
+        $Domain = $envDomain
+        $regionSource = 'CORALOGIX_DOMAIN env (already installed with it)'
+    }
+    if (-not $Domain) {
+        $Domain = 'eu1.coralogix.com'
+        $regionSource = 'default'
+    }
+}
+$resolvedRegion = Get-CxRegionForDomain -Domain $Domain
+Write-Host ("[collector] region {0} -> domain {1} (from {2})" -f
+    $(if ($resolvedRegion) { $resolvedRegion } else { 'custom' }), $Domain, $regionSource)
+if (-not $resolvedRegion) {
+    # Legitimate for a private ingress; also what a typo'd -Domain looks like. Say so
+    # once, loudly, because the collector will report healthy either way.
+    Write-Warning "[collector] '$Domain' is not a published Coralogix region domain. Data goes to ingress.$Domain - verify that is intended (regions: $(Format-CxRegionList))."
+}
 
 # Default the selector attributes to what Detect-Workloads.ps1 persisted machine-wide.
 if (-not $ResourceAttributes) {
@@ -240,7 +685,8 @@ if ($Session) {
 [Environment]::SetEnvironmentVariable('CORALOGIX_PRIVATE_KEY', $PrivateKey, 'Machine')
 $env:CORALOGIX_DOMAIN      = $Domain
 $env:CORALOGIX_PRIVATE_KEY = $PrivateKey
-Write-Host "[supervisor] CORALOGIX_DOMAIN=$Domain (machine env set)"
+Write-Host ("[supervisor] CORALOGIX_DOMAIN={0} (machine env set; region {1})" -f
+    $Domain, $(if ($resolvedRegion) { $resolvedRegion } else { 'custom' }))
 
 # ---- Persist deployment environment (read by resource/environment processor) --
 if ($Environment) {
@@ -322,18 +768,7 @@ if ($NoSupervisor) {
     # Fleet Management can group / assign config by them, then restart to apply.
     $supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Supervisor\config.yaml'
     if ($Session) { Backup-DeployFile -Session $Session -Path $supervisorConfig | Out-Null }
-    Set-SupervisorDescriptionAttributes -ConfigPath $supervisorConfig -Attributes $ResourceAttributes
-    try {
-        if (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue) {
-            # The vendor installer registers the service with StartType=Manual. After a reboot the
-            # supervisor stays Stopped -> the agent silently drops off Fleet Management and no
-            # telemetry ships until someone starts it by hand. Force Automatic so it survives reboots.
-            Set-Service -Name 'opampsupervisor' -StartupType Automatic -ErrorAction SilentlyContinue
-            Write-Host "[supervisor] set opampsupervisor StartType=Automatic (survives reboot)"
-            Restart-Service -Name 'opampsupervisor' -Force -ErrorAction SilentlyContinue
-            Write-Host "[supervisor] restarted opampsupervisor to apply AgentDescription attributes"
-        }
-    } catch { Write-Warning "[supervisor] could not configure/restart opampsupervisor: $_" }
+    Publish-SupervisorAgentDescription -ConfigPath $supervisorConfig -Attributes $ResourceAttributes | Out-Null
 }
 
 # ---- Verify -------------------------------------------------------------------

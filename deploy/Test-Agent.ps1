@@ -95,6 +95,16 @@ param(
     [hashtable] $ServiceNameOverrides = @{},
     [string]    $OverridesJson,
 
+    # Likewise for runtime classification: CX_IIS_SERVICES membership depends on it, so a
+    # doctor run with different runtime overrides than the install will report drift that
+    # is not there. Note the DIFFERENT key space - app identity ("Site/", "Site/api"), not
+    # the derived service name. See Resolve-IISAppRuntime.ps1.
+    [hashtable] $RuntimeOverrides = @{},
+    # Reads the env var by default, exactly as Instrument-IIS.ps1 does, so a fleet that stages
+    # one overrides file gets the same classification on both sides without threading a flag
+    # through deploy.bat and doctor.bat.
+    [string]    $RuntimeOverridesJson = $env:CX_RUNTIME_OVERRIDES_JSON,
+
     # --- tuning ----------------------------------------------------------------
     # Install-Agent.ps1 retries 12x5s because it JUST restarted the supervisor.
     # The doctor restarts nothing, so a long wait only slows a fleet sweep.
@@ -144,6 +154,10 @@ else { $script:CxMissingDeps += 'Test-IISInstrumentation.ps1' }
 $dep = Join-Path $here 'Test-NodeInstrumentation.ps1'
 if (Test-Path -LiteralPath $dep -ErrorAction SilentlyContinue) { . $dep }
 else { $script:CxMissingDeps += 'Test-NodeInstrumentation.ps1' }
+
+$dep = Join-Path $here 'Resolve-CxRegion.ps1'         # region <-> domain table (display only here)
+if (Test-Path -LiteralPath $dep -ErrorAction SilentlyContinue) { . $dep }
+else { $script:CxMissingDeps += 'Resolve-CxRegion.ps1' }
 
 # Availability is decided by the function actually being callable, not by the
 # file existing - that is what the bug above taught.
@@ -280,12 +294,26 @@ if (Use-Check 'env') {
             -Message "present ($($privateKey.Length) chars)" -Data @{ length = $privateKey.Length })
     }
 
+    # CORALOGIX_DOMAIN is the region. The recommended config resolves it as
+    # ${env:CORALOGIX_DOMAIN:-eu1.coralogix.com}, so an unset variable is not "the
+    # config decides" - it is "this host silently ships to eu1".
     $domain = Get-MachineVar 'CORALOGIX_DOMAIN'
     if (-not $domain) {
         Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'DOMAIN_MISSING' -Target 'CORALOGIX_DOMAIN' `
-            -Message 'not set - the collector falls back to whatever the config hardcodes')
+            -Message 'not set - the config default applies and this host ships to eu1. Re-deploy with -Region <code> (or CX_REGION), or -Domain / CX_DOMAIN for a private ingress, if that is not the account.')
     } else {
-        Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CORALOGIX_DOMAIN' -Message $domain)
+        # Name the region when the domain is one Coralogix publishes; flag it when it is
+        # not, because a typo'd domain and a private ingress look identical from here and
+        # the collector reports healthy either way.
+        $regionCode = if (Get-Command Get-CxRegionForDomain -ErrorAction SilentlyContinue) { Get-CxRegionForDomain -Domain $domain } else { $null }
+        if ($regionCode) {
+            Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CORALOGIX_DOMAIN' `
+                -Message "$domain (region $regionCode)" -Data @{ domain = $domain; region = $regionCode })
+        } else {
+            Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'DOMAIN_NOT_A_KNOWN_REGION' -Target 'CORALOGIX_DOMAIN' `
+                -Message "$domain is not a published Coralogix region domain - data goes to ingress.$domain. Expected for a private ingress (-Domain / CX_DOMAIN); a typo in that value otherwise." `
+                -Data @{ domain = $domain })
+        }
     }
 
     $environment = Get-MachineVar 'CX_ENVIRONMENT'
@@ -322,6 +350,40 @@ if (Use-Check 'env') {
     } else {
         Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_IIS_SERVICES' -Message $cxIisServices `
             -Data @{ value = $cxIisServices })
+    }
+
+    # CX_SERVICES is what the collector's transform/iis_service_labels reads FIRST; the per-runtime
+    # variables are only its inputs. A host that publishes CX_NODE_SERVICES or CX_DOTNET_SERVICES but
+    # no union silently falls back to IIS names, so those services are never claimed by the host
+    # entity - the exact failure that looks like "APM has spans, Infra Explorer shows no ownership".
+    # Unlike the per-runtime checks below, this one is deliberately case-INSENSITIVE on both sides:
+    # Install-Agent.ps1 de-duplicates the union with an OrdinalIgnoreCase comparer and keeps the
+    # first-seen spelling, so an IIS 'MyApp' and a Node 'myapp' legitimately collapse to one entry and
+    # a case-sensitive comparison here would report drift on a correct host. Sort-Object -Unique is
+    # case-insensitive (Select-Object -Unique is not), which is why it is used. What this check owns is
+    # MEMBERSHIP - is every instrumented service in the union; the exact spelling that ends up on the
+    # telemetry is graded against the app names by the CX_IIS_SERVICES / CX_NODE_SERVICES checks.
+    $cxServices = Get-MachineVar 'CX_SERVICES'
+    $unionSet = @(@($cxIisServices, (Get-MachineVar 'CX_NODE_SERVICES'), (Get-MachineVar 'CX_DOTNET_SERVICES')) |
+        Where-Object { $_ } | ForEach-Object { $_ -split ',' } | ForEach-Object { "$_".Trim() } |
+        Where-Object { $_ } | Sort-Object -Unique)
+    if (-not $unionSet.Count) {
+        Add-F (New-Finding -Check 'env' -Severity 'info' -Target 'CX_SERVICES' `
+            -Message 'not set, and no IIS/Node/.NET service names are published either - nothing is instrumented on this host to claim')
+    } elseif (-not $cxServices) {
+        Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_MISSING' -Target 'CX_SERVICES' `
+            -Message "not set, but $($unionSet.Count) service name(s) are published across CX_IIS_SERVICES/CX_NODE_SERVICES/CX_DOTNET_SERVICES. The collector falls back to IIS names only, so non-IIS services are not claimed for host ownership. Re-deploy: Install-Agent.ps1 publishes the union." `
+            -Data @{ expected = $unionSet })
+    } else {
+        $haveSet = @($cxServices -split ',' | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Sort-Object -Unique)
+        if (Compare-Object -ReferenceObject $unionSet -DifferenceObject $haveSet) {
+            Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_DRIFT' -Target 'CX_SERVICES' `
+                -Message "set to '$cxServices', which is not the union of the per-runtime variables ($($unionSet -join ',')) - a partial or stale deploy. Re-run the installer to republish it." `
+                -Data @{ cxServices = $haveSet; expected = $unionSet })
+        } else {
+            Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_SERVICES' -Message $cxServices `
+                -Data @{ value = $haveSet })
+        }
     }
 } else {
     Add-F (New-Finding -Check 'env' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
@@ -384,6 +446,26 @@ if (Use-Check 'iisServiceName') {
                     -Data @{ value = $cxIisServices })
             }
         } else {
+            # Runtime overrides first, and resolved ONCE. Two reasons to do it here rather
+            # than at the point of use: the hashtable and the JSON file have to be merged
+            # before either consumer sees them (passing only the hashtable to
+            # Get-IISServiceMap would classify the map without the file's entries while the
+            # loop below used both), and a bad VALUE throws - inside the try around
+            # Get-IISServiceMap that would surface as WEBADMINISTRATION_MISSING, which is the
+            # wrong diagnosis for an operator typo.
+            $rtCapable = [bool](Get-Command Resolve-IISAppRuntime -ErrorAction SilentlyContinue)
+            $rtOverrides = $null
+            if ($rtCapable) {
+                try { $rtOverrides = Resolve-IISRuntimeOverrides -Table $RuntimeOverrides -JsonPath $RuntimeOverridesJson }
+                catch {
+                    Add-F (New-Finding -Check 'iisServiceName' -Severity 'fail' -Code 'BAD_ARGUMENT' `
+                        -Message "-RuntimeOverrides could not be parsed: $($_.Exception.Message)")
+                }
+            } else {
+                Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'HELPER_MISSING' `
+                    -Message 'Resolve-IISAppRuntime.ps1 is not present, so non-.NET apps cannot be told apart from uninstrumented ones. Every named app is counted toward CX_IIS_SERVICES, which is the pre-classification behaviour and may report drift against an installer that filtered them out.')
+            }
+
             # Expected names. Prefer the authoritative library (it owns the naming
             # convention and the overrides); fall back to deriving them from
             # applicationHost.config when WebAdministration is unavailable - which
@@ -398,7 +480,9 @@ if (Use-Check 'iisServiceName') {
                             if (-not $ServiceNameOverrides.ContainsKey($p.Name)) { $ServiceNameOverrides[$p.Name] = $p.Value }
                         }
                     }
-                    $expectedMap = @(Get-IISServiceMap -Overrides $ServiceNameOverrides)
+                    $mapArgs = @{ Overrides = $ServiceNameOverrides }
+                    if ($rtOverrides) { $mapArgs['RuntimeOverrides'] = $rtOverrides }
+                    $expectedMap = @(Get-IISServiceMap @mapArgs)
                 } catch {
                     Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'WEBADMINISTRATION_MISSING' `
                         -Message "Get-IISServiceMap failed ($($_.Exception.Message)) - falling back to deriving names from applicationHost.config")
@@ -413,9 +497,31 @@ if (Use-Check 'iisServiceName') {
                 })
             }
 
+            # Classification below runs from $model.Apps rather than from $expectedMap: the
+            # fallback path above builds $expectedMap without Get-IISServiceMap, and both
+            # paths have to reach the same verdict or the two halves of this check disagree.
             $actualNames = @()
             foreach ($app in $model.Apps) {
                 $label = "$($app.Site)$($app.AppPath)"
+
+                # What IS this app? CX_IIS_SERVICES membership depends on the answer, and it
+                # has to be computed with the SAME rule Instrument-IIS.ps1 used - otherwise
+                # one side claims a name the other does not and the drift never clears.
+                $rt = $null
+                if ($rtCapable) {
+                    try {
+                        $anc       = @(Get-CxAncestorApps -Model $model -App $app)
+                        $rt = Resolve-IISAppRuntime -PhysicalPath $app.PhysicalPath `
+                            -PoolManagedRuntimeVersion $(if ($model.Pools[$app.Pool]) { $model.Pools[$app.Pool].ManagedRuntimeVersion } else { $null }) `
+                            -PoolFound ([bool]$model.Pools[$app.Pool]) `
+                            -AncestorPhysicalPaths @($anc | ForEach-Object { [string]$_.PhysicalPath }) `
+                            -InheritedFromLabels @($anc | ForEach-Object { "$($_.Site)$($_.AppPath)" }) `
+                            -Override (Get-IISRuntimeOverrideFor -Overrides $rtOverrides -Site $app.Site -AppPath $app.AppPath)
+                    } catch { $rt = $null }
+                }
+                # Instrumentable = the installer would have written a name for it. Unknown
+                # counts as NOT instrumentable, matching the installer's refusal to guess.
+                $instrumentable = if ($rt) { @('AspNetCore','AspNetFramework') -contains $rt.DotNetRuntime } else { $true }
                 $exp = @($expectedMap | Where-Object { $_.Site -eq $app.Site -and $_.AppPath -eq $app.AppPath }) |
                        Select-Object -First 1
                 $expectedName = if ($exp) { [string]$exp.ServiceName } else { $null }
@@ -431,11 +537,38 @@ if (Use-Check 'iisServiceName') {
                 $effective = if ($wcValue) { $wcValue } elseif ($poolValue) { $poolValue } else { $null }
                 $scope     = if ($wcValue) { 'webconfig' } elseif ($poolValue) { 'pool' } else { 'none' }
 
-                if (-not $effective) {
+                if (-not $effective -and -not $instrumentable) {
+                    # Unnamed ON PURPOSE. Reporting this as IIS_SERVICE_NAME_MISSING (warn)
+                    # would pin every host carrying the stock Default Web Site - i.e. nearly
+                    # all of them - at exit 2 forever, for a static site that was never going
+                    # to emit .NET telemetry.
+                    if ($rt.DotNetRuntime -eq 'Unknown') {
+                        Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE' -Target $label `
+                            -Message "$($rt.RuntimeReason). Not named, and not claimed in CX_IIS_SERVICES, rather than guessed. Resolve it with -RuntimeOverrides @{'$(Get-IISAppKey -Site $app.Site -AppPath $app.AppPath)'='AspNetCore'|'AspNetFramework'|'NonDotNet'} on BOTH the install and this check." `
+                            -Data @{ pool = $app.Pool; physicalPath = $app.PhysicalPath })
+                    } else {
+                        Add-F (New-Finding -Check 'iisServiceName' -Severity 'info' -Code 'NON_DOTNET_APP_NOT_INSTRUMENTED' -Target $label `
+                            -Message "$($rt.RuntimeReason). The .NET OpenTelemetry automatic instrumentation does not apply, so no OTEL_SERVICE_NAME is expected and the app is deliberately absent from CX_IIS_SERVICES." `
+                            -Data @{ pool = $app.Pool; physicalPath = $app.PhysicalPath; dotNetRuntime = $rt.DotNetRuntime })
+                    }
+                } elseif (-not $effective) {
                     Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'IIS_SERVICE_NAME_MISSING' -Target $label `
                         -Message "no OTEL_SERVICE_NAME on pool '$($app.Pool)' or in web.config - this app's spans land under a default service name" `
                         -Data @{ pool = $app.Pool; expected = $expectedName; physicalPath = $app.PhysicalPath })
+                } elseif (-not $instrumentable) {
+                    # A name IS present on an app that is not instrumentable: a leftover from
+                    # an installer that did not classify runtimes. Deliberately NOT counted
+                    # toward the expected set, so CX_IIS_SERVICES_DRIFT fires - which is the
+                    # correct verdict (the host claims a service nothing reports) and clears
+                    # on a re-run, because the installer now removes such names.
+                    # Not reported as a pass either: "OTEL_SERVICE_NAME=x" next to "this app
+                    # emits nothing" is the contradiction this whole change exists to remove.
+                    Add-F (New-Finding -Check 'iisServiceName' -Severity 'info' -Code 'NON_DOTNET_APP_NOT_INSTRUMENTED' -Target $label `
+                        -Message "OTEL_SERVICE_NAME=$effective ($scope) is set, but this app is $($rt.DotNetRuntime) and emits no .NET telemetry - a leftover from an installer that did not classify runtimes. Excluded from the expected CX_IIS_SERVICES set; re-run Instrument-IIS.ps1 to remove it." `
+                        -Data @{ value = $effective; scope = $scope; dotNetRuntime = $rt.DotNetRuntime })
                 } else {
+                    # THE membership filter, and it must stay the same rule the installer uses
+                    # to build $namedApps, or the two sets can never agree.
                     $actualNames += $effective
                     if ($expectedName -and $effective -ne $expectedName) {
                         Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'IIS_SERVICE_NAME_DRIFT' -Target $label `
@@ -457,6 +590,13 @@ if (Use-Check 'iisServiceName') {
             # CX_IIS_SERVICES must equal the SET of per-app names. Compare as sets:
             # adding or removing a site reorders the comma-join and would otherwise
             # look like drift.
+            #
+            # CASING IS PART OF THE COMPARISON. Select-Object -Unique is case-SENSITIVE (it keeps both
+            # 'MyApp' and 'myapp') while Compare-Object defaults to case-INSENSITIVE, so a casing-only
+            # mismatch used to dedupe into two entries and then compare as equal - reported as a pass.
+            # It is not one: the collector stamps this literal string for Infrastructure Service
+            # ownership, and it has to match the APM service name character for character or the
+            # correlation the label exists to provide silently does not resolve. Hence -CaseSensitive.
             $expSet = @($actualNames | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
             $varSet = @()
             if ($cxIisServices) {
@@ -467,9 +607,9 @@ if (Use-Check 'iisServiceName') {
                 Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_MISSING' -Target 'CX_IIS_SERVICES' `
                     -Message "not set at machine scope, but $($expSet.Count) instrumented app(s) exist - host Service ownership in Infrastructure Explorer will be BLANK. Re-run Instrument-IIS.ps1 (elevated) and restart the collector." `
                     -Data @{ appServiceNames = $expSet })
-            } elseif ($varSet.Count -gt 0 -and $expSet.Count -gt 0 -and (Compare-Object $expSet $varSet)) {
+            } elseif ($varSet.Count -gt 0 -and $expSet.Count -gt 0 -and (Compare-Object $expSet $varSet -CaseSensitive)) {
                 Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_DRIFT' -Target 'CX_IIS_SERVICES' `
-                    -Message "does not match the apps on this host. var=[$($varSet -join ', ')] apps=[$($expSet -join ', ')] - re-run Instrument-IIS.ps1 and restart the collector." `
+                    -Message "does not match the apps on this host. var=[$($varSet -join ', ')] apps=[$($expSet -join ', ')] - re-run Instrument-IIS.ps1 and restart the collector. apps[] lists only INSTRUMENTABLE applications (ASP.NET Core or ASP.NET Framework); static, native, reverse-proxied and undeterminable apps are excluded by design, so a name here that is missing from apps[] is usually a leftover the re-run will remove." `
                     -Data @{ cxIisServices = $varSet; appServiceNames = $expSet })
             } elseif ($varSet.Count -gt 0) {
                 Add-F (New-Finding -Check 'iisServiceName' -Severity 'pass' -Target 'CX_IIS_SERVICES' `
@@ -736,7 +876,15 @@ if (Use-Check 'iisInstrumentation') {
         Add-F (New-Finding -Check 'iisInstrumentation' -Severity 'unknown' -Code 'HELPER_MISSING' `
             -Message 'Test-IISInstrumentation.ps1 is not present next to this script')
     } else {
-        try { Add-Many (Test-IISInstrumentation -ExpectedOtlpEndpoint $ExpectedOtlpEndpoint) }
+        # Forward the runtime overrides. Without this the aggregator silently ignores them and
+        # reports RUNTIME_UNKNOWN_NEEDS_OVERRIDE for an app the operator has already decided -
+        # i.e. `doctor.bat -Only iisInstrumentation` would contradict both the install and the
+        # standalone validator, which is exactly the drift group C of the doctor test exists
+        # to catch.
+        $iisArgs = @{ ExpectedOtlpEndpoint = $ExpectedOtlpEndpoint }
+        if ($RuntimeOverrides -and $RuntimeOverrides.Count -gt 0) { $iisArgs['RuntimeOverrides'] = $RuntimeOverrides }
+        if ($RuntimeOverridesJson) { $iisArgs['RuntimeOverridesJson'] = $RuntimeOverridesJson }
+        try { Add-Many (Test-IISInstrumentation @iisArgs) }
         catch {
             Add-F (New-Finding -Check 'iisInstrumentation' -Severity 'unknown' -Code 'CHECK_ERRORED' `
                 -Message "Test-IISInstrumentation failed: $($_.Exception.Message)")

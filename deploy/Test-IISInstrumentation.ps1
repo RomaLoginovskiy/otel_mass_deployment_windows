@@ -28,7 +28,12 @@
                       against the deploy manifest
     e. poolOtlp       OTEL_EXPORTER_OTLP_ENDPOINT / _PROTOCOL are EFFECTIVE per
                       pool, modelling the applicationPoolDefaults inheritance trap
-    f. poolRuntime    every ASP.NET Core app's pool is "No Managed Code"
+    f. poolRuntime    classify each application's ACTUAL runtime (ASP.NET Core /
+                      ASP.NET Framework / non-.NET / undeterminable) and check it
+                      against its pool's CLR setting. "No Managed Code" is a pool
+                      property, not an app property: it is correct for ASP.NET
+                      Core, wrong for ASP.NET Framework, and says nothing at all
+                      about a static, native, PHP, Node or reverse-proxied app
 
   READ-ONLY. Reads the registry, applicationHost.config, and each app's
   web.config. Writes nothing, starts nothing, runs no appcmd and no iisreset.
@@ -62,6 +67,16 @@ param(
     # bitness (see Get-CxInetsrvDir).
     [string] $AppHostConfig,
     [string] $BackupRoot,                # default: Backup-Config.ps1's ProgramData root
+    # Force an application's runtime when detection cannot decide. Keyed by APP IDENTITY -
+    # "<Site><virtual path>", root apps ending in '/' - which is the same string this script
+    # prints in the Target column, so a key can be copied straight off the output. That is a
+    # DIFFERENT key space from Instrument-IIS.ps1's -ServiceNameOverrides, which is keyed by
+    # the derived service name; the slash-less form is accepted as an alias for a root app.
+    # Pass the SAME overrides the install used, or the two disagree about what is instrumented.
+    [hashtable] $RuntimeOverrides = @{},
+    # Defaults to the env var, as Instrument-IIS.ps1 does, so the install and this check see
+    # the same overrides without either caller having to remember to pass them.
+    [string] $RuntimeOverridesJson = $env:CX_RUNTIME_OVERRIDES_JSON,
     [switch] $Quiet,
     [switch] $PassThru
 )
@@ -87,6 +102,16 @@ if (Test-Path -LiteralPath $fmt -ErrorAction SilentlyContinue) {
 $logLib = Join-Path $script:CxIisHere 'Resolve-IISLogPaths.ps1'
 if (Test-Path -LiteralPath $logLib -ErrorAction SilentlyContinue) {
     try { . $logLib } catch { }
+}
+
+# Application runtime classification, shared with Instrument-IIS.ps1 so the installer and the
+# doctor cannot disagree about which apps are instrumentable. Guarded the same way: without it
+# the poolRuntime sub-check reports HELPER_MISSING (unknown) and every other check still runs.
+# Deliberately NOT reimplemented here - two copies of this policy is how the repo ended up with
+# two contradictory explanations of "No Managed Code".
+$rtLib = Join-Path $script:CxIisHere 'Resolve-IISAppRuntime.ps1'
+if (Test-Path -LiteralPath $rtLib -ErrorAction SilentlyContinue) {
+    try { . $rtLib } catch { }
 }
 if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) {
     function New-Finding {
@@ -352,31 +377,40 @@ function Get-CxAppHostModel {
     return $model
 }
 
+# web.config reading and URL-hierarchy ancestry now live in Resolve-IISAppRuntime.ps1
+# (Get-CxWebConfigRuntimeState / Get-CxAppAncestorPaths), because Instrument-IIS.ps1 needs the
+# identical answers and a second copy here would drift. Get-CxWebConfigCoreState survives there
+# as a back-compat shim with the same shape (.State/.IsCore/.Inheritable/.DirMissing/.Error).
+#
+# No local fallback on purpose. A degraded reimplementation that answers DIFFERENTLY from the
+# installer is worse than no answer at all - it would report an app as correctly instrumented
+# when the installer skipped it. If the helper is missing, the poolRuntime sub-check says so
+# with HELPER_MISSING (unknown) and defers, which is what 'unknown' is for.
+
+function Get-CxAncestorApps {
+    <#
+      Applications on the same site that sit ABOVE this one in the URL hierarchy,
+      nearest first. Thin adapter over the shared Get-CxAppAncestorPaths: this file's
+      callers pass ($Model, $App), the shared one takes a flat app collection so the
+      installer's service-map records feed it unchanged.
+    #>
+    [CmdletBinding()]
+    param($Model, $App)
+    if (-not (Get-Command Get-CxAppAncestorPaths -ErrorAction SilentlyContinue)) { return ,@() }
+    return (Get-CxAppAncestorPaths -Apps $Model.Apps -Site $App.Site -AppPath $App.AppPath)
+}
+
 function Test-CxAspNetCoreApp {
     <#
-      True when an app's web.config declares <aspNetCore> - i.e. it is an
-      ASP.NET Core app and therefore REQUIRES a "No Managed Code" pool.
-
-      Matches with //aspNetCore because the publish output commonly wraps the
-      node in <location path="." ...> rather than putting it directly under
-      <system.webServer> - the same reason Set-WebConfigServiceName does.
-
-      Returns $null (not $false) when the answer is unknowable: no physical path,
-      missing or unreadable web.config. Callers must not treat that as "no".
+      Back-compat wrapper: $true / $false / $null-when-unknowable. Prefer
+      Resolve-IISAppRuntime, which says WHICH runtime and WHY.
     #>
     [CmdletBinding()]
     param([string] $PhysicalPath)
-
-    if (-not $PhysicalPath) { return $null }
-    try {
-        $wc = Join-Path $PhysicalPath 'web.config'
-        # SilentlyContinue: an access-denied Test-Path emits a non-terminating
-        # error that escapes this try/catch under 'Continue'. We return $null
-        # (unknown) either way, but the console must stay clean.
-        if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
-        [xml]$x = Get-Content -LiteralPath $wc -Raw -ErrorAction Stop
-        return [bool]$x.SelectSingleNode('//aspNetCore')
-    } catch { return $null }
+    if (-not (Get-Command Get-CxWebConfigRuntimeState -ErrorAction SilentlyContinue)) { return $null }
+    $s = Get-CxWebConfigRuntimeState -PhysicalPath $PhysicalPath
+    if ($s.State -eq 'ok' -or $s.State -eq 'absent') { return [bool]$s.IsCore }
+    return $null
 }
 
 function Get-CxEffectivePoolEnv {
@@ -388,9 +422,16 @@ function Get-CxEffectivePoolEnv {
       OBSERVED BEHAVIOUR (verified in the ltsc2022 IIS container): when appcmd
       first writes ANY env var to a pool, IIS MATERIALISES the current
       applicationPoolDefaults entries into that pool's new block alongside it. So
-      in practice a freshly instrumented pool carries a full copy, not an empty
-      one - which is why "pool has a block but no endpoint" is rare and mostly
-      reachable only by hand-editing applicationHost.config.
+      a pool instrumented by THIS installer carries a full copy, not an empty one.
+
+      That is not the same as "pool has a block but no endpoint is rare". The copy
+      is taken from whatever the defaults held AT THE TIME OF THE FIRST WRITE, and
+      any earlier `appcmd .../+[name=...].environmentVariables...` counts - a
+      brownfield pool given a connection string before the agent was installed
+      (which is exactly what misc\wire-db.ps1 does) already owns a block that
+      predates the OTLP defaults, so it never sees them. On a SHARED pool that was
+      the live failure this check was hardened for; Instrument-IIS.ps1 now stamps
+      the OTLP vars directly onto such pools.
 
       The consequential case is that the copy is a SNAPSHOT: change
       applicationPoolDefaults afterwards and every pool that already has its own
@@ -441,7 +482,11 @@ function Test-IISInstrumentation {
         # defaults are evaluated when it is CALLED, by which point the whole
         # file has been sourced and Get-CxAppHostConfigPath exists.
         [string] $AppHostConfig        = (Get-CxAppHostConfigPath),
-        [string] $BackupRoot
+        [string] $BackupRoot,
+        # See the script-level parameter for the key space and why it differs from
+        # -ServiceNameOverrides.
+        [hashtable] $RuntimeOverrides = @{},
+        [string] $RuntimeOverridesJson
     )
 
     $findings = New-Object System.Collections.ArrayList
@@ -610,7 +655,7 @@ function Test-IISInstrumentation {
             if ($pool.HasOwnEnvBlock -and $defEndpoint) {
                 # The trap, caught: defaults look fine, this pool silently opted out.
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_LOST_INHERITANCE' -Target $poolName `
-                    -Message "pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do" `
+                    -Message "pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do. Usually a pool that owned a block before the agent was installed. Re-run Instrument-IIS.ps1 and recycle the pool: it writes the OTLP vars straight onto pools that own a block." `
                     -Data @{ defaultsEndpoint = $defEndpoint; poolEnvKeys = @($pool.Env.Keys) })
             } else {
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target $poolName `
@@ -620,7 +665,10 @@ function Test-IISInstrumentation {
         }
 
         if ($endpoint -match 'localhost') {
-            # Real, documented silent-failure mode - and the shipped default.
+            # Real, documented silent-failure mode. No longer reachable from a stock
+            # deploy (Instrument-IIS.ps1 defaults to 127.0.0.1 and rewrites a
+            # `localhost` value), so a hit here came from a hand edit, a pool block
+            # that predates the agent, or an install from before that change.
             Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'OTLP_ENDPOINT_LOCALHOST' -Target $poolName `
                 -Message "endpoint uses 'localhost' ($endpoint). On a dual-stack host that resolves to ::1 first and OTLP export is silently dropped. Use $ExpectedOtlpEndpoint." `
                 -Data @{ endpoint = $endpoint; expected = $ExpectedOtlpEndpoint })
@@ -647,36 +695,88 @@ function Test-IISInstrumentation {
         }
     }
 
-    # -- f: ASP.NET Core pools must be "No Managed Code" ---------------------
-    # Wrong here means NO telemetry at all, regardless of everything above.
-    foreach ($app in $model.Apps) {
-        $label = "$($app.Site)$($app.AppPath)"
-        $isCore = Test-CxAspNetCoreApp -PhysicalPath $app.PhysicalPath
-
-        if ($null -eq $isCore) {
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
-                -Message "cannot read web.config, so it is unknown whether this is an ASP.NET Core app needing 'No Managed Code'" `
-                -Data @{ physicalPath = $app.PhysicalPath })
-            continue
+    # -- f: what runtime is each app, and does its pool match? ----------------
+    # "No Managed Code" is a property of the POOL, not of the application. It means IIS does
+    # not load the .NET Framework CLR - it does NOT mean the app is unmanaged. So the pool
+    # setting alone decides nothing: it is correct for ASP.NET Core, wrong for ASP.NET
+    # Framework, and irrelevant to a static, native, PHP, Node or reverse-proxied app.
+    # Classify the app first, then judge the pairing. Policy lives in Resolve-IISAppRuntime.ps1
+    # so the installer skips exactly the apps this reports as not instrumentable.
+    if (-not (Get-Command Resolve-IISAppRuntime -ErrorAction SilentlyContinue)) {
+        Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'HELPER_MISSING' `
+            -Message "Resolve-IISAppRuntime.ps1 was not found next to this script, so application runtimes could not be classified. Deferring rather than guessing: a guess here would report apps as correctly instrumented that the installer skipped.")
+    } else {
+        # Same JSON-file-first, hashtable-on-top precedence as every other override pair in
+        # the deploy scripts. A bad VALUE or an unreadable JSON path is an operator error, not
+        # a host condition: graded 'fail' (exit 1) so it cannot be mistaken for a passing run,
+        # but converted from the library's throw rather than propagated - this function's
+        # contract is that it never throws, and Test-Agent.ps1 relies on that.
+        $rtOverrides = $null
+        try {
+            $rtOverrides = Resolve-IISRuntimeOverrides -Table $RuntimeOverrides -JsonPath $RuntimeOverridesJson
+        } catch {
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'fail' -Code 'BAD_ARGUMENT' `
+                -Message "-RuntimeOverrides could not be parsed: $($_.Exception.Message)")
         }
-        if (-not $isCore) { continue }   # Framework app: managed runtime is correct
 
-        $pool = $model.Pools[$app.Pool]
-        if (-not $pool) {
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $label `
-                -Message "pool '$($app.Pool)' is not declared in applicationHost.config")
-            continue
+        foreach ($k in (Get-IISUnmatchedRuntimeOverrideKeys -Overrides $rtOverrides -Apps $model.Apps)) {
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'RUNTIME_OVERRIDE_UNMATCHED' -Target $k `
+                -Message "-RuntimeOverrides has an entry for '$k' but no such IIS application exists on this host, so that classification is not in force. Usual causes: the key was copied from -ServiceNameOverrides (a different key space - runtime keys are '<Site><virtual path>' with root apps ending in '/'), a typo, or a decommissioned site.")
         }
 
-        $mrv = $pool.ManagedRuntimeVersion
-        if ($mrv -eq '') {
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'pass' -Target $label `
-                -Message "ASP.NET Core app on pool '$($app.Pool)' is No Managed Code")
-        } else {
-            $shown = if ($null -eq $mrv) { '<inherited default>' } else { $mrv }
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'POOL_NOT_NO_MANAGED_CODE' -Target $label `
-                -Message "ASP.NET Core app but pool '$($app.Pool)' has managedRuntimeVersion=$shown - it must be '' (No Managed Code) or the app emits NO telemetry at all" `
-                -Data @{ pool = $app.Pool; managedRuntimeVersion = $mrv })
+        foreach ($app in $model.Apps) {
+            $label = "$($app.Site)$($app.AppPath)"
+
+            # A read FAILURE is genuinely unknown. A web.config that is simply not there is
+            # not, and reporting both as "cannot read web.config" made the stock Default Web
+            # Site - wwwroot ships iisstart.htm and no web.config - look like an ACL problem
+            # on every host in the fleet. Kept as its own finding because it describes the
+            # FILE, where the classification below describes the APPLICATION.
+            $wc = Get-CxWebConfigRuntimeState -PhysicalPath $app.PhysicalPath
+            if ($wc.State -eq 'unreadable' -or $wc.State -eq 'nopath') {
+                Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
+                    -Message "$($wc.Error) - so this application's runtime cannot be determined" `
+                    -Data @{ physicalPath = $app.PhysicalPath; error = $wc.Error })
+                continue
+            }
+
+            $pool = $model.Pools[$app.Pool]
+            if (-not $pool) {
+                Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $label `
+                    -Message "pool '$($app.Pool)' is not declared in applicationHost.config, so its CLR setting cannot be checked")
+                continue
+            }
+
+            $anc       = @(Get-CxAncestorApps -Model $model -App $app)
+            $ancPaths  = @($anc | ForEach-Object { [string]$_.PhysicalPath })
+            $ancLabels = @($anc | ForEach-Object { "$($_.Site)$($_.AppPath)" })
+            $ov        = Get-IISRuntimeOverrideFor -Overrides $rtOverrides -Site $app.Site -AppPath $app.AppPath
+
+            $rt = Resolve-IISAppRuntime -PhysicalPath $app.PhysicalPath `
+                -PoolManagedRuntimeVersion $pool.ManagedRuntimeVersion `
+                -AncestorPhysicalPaths $ancPaths -InheritedFromLabels $ancLabels -Override $ov
+
+            # web.config state, reported ALONGSIDE the verdict rather than instead of it: they
+            # answer different questions and an operator needs both ("there is no file" vs
+            # "so nothing is instrumented here"). Suppressed when the app turned out to be
+            # Core by inheritance - there the missing file is expected, not informative.
+            if ($wc.State -eq 'absent' -and $rt.RuntimeSource -ne 'inherited') {
+                $msg = if ($wc.DirMissing) {
+                    "physical path '$($app.PhysicalPath)' does not exist, so there is no web.config - IIS cannot serve this app at all"
+                } else {
+                    "no web.config at '$($app.PhysicalPath)' - ASP.NET Core in IIS is wired by <aspNetCore> in web.config and classic ASP.NET by <system.web>, so neither is configured here. Normal for the stock Default Web Site."
+                }
+                Add-F (New-Finding -Check 'poolRuntime' -Severity 'info' -Code 'WEBCONFIG_ABSENT' -Target $label `
+                    -Message $msg -Data @{ physicalPath = $app.PhysicalPath; dirMissing = [bool]$wc.DirMissing })
+            }
+
+            if ($ov) {
+                Add-F (New-Finding -Check 'poolRuntime' -Severity 'info' -Code 'RUNTIME_OVERRIDE_APPLIED' -Target $label `
+                    -Message "runtime forced to $ov by -RuntimeOverrides; detection was not consulted. The install must be given the same override or the two will disagree about what is instrumented." `
+                    -Data @{ override = $ov })
+            }
+
+            Add-F (New-IISRuntimeFinding -Record $rt -Target $label)
         }
     }
 
@@ -805,6 +905,8 @@ if ($MyInvocation.InvocationName -ne '.') {
     }
     if ($AppHostConfig) { $callArgs['AppHostConfig'] = $AppHostConfig }
     if ($BackupRoot)    { $callArgs['BackupRoot']    = $BackupRoot }
+    if ($RuntimeOverrides -and $RuntimeOverrides.Count -gt 0) { $callArgs['RuntimeOverrides'] = $RuntimeOverrides }
+    if ($RuntimeOverridesJson) { $callArgs['RuntimeOverridesJson'] = $RuntimeOverridesJson }
 
     $result = Test-IISInstrumentation @callArgs
     $code   = Get-GradedExitCode -Findings $result

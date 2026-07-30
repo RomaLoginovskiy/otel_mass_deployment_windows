@@ -29,7 +29,10 @@ param(
     [string]$AppPool       = "SimpleWebAppPool",
     [int]   $Port          = 8080,
     [string]$ServiceName   = "SimpleWebApp",                    # feeds OTEL_SERVICE_NAME + both tags
-    [string]$OtlpEndpoint  = "http://localhost:4318",          # collector HTTP (http/protobuf default)
+    # IPv4 literal on purpose: the collector binds 127.0.0.1 only, and `localhost`
+    # resolves to ::1 first on a dual-stack host, which drops the export silently.
+    # A `localhost` value passed here is rewritten, not honored (see below).
+    [string]$OtlpEndpoint  = "http://127.0.0.1:4318",          # collector HTTP (http/protobuf default)
     [string]$Configuration = "Release",
     [int]   $LoadSweeps    = 40,
     [string]$Environment   = "",                               # deployment env (production/staging/dev); stamps cx_environment/cx_env + semconv, splits telemetry per env in Coralogix
@@ -49,6 +52,13 @@ $inetsrv = if (-not [Environment]::Is64BitProcess -and [Environment]::Is64BitOpe
 }
 $appcmd = Join-Path $inetsrv "appcmd.exe"
 $csproj = Join-Path $SourceDir "SimpleWebApp.csproj"
+
+# Normalize a `localhost` endpoint to the IPv4 literal before it is written to any pool.
+$logHelper = Join-Path $PSScriptRoot "..\deploy\Write-DeployLog.ps1"
+if (Test-Path $logHelper) { . $logHelper }
+if (Get-Command Resolve-CxOtlpEndpoint -ErrorAction SilentlyContinue) {
+    $OtlpEndpoint = Resolve-CxOtlpEndpoint -Endpoint $OtlpEndpoint
+}
 
 # The requested OTEL resource attributes (literal Coralogix-visible tag keys).
 $resourceAttrs = "tags.CX_SERVICE_NAME=$ServiceName,tags.service=$ServiceName"
@@ -138,10 +148,18 @@ if ($InstrumentAllApps) {
     # Reuse the fleet resolver so the demo host and the fleet path name apps identically.
     . (Join-Path $PSScriptRoot "..\deploy\Resolve-IISServiceNames.ps1")
     $svcMap = Get-IISServiceMap
+    # Same membership rule the fleet installer uses, so a demo host does not behave differently
+    # from a real one: only apps that classify as ASP.NET Core or ASP.NET Framework are named,
+    # and only those are claimed in CX_IIS_SERVICES below.
+    $namedApps = New-Object System.Collections.ArrayList
     foreach ($r in $svcMap) {
         $attrs = "tags.CX_SERVICE_NAME=$($r.ServiceName),tags.service=$($r.ServiceName)"
         if ($Environment) { $attrs += ",tags.cx_environment=$Environment,tags.cx_env=$Environment,deployment.environment.name=$Environment" }
-        Write-Host ("  {0,-18} {1,-10} pool={2,-18} -> {3} [{4}]" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope) -ForegroundColor Green
+        Write-Host ("  {0,-18} {1,-10} pool={2,-18} -> {3} [{4}] {5}" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope, $r.DotNetRuntime) -ForegroundColor Green
+        if ($r.Instrumentability -eq 'Unsupported' -or $r.Instrumentability -eq 'RequiresOverride') {
+            Write-Host "    skipped - $($r.RuntimeReason)" -ForegroundColor DarkGray
+            continue
+        }
         if ($r.Scope -eq 'pool') {
             # Dedicated pool: set the name, endpoint, and per-app tags on the pool.
             $poolVars = [ordered]@{
@@ -155,10 +173,11 @@ if ($InstrumentAllApps) {
                 & $appcmd set config -section:system.applicationHost/applicationPools `
                     "/+[name='$($r.Pool)'].environmentVariables.[name='$n',value='$($poolVars[$n])']" /commit:apphost | Out-Null
             }
+            [void]$namedApps.Add($r)
         } else {
             # Shared pool: only the per-app service name is distinguishable; endpoint/tags
             # are inherited from the pool. Set the name in the app's web.config.
-            [void](Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName)
+            if (Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName) { [void]$namedApps.Add($r) }
         }
     }
 }
@@ -168,10 +187,13 @@ Write-Host "== Step 6c: CX_IIS_SERVICES (infra service label) ==" -ForegroundCol
 # transform/iis_service_labels processor to stamp the IIS service name(s) onto INFRASTRUCTURE
 # telemetry so Coralogix resolves the host's Service ownership. Built from the SAME names
 # assigned as each app's OTEL_SERVICE_NAME, so ownership items == per-app service names:
-#   -InstrumentAllApps -> the distinct set from $svcMap (via Get-IISServiceLabelValue);
+#   -InstrumentAllApps -> the distinct set of apps that were actually NAMED (via
+#                         Get-IISServiceLabelValue). Not the whole map: a static site or a
+#                         reverse proxy emits no .NET telemetry, so claiming ownership of it
+#                         would advertise a service nothing reports under;
 #   otherwise the single $ServiceName (which is exactly this pool's OTEL_SERVICE_NAME).
 if ($InstrumentAllApps -and $svcMap) {
-    $iisServices = Get-IISServiceLabelValue -Map $svcMap
+    $iisServices = Get-IISServiceLabelValue -Map @($namedApps.ToArray())
 } else {
     $iisServices = $ServiceName
 }

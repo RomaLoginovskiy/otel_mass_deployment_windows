@@ -15,8 +15,20 @@
     4. Restart the collector so it re-reads OTEL_RESOURCE_ATTRIBUTES, then verify
        and write a JSON status summary.
 
+.PARAMETER Region
+  Coralogix region code: eu1, eu2, us1, us2, us3, ap1, ap2, ap3 (see
+  Resolve-CxRegion.ps1). Forwarded to Install-CoralogixSupervisor.ps1, which resolves
+  it to <region>.coralogix.com and publishes it as CORALOGIX_DOMAIN. An unknown code
+  fails the install rather than defaulting. Outranked by -Domain and by the CX_DOMAIN
+  environment variable.
+
 .PARAMETER Domain
-  Coralogix domain. Default: eu1.coralogix.com
+  Full Coralogix ingress domain, for a private / non-standard endpoint. Wins over
+  -Region. With neither given the domain falls back to CX_DOMAIN in the environment
+  (the domain-shaped equivalent, which deploy.bat forwards here), then CX_REGION, then
+  a CORALOGIX_DOMAIN exported for this run, then region.txt in this folder, then
+  whatever a previous install persisted, then eu1.coralogix.com - resolved by
+  Install-CoralogixSupervisor.ps1, which documents the order.
 
 .PARAMETER KeyFile
   File containing the Send-Your-Data key. Default: .\SendDataKey.txt
@@ -50,13 +62,22 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Domain            = 'eu1.coralogix.com',
+    # Region/domain are resolved in Install-CoralogixSupervisor.ps1 (one authority for
+    # the fallback chain), so both default to $null here and are forwarded only when set.
+    [string] $Region            = $null,
+    [string] $Domain            = $null,
     [string] $KeyFile           = $null,
     [string] $PrivateKey        = $null,
     [string] $Environment       = $null,
     [string] $Application       = $null,
     [switch] $NoSupervisor,
     [switch] $SkipInstrument,
+    # Comma-separated .NET Windows services (outside IIS) to instrument, e.g. 'cxworkersvc,billing'.
+    # Also readable from CX_DOTNET_SERVICE_NAMES so a fleet can set it per host without threading a
+    # flag through deploy.bat. Deliberately opt-in: unlike Node services, which are discovered by
+    # their command line, "every .NET service on this box" includes Windows' own services, and
+    # attaching a CLR profiler to those is not a decision a deploy script should make unprompted.
+    [string] $DotNetServices    = $null,
     [string] $InstrumentVersion = 'v1.16.0-beta.1'
 )
 
@@ -84,6 +105,9 @@ $status = [ordered]@{
     # poc/Deploy-FromHost.ps1 and existing runbooks read it; it means "the
     # collector install step completed", not "the supervisor is running".
     mode          = $(if ($NoSupervisor) { 'no-supervisor' } else { 'supervisor' })
+    # Effective Coralogix ingress domain, filled in after the collector step from what
+    # was actually persisted (see below) - not from the -Region/-Domain arguments.
+    domain        = $null
     supervisor    = $false
     iisInstrumented = $false
     pm2Instrumented = $false
@@ -134,7 +158,11 @@ try {
     # -- 2. Install the collector ----------------------------------------------
     # -NoSupervisor selects the vendor installer's regular mode. Everything else
     # about this call is identical between the two modes.
-    $supArgs = @{ Domain = $Domain; BaseConfig = (Join-Path $here 'config.supervisor.yaml') }
+    # Pass -Region/-Domain ONLY when actually given: an empty value here would look
+    # explicit to the child script and short-circuit its env/region.txt fallbacks.
+    $supArgs = @{ BaseConfig = (Join-Path $here 'config.supervisor.yaml') }
+    if ($Region) { $supArgs['Region'] = $Region }
+    if ($Domain) { $supArgs['Domain'] = $Domain }
     if ($NoSupervisor) { $supArgs['NoSupervisor'] = $true }
     if ($PrivateKey) { $supArgs['PrivateKey'] = $PrivateKey } else { $supArgs['KeyFile'] = $KeyFile }
     # Persist CX_ENVIRONMENT (machine) so the collector's resource/environment
@@ -148,6 +176,10 @@ try {
     $supArgs['Session'] = $session
     & (Join-Path $here 'Install-CoralogixSupervisor.ps1') @supArgs
     $status.supervisor = $true
+    # Read the region back off what the child persisted rather than echoing the
+    # argument: with no -Region/-Domain the effective value comes from the env or
+    # region.txt, and the status summary is what a fleet rollout is audited against.
+    $status.domain = [Environment]::GetEnvironmentVariable('CORALOGIX_DOMAIN', 'Machine')
 
     # -- 3. Conditional IIS zero-code instrumentation ---------------------------
     if ($roles.IIS -and -not $SkipInstrument) {
@@ -163,12 +195,98 @@ try {
     # -- 3b. Conditional Node.js / PM2 zero-code instrumentation ----------------
     if ($roles.PM2 -and -not $SkipInstrument) {
         Write-Host "[agent] PM2 detected -> configuring zero-code Node.js instrumentation"
+        if ($roles.PM2Hosting -eq 'service') {
+            Write-Host "[agent] PM2 is hosted as a Windows service owned by $($roles.PM2Owner) - its apps are restarted as that account"
+        }
         & (Join-Path $here 'Instrument-NodePM2.ps1') -Session $session
-        $status.pm2Instrumented = $true
+        # Read the outcome back off the shared manifest instead of assuming success. An install
+        # that could not reach the PM2 daemon must not be reported as instrumented - that claim
+        # in the status summary is how a host ends up believed-covered and silent.
+        $status.pm2Instrumented = [bool]$session.Manifest.nodeInstrumented
     } elseif ($roles.PM2) {
         Write-Host "[agent] PM2 detected but -SkipInstrument set; skipping instrumentation"
     } else {
         Write-Host "[agent] PM2 not detected; skipping Node.js zero-code instrumentation"
+    }
+
+    # -- 3c. Windows services outside IIS and outside PM2 ------------------------
+    # Node started by the SCM with no PM2, and .NET services that are not hosted by IIS. Both were
+    # out of scope until now, and both are silent on a host that reports a fully successful install:
+    # the IIS path only reaches w3wp, and the PM2 path only reaches apps a daemon manages.
+    #
+    # Node services are DISCOVERED (the instrumenter enumerates services whose command line runs
+    # node.exe, excluding PM2's own). .NET services are NOT: "every .NET service on the box"
+    # includes Windows' own, and attaching a profiler to those is not a decision a deploy script
+    # should take by itself - so they must be named explicitly via CX_DOTNET_SERVICES.
+    if (-not $SkipInstrument) {
+        $nodeSvcScript = Join-Path $here 'Instrument-NodeService.ps1'
+        if (Test-Path $nodeSvcScript) {
+            Write-Host "[agent] checking for Node.js Windows services (no PM2) ..."
+            & $nodeSvcScript
+            # Exit 1 means at least one service was refused with a reason, which is information, not
+            # a reason to fail the whole install - the reasons are already printed.
+            $status.nodeServiceInstrumented = ($LASTEXITCODE -eq 0)
+        } else {
+            # A silent skip here is how an incomplete package passes for a successful install: the
+            # transcript says nothing, the status JSON says nothing, and a fleet reports green while
+            # no Node service on any host was ever instrumented.
+            $status.nodeServiceInstrumented = $null
+            $status.nodeServiceScriptMissing = $true
+            Write-Warning "[agent] Instrument-NodeService.ps1 is missing from the payload - Node.js Windows services (services running node.exe without PM2) were NOT instrumented. Rebuild the package with Build-DeploymentPackage.ps1."
+        }
+
+        $dotnetSvcScript = Join-Path $here 'Instrument-DotNetService.ps1'
+        $dotnetSvcNames  = @()
+        foreach ($src in @($DotNetServices, $env:CX_DOTNET_SERVICE_NAMES)) {
+            if ($src) { $dotnetSvcNames += @(($src -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        }
+        $dotnetSvcNames = @($dotnetSvcNames | Sort-Object -Unique)
+        if ((Test-Path $dotnetSvcScript) -and $dotnetSvcNames.Count) {
+            Write-Host "[agent] instrumenting .NET Windows service(s): $($dotnetSvcNames -join ', ')"
+            & $dotnetSvcScript -Services $dotnetSvcNames
+            $status.dotnetServiceInstrumented = ($LASTEXITCODE -eq 0)
+        } elseif ($dotnetSvcNames.Count) {
+            Write-Warning "[agent] .NET services requested ($($dotnetSvcNames -join ', ')) but Instrument-DotNetService.ps1 is missing from the payload"
+        } else {
+            Write-Host "[agent] no .NET Windows services requested (-DotNetServices / CX_DOTNET_SERVICE_NAMES); skipping"
+        }
+    }
+
+    # -- 3d. Publish CX_SERVICES: every service this host actually claims ---------
+    # The collector stamps host-ownership labels from ONE variable, but each instrumenter only ever
+    # publishes its own slice: CX_IIS_SERVICES, CX_NODE_SERVICES, CX_DOTNET_SERVICES. Without a union
+    # a Node or .NET service shows up in APM through its own spans while the HOST entity never claims
+    # it - so Infrastructure Explorer shows no Service ownership for it and APM<->host correlation is
+    # impossible. On a Node-only host the collector's guard was false and NO labels were stamped at
+    # all. Computed here because this is the first point at which every instrumenter has run; step 4
+    # restarts the collector, which is what makes the new value take effect.
+    $svcSeen  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $svcUnion = New-Object System.Collections.Generic.List[string]
+    foreach ($varName in 'CX_IIS_SERVICES', 'CX_NODE_SERVICES', 'CX_DOTNET_SERVICES') {
+        $raw = [Environment]::GetEnvironmentVariable($varName, 'Machine')
+        if (-not $raw) { continue }
+        foreach ($n in ($raw -split ',')) {
+            $t = "$n".Trim()
+            # HashSet.Add returns false for a name another instrumenter already claimed, which is how
+            # an IIS app fronting a PM2 process is counted once rather than twice.
+            if ($t -and $svcSeen.Add($t)) { [void]$svcUnion.Add($t) }
+        }
+    }
+    if ($svcUnion.Count) {
+        $cxServices = ($svcUnion.ToArray() -join ',')
+        # Record BEFORE writing, so uninstall deletes a variable we created and restores one that was
+        # already set. Without this the manifest has nothing to reverse and the value survives the
+        # uninstall, leaving the host claiming ownership of services that are gone.
+        if ($session) {
+            try { Record-EnvChange -Session $session -Name 'CX_SERVICES' -PriorValue ([Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')) } catch {}
+        }
+        [Environment]::SetEnvironmentVariable('CX_SERVICES', $cxServices, 'Machine')
+        Write-Host "[agent] set machine CX_SERVICES=$cxServices ($($svcUnion.Count) service(s) claimed for host ownership)" -ForegroundColor Green
+    } elseif ([Environment]::GetEnvironmentVariable('CX_SERVICES', 'Machine')) {
+        # Nothing instrumented, or everything was refused. Clear the stale value instead of leaving
+        # the host advertising ownership of services it no longer runs.
+        [Environment]::SetEnvironmentVariable('CX_SERVICES', $null, 'Machine')
+        Write-Host '[agent] no instrumented services on this host; cleared stale CX_SERVICES'
     }
 
     # -- 4. Restart collector to pick up OTEL_RESOURCE_ATTRIBUTES ----------------

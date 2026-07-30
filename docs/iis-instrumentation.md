@@ -13,7 +13,7 @@ Data flow:
 
 ```mermaid
 flowchart LR
-  A["IIS .NET app (auto-instrumented)"] -->|OTLP localhost:4318| C["OTel Collector (Windows service)"]
+  A["IIS .NET app (auto-instrumented)"] -->|OTLP 127.0.0.1:4318| C["OTel Collector (Windows service)"]
   H["Host + IIS metrics, Event Log, IIS logs"] --> C
   C -->|OTLP over HTTPS| X["Coralogix"]
 ```
@@ -188,9 +188,13 @@ Register-OpenTelemetryForIIS
 > This maps to what happened on the call: import the module, install core, then register IIS. The early errors ("could not find path to OpenTelemetry") came from running the register step before the module and core files were in place.
 > 
 
-### 2. ASP.NET Core app pools need "No Managed Code"
+### 2. "No Managed Code" is for ASP.NET Core pools only
 
-For ASP.NET Core apps hosted in IIS, set the application pool's .NET CLR Version to "No Managed Code". If this is wrong, no telemetry is generated at all. .NET Framework apps do not need this. This is the practical difference behind the Framework versus Core confusion during the session.
+For ASP.NET Core apps hosted in IIS, set the application pool's .NET CLR Version to "No Managed Code". Microsoft's own wording is that this is *"optional but recommended"*: the app runs and reports either way, but a managed-CLR pool loads a desktop CLR that nothing in a Core app uses. The doctor reports the mismatch as `POOL_NOT_NO_MANAGED_CODE` (warn) and the app is still instrumented.
+
+> **Do not apply this to an ASP.NET Framework pool.** "No Managed Code" means IIS does not load the .NET Framework CLR into the worker process, so a Framework app's managed handlers cannot be created and **IIS fails every request** with 500.21. That is an outage, not a telemetry gap. Framework pools need `v4.0`. Reported as `FRAMEWORK_POOL_NO_MANAGED_CLR`.
+
+The setting is a property of the **pool**, not of the application, so it never decides on its own whether an app can be instrumented. `Instrument-IIS.ps1` classifies each application first — ASP.NET Core, ASP.NET Framework, non-.NET, or undeterminable — and only then judges the pairing. A static site, a PHP or Node app behind IIS, or a URL-Rewrite reverse proxy is skipped entirely and excluded from `CX_IIS_SERVICES`, because .NET auto-instrumentation produces nothing for it. See [agent-diagnostics.md](agent-diagnostics.md) → *"No Managed Code" does not mean unsupported* for the full matrix, the reverse-proxy distinction, and the `-RuntimeOverrides` escape hatch.
 
 ### 3. Point the apps at the collector and set a service name
 
@@ -253,7 +257,15 @@ There are three places to set these, in increasing order of scope.
 </configuration>
 ```
 
-**Per app, ASP.NET Framework.** Use `appSettings` in that app's `Web.config`, for example `<add key="OTEL_SERVICE_NAME" value="wallet-api" />`. If you do not set a service name, one is generated as `SiteName\VirtualDirectoryPath`, which is why some services showed up automatically during the session but were not named the way you want.
+**Per app, ASP.NET Framework — only on a dedicated pool.** Use `appSettings` in that app's `Web.config`, for example `<add key="OTEL_SERVICE_NAME" value="wallet-api" />`. Any `OTEL_*` setting works this way, and environment variables take precedence over it.
+
+⚠️ **This does not give you per-app names on a shared pool.** From the upstream configuration reference:
+
+> On .NET Framework, `OTEL_*` values from `Web.config` or `App.config` are promoted to process-level environment variables at startup, and the OTel SDK is initialized only once per process. In IIS, where multiple applications can share a single worker process (Application Pool), this means the first application to start determines the configuration for all applications in that pool.
+
+So on a shared pool the winner is a startup race, not the app you edited. The only reliable per-app naming for Framework is **one app pool per app** (then the pool environment variable carries the name and the automation below handles it, since scope selection is runtime-agnostic). This is tracked as a known gap in [`iis-e2e-matrix.md`](./iis-e2e-matrix.md) ("ASP.NET Framework app on a *shared* pool cannot be named").
+
+If you do not set a service name at all, one is auto-detected as `SiteName\VirtualDirectoryPath` — which is why some services showed up automatically during the session but were not named the way you want. Note the consequence: an unnamed Framework app **still reports**, so it is absent from `CX_IIS_SERVICES` while present in APM.
 
 **For all apps at once (host-wide).** Set the variables on the `W3SVC` and `WAS` Windows services in the registry. `Register-OpenTelemetryForIIS` already writes the profiler variables here, so you append the OTLP settings to the same multi-string value.
 
@@ -273,7 +285,7 @@ There is also a per app pool option: `Enable-OpenTelemetryForIISAppPool -AppPool
 - **Scope (dedicated pool vs shared pool).** An application that owns its app pool gets the name set on the pool — and the OTLP endpoint/protocol are re-set on that pool too, because a pool that declares its own `<environmentVariables>` stops inheriting `applicationPoolDefaults` (see Part 4). Applications that **share** a pool instead get the name written into each one's own `web.config`, since a single pool-level variable cannot distinguish co-hosted apps. Note: ASP.NET Core **in-process** hosting allows only one app per pool (a second in-process app in the same pool returns HTTP 500), so pool-sharing in practice means **out-of-process** or ASP.NET **Framework** apps — in-process apps each land on their own pool and take the pool-scoped path anyway.
 - **Overrides.** Rename specific apps with `-ServiceNameOverrides @{ 'Wallet/api' = 'wallet-api' }` or `-OverridesJson <file>` (keys are the auto-derived names).
 
-Classic ASP.NET **Framework** apps have no `<aspNetCore>` element, so the web.config writer skips them with a warning — set their name via `appSettings` as shown above. Because no app's name is stamped host-wide, host/infrastructure signals (hostmetrics, IIS receiver, event logs, access logs) no longer collapse under one app; they fall back to the collector's neutral `subsystem_name`.
+Classic ASP.NET **Framework** apps have no `<aspNetCore>` element, so the web.config writer skips them with a warning. `appSettings` is **not** a workaround here: the writer is only reached for pool-*sharing* apps, and on a shared pool `appSettings` is promoted process-wide and first-app-wins (see above). Give such an app its own pool to bring it under management. Until then it reports under the auto-detected `Site\AppPath` and is excluded from `CX_IIS_SERVICES` — the host under-claims rather than claiming a name it did not set. Because no app's name is stamped host-wide, host/infrastructure signals (hostmetrics, IIS receiver, event logs, access logs) no longer collapse under one app; they fall back to the collector's neutral `subsystem_name`.
 
 ### 4. Restart IIS or the pools
 
@@ -454,7 +466,11 @@ zero counters means the problem is upstream of the connector, not in it. This is
 
 **"Could not find path to OpenTelemetry" or the module is not found.** The register or install step ran before the module was imported or the core files were installed. Run the steps in order: download, `Import-Module`, `Install-OpenTelemetryCore`, then `Register-OpenTelemetryForIIS`.
 
-**No telemetry from an ASP.NET Core app.** The app pool is probably not set to "No Managed Code". Fix the pool and recycle it. Reported per app as `POOL_NOT_NO_MANAGED_CODE`, naming the pool. If that passes and there is still nothing, look for `PROFILER_NOT_REGISTERED` (the register step never ran on this host), `PROFILER_PATH_MISSING` (the profiler DLL the registry points at was deleted — IIS starts and emits nothing), and `OTLP_ENDPOINT_LOCALHOST`.
+**No telemetry from an ASP.NET Core app.** Look for `PROFILER_NOT_REGISTERED` (the register step never ran on this host), `PROFILER_PATH_MISSING` (the profiler DLL the registry points at was deleted — IIS starts and emits nothing), and `OTLP_ENDPOINT_LOCALHOST` first: those are the ones that produce silence. `POOL_NOT_NO_MANAGED_CODE` is worth fixing but is **not** the cause of total silence — the app reports from a managed-CLR pool too.
+
+**An app is reported as `NON_DOTNET_APP_NOT_INSTRUMENTED` and you expected telemetry.** The classifier found neither `<aspNetCore>` nor classic ASP.NET configuration for it. Usual causes: the publish output is incomplete (no `web.config`, so IIS is not routing to ANCM either and the app is not serving), the site really is static or a reverse proxy, or the app is a child of a parent whose `<location inheritInChildApplications="false">` stops `<aspNetCore>` flowing down. If the detection is genuinely wrong, force it with `-RuntimeOverrides` — and pass the same override to the doctor.
+
+**An ASP.NET Framework app returns 500.21 after a "fix".** Its pool was set to "No Managed Code". That is correct for ASP.NET Core and breaks Framework apps outright. Set the pool back to `v4.0`.
 
 **Endpoint fixed centrally but the pools still export nowhere.** A pool with its own `<environmentVariables>` block **replaces** `applicationPoolDefaults` rather than merging with it, and IIS copies the defaults into that block the first time `appcmd` writes any variable to the pool. That copy never refreshes, so later edits to the defaults never reach an already-instrumented pool. Reported as `POOL_ENV_STALE`; fix by re-running `Instrument-IIS.ps1` and recycling the pool. (See Part 4, "Where the variables can live, and what wins".)
 

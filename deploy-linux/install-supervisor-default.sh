@@ -14,10 +14,17 @@
 #   app.type  ← APP_TYPE  (default: databases)
 #   env.type  ← ENV_TYPE  (default: databases)
 #
+# Region:
+#   CORALOGIX_REGION="eu2"  (or --region eu2) -> domain eu2.coralogix.com
+#   Region codes: us1 us2 us3 eu1 eu2 ap1 ap2 ap3. CORALOGIX_DOMAIN stays available for
+#   a private / legacy ingress domain and WINS over the region when both are given.
+#   The region must match the account the private key belongs to - a mismatched pair
+#   authenticates nowhere while the supervisor still reports active.
+#
 # Usage (pass credentials explicitly; use sudo env so vars are not dropped):
 #   sudo env \
 #     CORALOGIX_PRIVATE_KEY="<key>" \
-#     CORALOGIX_DOMAIN="app.coralogix.in" \
+#     CORALOGIX_REGION="ap1" \
 #     APP_TYPE="postgresql" ENV_TYPE="prod" \
 #     POSTGRES_OTEL_PASSWORD="<password>" \
 #     POSTGRES_OTEL_USER="otel_monitor" \
@@ -36,7 +43,35 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 : "${CORALOGIX_PRIVATE_KEY:?Set CORALOGIX_PRIVATE_KEY}"
-: "${CORALOGIX_DOMAIN:?Set CORALOGIX_DOMAIN (e.g. app.coralogix.in)}"
+
+# -----------------------------------------------------------------------------
+# Region -> domain
+# -----------------------------------------------------------------------------
+# Operators think in region codes; the collector and the OpAMP endpoint want the
+# domain, which is always <region>.coralogix.com. An unrecognised code is fatal: it
+# would otherwise become a domain that resolves nowhere (or worse, someone else's
+# account) while every service here still reports healthy.
+CX_REGIONS="us1 us2 us3 eu1 eu2 ap1 ap2 ap3"
+CORALOGIX_REGION="${CORALOGIX_REGION:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --region)   CORALOGIX_REGION="${2:?--region needs a value, e.g. --region eu2}"; shift 2 ;;
+    --region=*) CORALOGIX_REGION="${1#*=}"; shift ;;
+    *) break ;;
+  esac
+done
+
+if [[ -n "${CORALOGIX_DOMAIN:-}" && -n "${CORALOGIX_REGION}" ]]; then
+  echo "WARN: both CORALOGIX_DOMAIN and a region given; using domain ${CORALOGIX_DOMAIN}" >&2
+elif [[ -n "${CORALOGIX_REGION}" ]]; then
+  cx_region="$(printf '%s' "${CORALOGIX_REGION}" | tr '[:upper:]' '[:lower:]')"
+  case " ${CX_REGIONS} " in
+    *" ${cx_region} "*) CORALOGIX_DOMAIN="${cx_region}.coralogix.com" ;;
+    *) echo "ERROR: unknown Coralogix region '${CORALOGIX_REGION}'. Supported: ${CX_REGIONS}. Use CORALOGIX_DOMAIN=<domain> for a private ingress domain." >&2
+       exit 1 ;;
+  esac
+fi
+: "${CORALOGIX_DOMAIN:?Set CORALOGIX_REGION (${CX_REGIONS}) or CORALOGIX_DOMAIN (e.g. app.coralogix.in)}"
 : "${POSTGRES_OTEL_PASSWORD:?Set POSTGRES_OTEL_PASSWORD (required for postgresql receiver in remote config)}"
 
 # Fleet Management selection attributes
@@ -98,6 +133,7 @@ if grep -q "${CRED_MARKER_BEGIN}" "${SUPERVISOR_ENV}" 2>/dev/null; then
   mv "${SUPERVISOR_ENV}.tmp" "${SUPERVISOR_ENV}"
 fi
 sed -i \
+  -e '/^CORALOGIX_DOMAIN=/d' \
   -e '/^APP_TYPE=/d' \
   -e '/^ENV_TYPE=/d' \
   -e '/^REDIS_ENDPOINT=/d' \
@@ -114,6 +150,9 @@ sed -i \
 {
   echo ""
   echo "${CRED_MARKER_BEGIN}"
+  # The remote config's exporters read ${env:CORALOGIX_DOMAIN}, so the region has to
+  # survive here too - not only in the installer's own process environment.
+  echo "CORALOGIX_DOMAIN=${CORALOGIX_DOMAIN}"
   echo "APP_TYPE=${APP_TYPE}"
   echo "ENV_TYPE=${ENV_TYPE}"
   echo "REDIS_ENDPOINT=${REDIS_ENDPOINT}"
@@ -145,9 +184,19 @@ def upsert_attr(text: str, key: str, value: str) -> str:
     attr_re = re.compile(rf'(?m)^(\s*)(?:{re.escape(key)}|"{re.escape(key)}"):\s*.*$')
     m = re.search(r'(?m)^(\s*)non_identifying_attributes:\s*$', text)
     indent = (m.group(1) + "  ") if m else "      "
-    new_line = f'{indent}{key}: "{value}"'
+    # Single-quoted with every backslash DOUBLED. The supervisor re-serializes description
+    # values into the merged config without escaping them and parses that text again, so one
+    # level of backslash escaping is consumed per pass: a value that survives the first parse
+    # as a single backslash either kills the service ("yaml: found unknown escape character")
+    # or is silently corrupted when the trailing character happens to be a valid escape.
+    # Measured on Windows, where the values are paths - but the writer is shared, and an
+    # APP_TYPE or ENV_TYPE carrying a backslash would hit exactly the same parser.
+    new_line = "{}{}: '{}'".format(indent, key, value.replace("\\", "\\\\").replace("'", "''"))
     if attr_re.search(text):
-        return attr_re.sub(new_line, text, count=1)
+        # lambda, not the string: re.sub() reads a string replacement as a TEMPLATE, so a value
+        # containing '\' raises re.PatternError ("bad escape \\P"). A callable's return value
+        # is used verbatim.
+        return attr_re.sub(lambda _: new_line, text, count=1)
     if m:
         return re.sub(
             r'(?m)^(\s*)non_identifying_attributes:\s*$',
@@ -161,6 +210,8 @@ def upsert_attr(text: str, key: str, value: str) -> str:
 
 # Env vars that must reach the collector when Fleet pushes config.yaml-style receivers
 PASS_THROUGH = [
+    # Region: the pushed config's coralogix exporters use ${env:CORALOGIX_DOMAIN}
+    "CORALOGIX_DOMAIN",
     "APP_TYPE",
     "ENV_TYPE",
     "REDIS_ENDPOINT",

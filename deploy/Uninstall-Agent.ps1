@@ -94,6 +94,7 @@ $status = [ordered]@{
     nodeDeinstrumented = $false
     servicesRemoved   = @()
     envVarsCleared    = @()
+    serviceEnvCleared = @()
     restored          = $false
     purged            = $false
     result            = 'unknown'
@@ -226,7 +227,12 @@ try {
                 Remove-PoolEnvEntry -Pool $p -Name 'OTEL_EXPORTER_OTLP_PROTOCOL'
             }
             try {
-                $svcMap = Get-IISServiceMap
+                # -SkipRuntimeClassification on purpose. Uninstall must clean up names written
+                # by ANY prior version of the installer, including ones it would no longer
+                # write today (before runtime classification, every dedicated-pool app was
+                # named - static sites included). Filtering here would strand exactly those.
+                # Removal is already ownership-checked by value, so being broad is safe.
+                $svcMap = Get-IISServiceMap -SkipRuntimeClassification
                 foreach ($r in @($svcMap)) {
                     if ($r.Scope -eq 'webconfig' -and $r.PhysicalPath) {
                         Remove-WebConfigServiceName -PhysicalPath $r.PhysicalPath | Out-Null
@@ -267,8 +273,21 @@ try {
 
     # -- 1b. Node.js / PM2 de-instrumentation ----------------------------------
     # Clear NODE_OPTIONS/OTEL_* off each PM2 app so its workers restart uninstrumented.
-    # Guard: manifest flag when available, else best-effort if pm2 is on PATH.
-    $nodeWasInstrumented = if ($manifest) { [bool]$manifest.nodeInstrumented } else { [bool](Get-Command pm2 -ErrorAction SilentlyContinue) }
+    # Guard: manifest flag when available, else best-effort.
+    #
+    # The best-effort probe deliberately does NOT rest on `Get-Command pm2`: where PM2 is hosted
+    # as a Windows service the CLI lives in C:\ProgramData\npm and is routinely off the PATH of
+    # the account running uninstall, so that test answers "no PM2 here" on precisely the hosts
+    # that have the most of it. Ask the topology instead, and fall back to the PATH check only if
+    # the helper is missing from this deploy directory.
+    $nodeWasInstrumented = $false
+    if ($manifest) {
+        $nodeWasInstrumented = [bool]$manifest.nodeInstrumented
+    } elseif (Get-Command Get-CxPm2Topology -ErrorAction SilentlyContinue) {
+        try { $nodeWasInstrumented = ((Get-CxPm2Topology).Hosting -ne 'none') } catch { }
+    } else {
+        $nodeWasInstrumented = [bool](Get-Command pm2 -ErrorAction SilentlyContinue)
+    }
     if ($nodeWasInstrumented -and (Get-Command Remove-NodeInstrumentation -ErrorAction SilentlyContinue)) {
         try {
             Write-Host "[uninstall] reverting Node.js/PM2 instrumentation ..."
@@ -295,7 +314,7 @@ try {
     }
 
     # -- 3. Machine env vars ----------------------------------------------------
-    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES')
+    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES','CX_DOTNET_SERVICES','CX_SERVICES')
     if ($manifest -and $manifest.envVars) {
         foreach ($e in @($manifest.envVars)) {
             if (-not $e) { continue }
@@ -307,6 +326,21 @@ try {
                 Write-Host "[uninstall] restored machine env $($e.name) to prior value"
             }
             $status.envVarsCleared += $e.name
+        }
+        # Not every variable reaches the manifest: CX_SERVICES is written by Install-Agent.ps1 without a
+        # -Session, and Instrument-DotNetService.ps1 has no Session parameter at all, so the manifest has
+        # nothing to reverse for them. Worse, CX_DOTNET_SERVICES is written as a UNION with its previous
+        # value, so a name left behind here outlives the uninstall and keeps accumulating across every
+        # later reinstall - the host permanently claims ownership of software that is gone. Sweep
+        # whatever the manifest did not cover.
+        $covered = @(@($manifest.envVars) | Where-Object { $_ } | ForEach-Object { $_.name })
+        foreach ($n in $envNames) {
+            if ($covered -contains $n) { continue }
+            if ([Environment]::GetEnvironmentVariable($n, 'Machine')) {
+                [Environment]::SetEnvironmentVariable($n, $null, 'Machine')
+                Write-Host "[uninstall] deleted machine env $n (not recorded in the manifest)"
+                $status.envVarsCleared += $n
+            }
         }
     } else {
         foreach ($n in $envNames) {
@@ -328,6 +362,66 @@ try {
             (Join-Path ${env:ProgramFiles} 'OpenTelemetry Collector'),
             (Join-Path ${env:ProgramFiles} 'OpenTelemetry .NET AutoInstrumentation')
         )
+        # BEFORE deleting anything: clear the per-service environment entries that POINT INTO these
+        # directories. Instrument-DotNetService.ps1 and Instrument-NodeService.ps1 write CORECLR_* /
+        # DOTNET_STARTUP_HOOKS / NODE_OPTIONS into the service's own Environment REG_MULTI_SZ under
+        # HKLM\SYSTEM\CurrentControlSet\Services\<name>, and Unregister-OpenTelemetryForIIS only ever
+        # covers W3SVC and WAS. Leaving them behind is not a telemetry problem: a missing profiler DLL
+        # merely stops instrumentation, but a DOTNET_STARTUP_HOOKS pointing at a deleted assembly is
+        # fatal at CLR bootstrap, so the service stops STARTING - a purge would brick every .NET service
+        # this agent had instrumented.
+        #
+        # Ownership-checked: entries are removed only when a path-bearing value resolves under a
+        # directory this purge is about to delete. A service instrumented by something else keeps its
+        # own configuration.
+        $ourSvcNames = @('CORECLR_ENABLE_PROFILING','CORECLR_PROFILER','CORECLR_PROFILER_PATH',
+                         'COR_ENABLE_PROFILING','COR_PROFILER','COR_PROFILER_PATH',
+                         'OTEL_DOTNET_AUTO_HOME','DOTNET_ADDITIONAL_DEPS','DOTNET_SHARED_STORE',
+                         'DOTNET_STARTUP_HOOKS','OTEL_DOTNET_AUTO_PLUGINS','NODE_OPTIONS',
+                         'OTEL_EXPORTER_OTLP_ENDPOINT','OTEL_EXPORTER_OTLP_PROTOCOL','OTEL_SERVICE_NAME')
+        $ownedRoots = @(@($dirs) + @('C:\cx')) | Where-Object { $_ }
+        foreach ($svcKey in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction SilentlyContinue)) {
+            $lines = $null
+            try { $lines = @((Get-ItemProperty -LiteralPath $svcKey.PSPath -Name 'Environment' -ErrorAction Stop).Environment) } catch { continue }
+            if (-not $lines -or -not $lines.Count) { continue }
+
+            $isOurs = $false
+            foreach ($line in $lines) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $eq = $line.IndexOf('=')
+                if ($eq -lt 1) { continue }
+                if ($ourSvcNames -notcontains $line.Substring(0, $eq)) { continue }
+                $val = $line.Substring($eq + 1)
+                foreach ($root in $ownedRoots) {
+                    if ($val -and $val.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $isOurs = $true; break }
+                }
+                if ($isOurs) { break }
+            }
+            if (-not $isOurs) { continue }
+
+            # Written as a unit, so removed as a unit - a half-cleared set is what leaves a service
+            # with a profiler enabled and no DLL to load.
+            $keep = @()
+            foreach ($line in $lines) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $eq = $line.IndexOf('=')
+                if ($eq -lt 1) { $keep += $line; continue }
+                if ($ourSvcNames -notcontains $line.Substring(0, $eq)) { $keep += $line }
+            }
+            $svcName = Split-Path -Leaf $svcKey.Name
+            try {
+                if ($keep.Count) {
+                    Set-ItemProperty -LiteralPath $svcKey.PSPath -Name 'Environment' -Value ([string[]]$keep) -Type MultiString -ErrorAction Stop
+                } else {
+                    Remove-ItemProperty -LiteralPath $svcKey.PSPath -Name 'Environment' -ErrorAction Stop
+                }
+                Write-Host "[uninstall] cleared OTel environment entries from service '$svcName' ($($lines.Count - $keep.Count) removed, $($keep.Count) kept)"
+                $status.serviceEnvCleared += $svcName
+            } catch {
+                Write-Warning "[uninstall] could not clear OTel environment entries from service '$svcName' - it may fail to start once the purge deletes the profiler: $_"
+            }
+        }
+
         foreach ($d in $dirs) {
             if (Test-Path $d) {
                 try { Remove-Item -LiteralPath $d -Recurse -Force; Write-Host "[uninstall] removed $d" }

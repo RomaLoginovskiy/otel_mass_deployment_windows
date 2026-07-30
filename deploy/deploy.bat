@@ -9,6 +9,13 @@ REM  version the .NET auto-instrumentation module requires) with the execution
 REM  policy bypassed for this process only, and propagates the exit code so
 REM  BatchPatch marks the row failed on any error.
 REM
+REM  Run by hand instead of through BatchPatch? Every Install-Agent.ps1 flag can be
+REM  passed straight through:
+REM      deploy.bat -Domain eu2.coralogix.com -KeyFile C:\secrets\SendDataKey.txt
+REM      deploy.bat -Region eu2 -Environment staging
+REM  Arguments and the environment variables below are EXCLUSIVE: typing any argument
+REM  skips the env-var block entirely (see the note above the block for why).
+REM
 REM  Optional: set the key and/or the deployment environment out-of-band before
 REM  running instead of shipping SendDataKey.txt, e.g. in the BatchPatch remote
 REM  command:
@@ -16,8 +23,30 @@ REM      set CX_ENVIRONMENT=staging && set CORALOGIX_PRIVATE_KEY=cxtp_xxx && dep
 REM  CX_ENVIRONMENT labels this host's telemetry (production/staging/dev/...) so
 REM  Coralogix can split it by environment in Infra Explorer.
 REM
+REM      set CX_REGION=eu2 && deploy.bat          ship to the eu2 account
+REM  Coralogix region code (eu1/eu2/us1/us2/us3/ap1/ap2/ap3). It becomes the collector's
+REM  ingress domain <region>.coralogix.com AND the OpAMP endpoint, so it must match the
+REM  account the Send-Your-Data key belongs to - a key from another region authenticates
+REM  nowhere and the host reports healthy while sending nothing. An unknown code fails
+REM  the install. For a private or non-standard ingress domain use CX_DOMAIN instead:
+REM      set CX_DOMAIN=my-ingress.example.com && deploy.bat
+REM  CX_DOMAIN is the full ingress domain, taken verbatim (a scheme and trailing slash are
+REM  stripped), and it is NOT checked against the published region list - so it also wins
+REM  over CX_REGION when both are set. With neither set the region is taken from region.txt
+REM  in this folder (baked in by Build-DeploymentPackage.ps1 -Region), then from whatever a
+REM  previous install persisted, and finally eu1.
+REM
 REM      set CX_NO_SUPERVISOR=1 && deploy.bat     collector without the OpAMP Supervisor
 REM      set CX_SKIP_INSTRUMENT=1 && deploy.bat   collector only, leave IIS/Node alone
+REM
+REM      set CX_RUNTIME_OVERRIDES_JSON=C:\path\runtimes.json && deploy.bat
+REM  Force the runtime of IIS apps the installer cannot classify, e.g.
+REM      { "Wallet/api": "AspNetCore", "Legacy/": "AspNetFramework", "Static/": "NonDotNet" }
+REM  Keyed by "<Site><virtual path>" with root apps ending in '/' - the same string the
+REM  doctor prints in its Target column. Not added to ARGS below on purpose: the scripts
+REM  read this variable directly (like CX_OTEL_DOTNET_ARCHIVE), so the SAME file is picked
+REM  up by the install AND by doctor.bat. If only one of them saw it they would disagree
+REM  about which apps belong in CX_IIS_SERVICES and report drift forever.
 REM ===========================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
@@ -49,13 +78,47 @@ REM                       installer (-Config instead of -Supervisor
 REM                       -SupervisorCollectorBaseConfig). Instrumentation and the
 REM                       diagnostics are identical in both modes.
 REM   CX_SKIP_INSTRUMENT=1  install the collector but do NOT touch IIS / Node.
+REM   CX_REGION           which Coralogix account region receives the data.
+REM   CX_DOMAIN           full ingress domain for a private / non-standard endpoint;
+REM                       forwarded as -Domain, which outranks -Region.
+REM
+REM CORALOGIX_DOMAIN is deliberately NOT forwarded as -Domain. A previous install
+REM persisted it at machine scope, so this cmd.exe inherits it and cannot tell a value
+REM someone just exported from that leftover - passing it as an explicit flag would make
+REM the leftover outrank a baked-in region.txt forever. Install-CoralogixSupervisor.ps1
+REM reads the variable directly instead and compares it with the machine value to tell
+REM the two apart (same "read it, do not flag it" pattern as CX_RUNTIME_OVERRIDES_JSON).
+REM CX_DOMAIN is the flagged form that exists precisely because CORALOGIX_DOMAIN cannot be
+REM one: nothing we install ever persists CX_DOMAIN machine-wide, so its presence is
+REM unambiguously a decision made for THIS run and needs no leftover comparison.
+REM
+REM Two ways in, and they are mutually exclusive by design (same shape as doctor.bat):
+REM
+REM   deploy.bat -Domain eu2.coralogix.com -KeyFile C:\k.txt
+REM                                     command-line args win; env vars ignored
+REM   set CX_DOMAIN=eu2.coralogix.com && deploy.bat
+REM                                     for BatchPatch, which generally cannot pass
+REM                                     arguments to a remote command
+REM
+REM They must NOT be combined into one invocation. Passing -Domain twice is not "last
+REM one wins" - PowerShell fails parameter binding outright ("parameter 'Domain' is
+REM specified more than once"), the script never runs, and BatchPatch shows a red row
+REM with no diagnostics at all. So if any argument was typed, the env-var block is
+REM skipped entirely. Note the arguments go to Install-Agent.ps1, which accepts -Region
+REM and -Domain but ALSO -KeyFile / -Application / -InstrumentVersion that no env var
+REM below exposes; run `powershell -File Install-Agent.ps1 -?` for the full set.
 set ARGS=
+if not "%~1"=="" goto :runargs
+
 if defined CORALOGIX_PRIVATE_KEY set ARGS=%ARGS% -PrivateKey "%CORALOGIX_PRIVATE_KEY%"
+if defined CX_REGION set ARGS=%ARGS% -Region "%CX_REGION%"
+if defined CX_DOMAIN set ARGS=%ARGS% -Domain "%CX_DOMAIN%"
 if defined CX_ENVIRONMENT set ARGS=%ARGS% -Environment "%CX_ENVIRONMENT%"
 if defined CX_NO_SUPERVISOR set ARGS=%ARGS% -NoSupervisor
 if defined CX_SKIP_INSTRUMENT set ARGS=%ARGS% -SkipInstrument
 
-"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1"%ARGS%
+:runargs
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1"%ARGS% %*
 
 set "RC=%ERRORLEVEL%"
 echo deploy.bat exit code: %RC%

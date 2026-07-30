@@ -19,6 +19,11 @@
     workload.nodejs.version=<v>    when Node.js present
     workload.dotnet.version=<v>    when .NET present
     workload.pm2.apps=<count>      when PM2 is managing >=1 Node app
+    workload.pm2.hosting=<how>     'service' (Windows service, e.g. pm2-installer /
+                                   node-windows) or 'user' (per-user daemon)
+    workload.pm2.owner=<account>   the account that owns the PM2 daemon - the only identity
+                                   that can restart its apps
+    workload.pm2.home=<path>       PM2_HOME the running daemon uses
 
   These land on the OpAMP AgentDescription (the Supervisor reports the collector's
   resource attributes; resourcedetection/env in the base config promotes
@@ -58,9 +63,17 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
+$script:CxDetectHere = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+
 # Optional backup/manifest recording (shared session from the orchestrator).
 $backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
 if (Test-Path $backupHelper) { . $backupHelper }
+
+# PM2 topology + app-list probes (Get-CxPm2Topology / Get-PM2ProcessList). Optional on purpose:
+# this file has to stay usable in a hand-assembled deploy directory, so a missing helper degrades
+# Get-PM2Info to its original PATH-only probe rather than breaking detection outright.
+$nodeHelper = Join-Path $script:CxDetectHere 'Resolve-NodeServiceNames.ps1'
+if (Test-Path $nodeHelper) { . $nodeHelper }
 
 # ---------------------------------------------------------------------------
 # Signal helpers (all safe / non-throwing)
@@ -178,38 +191,82 @@ function Get-NodeInfo {
 }
 
 function Get-PM2Info {
-    # Detect the PM2 Node process manager and the apps it currently manages.
-    # PM2 runs a background "God daemon" (itself a node process); managed apps are
-    # listed via `pm2 jlist`, which prints a JSON array. Each element carries
-    # .name, .pid and .pm2_env.exec_mode ('fork_mode' | 'cluster_mode').
-    #   present : pm2 CLI on PATH, or a PM2 home dir exists (daemon may be stopped)
+    # Detect the PM2 Node process manager, HOW IT IS HOSTED, and the apps it manages.
+    #
+    # PM2 is usually described as per-user - its daemon belongs to whoever started it - and this
+    # probe used to assume exactly that: pm2 on the caller's PATH, else a ~\.pm2 directory. On a
+    # host where PM2 was installed AS A WINDOWS SERVICE (the pm2-installer / node-windows layout:
+    # PM2_HOME=C:\ProgramData\pm2, daemon owned by NT AUTHORITY\LOCAL SERVICE) neither signal
+    # fires for the deploying account. PM2 read as absent, Install-Agent's
+    # `if ($roles.PM2 -and -not $SkipInstrument)` gate never fired, and a production host running
+    # 26 PM2 apps produced no Node telemetry at all - with nothing in the output saying why.
+    #
+    # So the primary probe is now the machine-wide topology (Win32_Process command lines,
+    # Win32_Service.StartName, dump.pm2 on disk) from Resolve-NodeServiceNames.ps1, which sees
+    # that layout regardless of who is running this script. The PATH/home checks are kept as
+    # additional signals: pm2 installed but never started leaves no daemon and no home directory.
+    #
+    #   present : PM2 is present on this host in any form
     #   apps    : distinct managed app names (the future OTEL_SERVICE_NAME per app)
     #   modes   : distinct exec modes seen (informational)
-    $info = [ordered]@{ present = $false; apps = @(); modes = @() }
+    #   hosting : 'service' | 'user' | 'none' - how the daemon is hosted
+    #   owner   : account that owns the daemon (the identity that can restart the apps)
+    #   home    : PM2_HOME the running daemon uses
+    #   source  : where `apps` came from - 'jlist' (live daemon) | 'dump' | 'logs'
+    $info = [ordered]@{
+        present = $false; apps = @(); modes = @()
+        hosting = 'none';  owner = $null; home = $null; source = $null
+    }
+
+    if (Get-Command Get-CxPm2Topology -ErrorAction SilentlyContinue) {
+        $topo = $null
+        try { $topo = Get-CxPm2Topology } catch { }
+        if ($topo) {
+            $info.hosting = [string]$topo.Hosting
+            $info.owner   = $topo.Owner
+            $info.home    = $topo.Home
+            if ($topo.Hosting -ne 'none' -or $topo.Home) { $info.present = $true }
+            try {
+                $list = @(Get-PM2ProcessList -Pm2Home $topo.Home)
+                if ($list.Count -gt 0) {
+                    $info.present = $true
+                    $info.apps    = @($list | ForEach-Object { $_.Name }     | Where-Object { $_ } | Select-Object -Unique)
+                    $info.modes   = @($list | ForEach-Object { $_.ExecMode } | Where-Object { $_ } | Select-Object -Unique)
+                    $info.source  = [string](@($list)[0].Source)
+                }
+            } catch { }
+        }
+    }
+
     $cmd = Get-Command pm2 -ErrorAction SilentlyContinue
-    if (-not $cmd) {
+    if ($cmd) { $info.present = $true }
+    if (-not $info.present) {
         # No pm2 on PATH: last-resort check for a PM2 home dir (installed, daemon down).
         if (Test-PathAny @("$env:USERPROFILE\.pm2", $env:PM2_HOME)) { $info.present = $true }
-        return $info
     }
-    $info.present = $true
+
+    # Original per-caller enumeration, still the right answer when the topology helper is not in
+    # this deploy directory or when the caller does own the daemon and it is simply idle.
     # NOTE: `pm2 jlist` JSON has duplicate keys; Windows PowerShell 5.1 ConvertFrom-Json throws
     # DuplicateKeysInJsonString on it. Parse tolerantly by splitting into per-process chunks
     # (each top-level object starts with `{"pid":`) and pulling name/exec_mode by regex.
-    try {
-        $raw = (& pm2 jlist 2>$null | Out-String).Trim()
-        if ($raw -and $raw.StartsWith('[')) {
-            $names = New-Object System.Collections.Generic.List[string]
-            $modes = New-Object System.Collections.Generic.List[string]
-            foreach ($chunk in ($raw -split '\{"pid":')) {
-                if ($chunk -notmatch '"name":"') { continue }
-                if ($chunk -match '"name":"([^"]+)"')      { $names.Add($matches[1]) }
-                if ($chunk -match '"exec_mode":"([^"]+)"') { $modes.Add($matches[1]) }
+    if ($cmd -and @($info.apps).Count -eq 0) {
+        try {
+            $raw = (& pm2 jlist 2>$null | Out-String).Trim()
+            if ($raw -and $raw.StartsWith('[')) {
+                $names = New-Object System.Collections.Generic.List[string]
+                $modes = New-Object System.Collections.Generic.List[string]
+                foreach ($chunk in ($raw -split '\{"pid":')) {
+                    if ($chunk -notmatch '"name":"') { continue }
+                    if ($chunk -match '"name":"([^"]+)"')      { $names.Add($matches[1]) }
+                    if ($chunk -match '"exec_mode":"([^"]+)"') { $modes.Add($matches[1]) }
+                }
+                $info.apps  = @($names | Where-Object { $_ } | Select-Object -Unique)
+                $info.modes = @($modes | Where-Object { $_ } | Select-Object -Unique)
+                if (@($info.apps).Count -gt 0 -and -not $info.source) { $info.source = 'jlist' }
             }
-            $info.apps  = @($names | Where-Object { $_ } | Select-Object -Unique)
-            $info.modes = @($modes | Where-Object { $_ } | Select-Object -Unique)
-        }
-    } catch {}
+        } catch {}
+    }
     return $info
 }
 
@@ -291,6 +348,10 @@ $roles = [ordered]@{
     NodeJsVersion = $node.version
     PM2           = [bool]$pm2.present
     PM2Apps       = @($pm2.apps)
+    PM2Hosting    = [string]$pm2.hosting
+    PM2Owner      = $pm2.owner
+    PM2Home       = $pm2.home
+    PM2AppSource  = $pm2.source
     RabbitMQ      = [bool](Get-RabbitPresent)
     Redis         = [bool](Get-RedisPresent)
     Valkey        = [bool](Get-ValkeyPresent)
@@ -348,6 +409,15 @@ foreach ($k in $workloadKeys.Keys) {
 if ($roles.NodeJs -and $roles.NodeJsVersion) { $attrMap['workload.nodejs.version'] = $roles.NodeJsVersion }
 if ($roles.DotNet -and $roles.DotNetVersion) { $attrMap['workload.dotnet.version'] = $roles.DotNetVersion }
 if ($roles.PM2 -and @($roles.PM2Apps).Count -gt 0) { $attrMap['workload.pm2.apps'] = @($roles.PM2Apps).Count }
+# How PM2 is hosted travels with the host, because it decides whether the instrumentation can be
+# applied by a plain BatchPatch run at all: hosting=service means the apps only answer to their
+# service account. A Fleet group can select on it, and the absence of these keys on a host that
+# does run PM2 is itself the signal that this detection is stale.
+if ($roles.PM2 -and $roles.PM2Hosting -and $roles.PM2Hosting -ne 'none') { $attrMap['workload.pm2.hosting'] = $roles.PM2Hosting }
+# Values must not contain ',' or '=' (see the note below). An account name or a path cannot,
+# but guard rather than trust, since a bad value silently truncates the whole attribute string.
+if ($roles.PM2 -and $roles.PM2Owner -and $roles.PM2Owner -notmatch '[,=]') { $attrMap['workload.pm2.owner'] = $roles.PM2Owner }
+if ($roles.PM2 -and $roles.PM2Home  -and $roles.PM2Home  -notmatch '[,=]') { $attrMap['workload.pm2.home']  = $roles.PM2Home }
 
 foreach ($k in $ExtraAttributes.Keys) { $attrMap[$k] = $ExtraAttributes[$k] }
 
@@ -371,6 +441,8 @@ try {
         workloads = ($workloadKeys.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { $_.Key -replace '^workload\.','' })
         versions  = @{ nodejs = $roles.NodeJsVersion; dotnet = $roles.DotNetVersion }
         pm2Apps   = @($roles.PM2Apps)
+        pm2       = [ordered]@{ hosting = $roles.PM2Hosting; owner = $roles.PM2Owner
+                                home = $roles.PM2Home; appSource = $roles.PM2AppSource }
         otel_resource_attributes = $otelAttrs
     }
     $summary | ConvertTo-Json -Depth 5 | Out-File -FilePath $LogPath -Encoding utf8

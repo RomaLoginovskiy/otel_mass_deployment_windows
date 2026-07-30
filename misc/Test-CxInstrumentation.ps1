@@ -101,6 +101,14 @@ param(
     [string]   $AppHostConfig        = (Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'),
     [string]   $InstallPrefix        = 'C:\cx\otel-node',
     [string]   $Package              = '@opentelemetry/auto-instrumentations-node',
+    # Force an application's runtime where detection cannot decide, e.g.
+    #   @{ 'Wallet/api' = 'AspNetCore'; 'Static/' = 'NonDotNet' }
+    # Keyed by APP IDENTITY - "<Site><virtual path>", root apps ending in '/' - which is the
+    # same string this script prints in the Target column. That is a DIFFERENT key space from
+    # the installer's -ServiceNameOverrides (keyed by derived service name, no trailing slash
+    # on a root app); the slash-less form is accepted here as an alias. Pass the SAME overrides
+    # the install used or the two disagree about which apps are instrumented.
+    [hashtable] $RuntimeOverrides    = @{},
 
     # --- output ----------------------------------------------------------------
     [string]   $JsonPath,
@@ -1703,8 +1711,14 @@ function Test-CxReceiverFlow {
             [void] $out.Add((New-Finding -Check 'receiverFlow' -Severity 'unknown' -Code 'RECEIVER_NO_DATA_YET' -Target $r `
                 -Message ("nothing yet, but the collector has only been up {0:N0}s - re-run in {1:N0}s" -f $uptime, ($warmup - $uptime)) -Data $data))
         } else {
+            # This is where a scraper whose SOURCE is down lands. It does not reach
+            # RECEIVER_SCRAPE_FAILING: a connection-level failure returns zero data
+            # points, so otelcol_scraper_errored_metric_points stays 0 (measured
+            # against a rabbitmq receiver with no broker - the error appears only in
+            # the collector log). The counters therefore cannot say WHY, and
+            # -ProbeEndpoints is what turns this into a diagnosis.
             [void] $out.Add((New-Finding -Check 'receiverFlow' -Severity 'warn' -Code 'RECEIVER_NO_DATA' -Target $r `
-                -Message 'has produced nothing since the collector started, and nothing during the sample window' -Data $data))
+                -Message 'has produced nothing since the collector started, and nothing during the sample window. Run with -ProbeEndpoints to test whether its source is reachable - a scraper whose target is down reports exactly this, with no error counter to show for it.' -Data $data))
         }
     }
 
@@ -2196,26 +2210,393 @@ function Get-CxAppHostModel {
     return $model
 }
 
-function Test-CxAspNetCoreApp {
+function Get-CxWebConfigCoreState {
     <#
-      True when web.config declares <aspNetCore> - i.e. an ASP.NET Core app, which
-      REQUIRES a "No Managed Code" pool. Matched with //aspNetCore because publish
-      output commonly wraps the node in <location path="."> rather than putting it
-      directly under <system.webServer>.
+      Does this app's own web.config declare <aspNetCore> - i.e. is it an ASP.NET
+      Core app, which REQUIRES a "No Managed Code" pool?
 
-      Returns $null (not $false) when unknowable. Callers must not treat that as
-      "no".
+      A state, not a tri-state boolean, because "there is no web.config" and
+      "web.config could not be read" are DIFFERENT ANSWERS and reporting them as
+      one produced a wrong diagnosis on essentially every host: stock IIS ships
+      C:\inetpub\wwwroot with iisstart.htm and no web.config, so "Default Web
+      Site/" always came back as unreadable and read like a permissions problem.
+
+        nopath      no physicalPath in applicationHost.config
+        absent      no web.config there (DirMissing = the folder is gone too).
+                    ANCM is wired BY web.config, so barring inheritance from a
+                    parent application this is NOT an ASP.NET Core app
+        unreadable  exists but could not be opened or parsed - Error carries the
+                    reason, the only way to tell an ACL from malformed XML
+        ok          parsed; IsCore is authoritative
+
+      Matched with //aspNetCore because publish output commonly wraps the node in
+      <location path="."> rather than putting it directly under <system.webServer>.
+      Inheritable reports whether that <location> lets the setting flow into child
+      applications; `dotnet publish` emits inheritInChildApplications="false"
+      precisely to stop it.
+
+      Reads through [System.IO.File] rather than Test-Path/Get-Content on purpose:
+      the .NET exceptions distinguish not-found from access-denied, where a
+      Test-Path under SilentlyContinue returns $false for both.
     #>
     [CmdletBinding()]
     param([string] $PhysicalPath)
 
-    if (-not $PhysicalPath) { return $null }
+    # $Reason, not $Error: a parameter named Error would shadow the automatic
+    # $Error collection inside this function.
+    function New-State {
+        param($State, $IsCore, $Inheritable = $false, $DirMissing = $false, $Reason = $null, $FrameworkEvidence = @())
+        [pscustomobject]@{
+            State = $State; IsCore = $IsCore; Inheritable = $Inheritable
+            DirMissing = $DirMissing; Error = $Reason
+            FrameworkEvidence = @($FrameworkEvidence)
+        }
+    }
+
+    if (-not $PhysicalPath) {
+        return (New-State 'nopath' $null -Reason 'the application has no physicalPath in applicationHost.config, so its web.config cannot be located')
+    }
+
+    $wc = Join-Path $PhysicalPath 'web.config'
+    $raw = $null
     try {
-        $wc = Join-Path $PhysicalPath 'web.config'
-        if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
-        [xml]$x = Get-Content -LiteralPath $wc -Raw -ErrorAction Stop
-        return [bool]$x.SelectSingleNode('//aspNetCore')
-    } catch { return $null }
+        $raw = [System.IO.File]::ReadAllText($wc)
+    } catch [System.IO.DirectoryNotFoundException] {
+        return (New-State 'absent' $false -DirMissing $true)
+    } catch [System.IO.FileNotFoundException] {
+        return (New-State 'absent' $false)
+    } catch {
+        return (New-State 'unreadable' $null -Reason $_.Exception.Message)
+    }
+
+    try {
+        [xml]$x = $raw
+    } catch {
+        return (New-State 'unreadable' $null -Reason "web.config is not well-formed XML: $($_.Exception.Message)")
+    }
+
+    $core = $x.SelectSingleNode('//aspNetCore')
+    $inheritable = $true
+    if ($core) {
+        foreach ($loc in @($core.SelectNodes('ancestor::location'))) {
+            $v = [string]$loc.GetAttribute('inheritInChildApplications')
+            if ($v -match '^\s*(false|0)\s*$') { $inheritable = $false; break }
+        }
+    }
+
+    # POSITIVE classic-ASP.NET evidence, harvested from the SAME parsed DOM - one file read,
+    # both runtime answers. Never inferred from the pool's managedRuntimeVersion: that
+    # attribute is absent by default and defaults to v4.0, so keying off it would classify
+    # every static site on DefaultAppPool as ASP.NET Framework.
+    # An EMPTY <system.web/>, or one holding only <httpRuntime>, does not count - both appear
+    # in the web.config of plain static sites.
+    $fw = New-Object System.Collections.Generic.List[string]
+    $meaningful = @('compilation','httpHandlers','httpModules','authentication','authorization',
+                    'pages','sessionState','machineKey','globalization','customErrors',
+                    'membership','roleManager','profile','siteMap','webServices','trust','identity')
+    try {
+        foreach ($sw in @($x.SelectNodes('//system.web'))) {
+            foreach ($c in @($sw.ChildNodes)) {
+                if ($c.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
+                if ($meaningful -contains $c.LocalName) {
+                    $tok = "system.web/$($c.LocalName)"
+                    if (-not $fw.Contains($tok)) { [void]$fw.Add($tok) }
+                }
+            }
+        }
+        foreach ($n in @($x.SelectNodes('//system.webServer/handlers/add')) + @($x.SelectNodes('//system.webServer/modules/add'))) {
+            $t = [string]$n.GetAttribute('type')
+            if ($t -and $t -notmatch 'AspNetCoreModule' -and -not $fw.Contains('managed handler/module type')) { [void]$fw.Add('managed handler/module type') }
+            if (([string]$n.GetAttribute('path')) -match '\.(aspx|asmx|ashx|axd)$' -and -not $fw.Contains('classic handler mapping')) { [void]$fw.Add('classic handler mapping') }
+        }
+        if ($x.SelectSingleNode('//runtime/assemblyBinding')) { [void]$fw.Add('runtime/assemblyBinding') }
+        if ($x.SelectSingleNode('//system.web.extensions'))   { [void]$fw.Add('system.web.extensions') }
+        if ($x.SelectSingleNode('//system.serviceModel'))     { [void]$fw.Add('system.serviceModel') }
+    } catch {}
+
+    return (New-State 'ok' ([bool]$core) -Inheritable $inheritable -FrameworkEvidence $fw.ToArray())
+}
+
+function Get-CxAncestorApps {
+    <#
+      Applications on the same site ABOVE this one in the URL hierarchy, nearest
+      first. IIS config inheritance follows the URL path, not the physical one, so
+      this - not a walk up the filesystem - is how a child app finds the web.config
+      it may be inheriting from.
+    #>
+    [CmdletBinding()]
+    param($Model, $App)
+
+    $self = ([string]$App.AppPath).TrimEnd('/')      # '/' -> '',  '/api' -> '/api'
+    $out = @($Model.Apps | Where-Object {
+        $_.Site -eq $App.Site -and $_.AppPath -ne $App.AppPath -and
+        ($_.AppPath -eq '/' -or $self.StartsWith((([string]$_.AppPath).TrimEnd('/') + '/'), [StringComparison]::OrdinalIgnoreCase))
+    })
+    return ,@($out | Sort-Object { ([string]$_.AppPath).Length } -Descending)
+}
+
+function Test-CxAspNetCoreApp {
+    <#
+      Back-compat wrapper: $true / $false / $null-when-unknowable. Prefer
+      Get-CxWebConfigCoreState, which says WHY the answer is unknown.
+    #>
+    [CmdletBinding()]
+    param([string] $PhysicalPath)
+    $s = Get-CxWebConfigCoreState -PhysicalPath $PhysicalPath
+    if ($s.State -eq 'ok' -or $s.State -eq 'absent') { return [bool]$s.IsCore }
+    return $null
+}
+
+# -------------------------------------------------------------------------------------------
+# Application runtime classification
+#
+# "No Managed Code" is a property of the APP POOL, not of the application. It means IIS does
+# not load the .NET Framework CLR - it does NOT mean the application is unmanaged. ASP.NET Core
+# apps are managed; they run on CoreCLR booted by the ASP.NET Core Module. So the pool setting
+# alone decides nothing:
+#
+#   ASP.NET Core      + No Managed Code -> correct
+#   ASP.NET Core      + v4.0/v2.0       -> works (Microsoft: No Managed Code is "optional but
+#                                          recommended"), but the pool loads an unused CLR
+#   ASP.NET Framework + v4.0/v2.0       -> correct
+#   ASP.NET Framework + No Managed Code -> broken; managed handlers cannot load
+#   non-.NET / undeterminable           -> .NET auto-instrumentation does not apply at all
+#
+# INLINED from deploy\Resolve-IISAppRuntime.ps1 because this file is deliberately standalone -
+# it is the copy you drop on a host whose deploy package is missing. Keep the two in step: the
+# repo's whole reason for having one classifier is that two copies of this policy is how it
+# ended up with two contradictory explanations of "No Managed Code".
+# -------------------------------------------------------------------------------------------
+
+function Get-CxAppFilesystemEvidence {
+    <#
+      Cheap non-recursive probes of the application root. Accessible=$false means the probes
+      could not run (ACL, dead UNC) - that maps to Unknown, never to NonDotNet: "I could not
+      look" is not "there is nothing there".
+    #>
+    [CmdletBinding()]
+    param([string] $PhysicalPath)
+
+    $ev = New-Object System.Collections.Generic.List[string]
+    if (-not $PhysicalPath) { return [pscustomobject]@{ Accessible = $false; Evidence = @() } }
+    try {
+        if (-not [System.IO.Directory]::Exists($PhysicalPath)) { return [pscustomobject]@{ Accessible = $false; Evidence = @() } }
+    } catch { return [pscustomobject]@{ Accessible = $false; Evidence = @() } }
+
+    $accessible = $true
+    try {
+        foreach ($pat in @('*.aspx','*.asmx','*.ashx','*.axd','*.asax')) {
+            $hit = @([System.IO.Directory]::EnumerateFiles($PhysicalPath, $pat, [System.IO.SearchOption]::TopDirectoryOnly) | Select-Object -First 1)
+            if ($hit.Count -gt 0) {
+                if ([System.IO.Path]::GetFileName($hit[0]) -match '(?i)^global\.asax$') { [void]$ev.Add('Global.asax') }
+                elseif (-not $ev.Contains('classic page files')) { [void]$ev.Add('classic page files') }
+            }
+        }
+    } catch { $accessible = $false }
+    try {
+        foreach ($pat in @('*.runtimeconfig.json','*.deps.json')) {
+            if (@([System.IO.Directory]::EnumerateFiles($PhysicalPath, $pat, [System.IO.SearchOption]::TopDirectoryOnly) | Select-Object -First 1).Count -gt 0) {
+                [void]$ev.Add('dotnet publish artifacts'); break
+            }
+        }
+    } catch {}
+    try {
+        $bin = Join-Path $PhysicalPath 'bin'
+        if ([System.IO.Directory]::Exists($bin) -and
+            @([System.IO.Directory]::EnumerateFiles($bin, '*.dll', [System.IO.SearchOption]::TopDirectoryOnly) | Select-Object -First 1).Count -gt 0) {
+            [void]$ev.Add('bin/*.dll')
+        }
+    } catch {}
+
+    return [pscustomobject]@{ Accessible = $accessible; Evidence = @($ev.ToArray()) }
+}
+
+function Resolve-CxAppRuntime {
+    <#
+      Classify one application and derive its instrumentability.
+
+      -PoolManagedRuntimeVersion is UNTYPED on purpose. Declaring it [string] makes PowerShell
+      coerce $null to '', collapsing "attribute absent" (which means v4.0) into "No Managed
+      Code" - the exact inversion of the distinction Get-CxAppHostModel preserves, and it would
+      make every ASP.NET Core app on a default pool report as correctly configured.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $PhysicalPath,
+        $PoolManagedRuntimeVersion,
+        [string[]] $AncestorPhysicalPaths = @(),
+        [string[]] $InheritedFromLabels   = @(),
+        [string] $Override
+    )
+
+    $poolClrLoads = -not ($null -ne $PoolManagedRuntimeVersion -and ([string]$PoolManagedRuntimeVersion) -eq '')
+    $runtime = 'Unknown'; $source = 'none'; $inheritedFrom = $null; $reason = ''; $wcState = 'nopath'
+
+    if ($Override) {
+        $runtime = $Override; $source = 'override'
+        $reason  = "runtime forced to $Override by -RuntimeOverrides"
+    } else {
+        $wc = Get-CxWebConfigCoreState -PhysicalPath $PhysicalPath
+        $wcState = $wc.State
+        if ($wc.State -eq 'unreadable' -or $wc.State -eq 'nopath') {
+            $reason = "$($wc.Error) - so the application runtime cannot be determined"
+        } elseif ($wc.State -eq 'ok' -and $wc.IsCore) {
+            $runtime = 'AspNetCore'; $source = 'webconfig'
+            $reason  = 'web.config declares <aspNetCore>, so this is an ASP.NET Core application hosted by the ASP.NET Core Module'
+        } elseif ($wc.State -eq 'ok' -and @($wc.FrameworkEvidence).Count -gt 0) {
+            $runtime = 'AspNetFramework'; $source = 'webconfig'
+            $reason  = "web.config carries classic ASP.NET configuration ($($wc.FrameworkEvidence -join ', ')), so this is an ASP.NET Framework application"
+        } else {
+            $fs = Get-CxAppFilesystemEvidence -PhysicalPath $PhysicalPath
+            for ($i = 0; $i -lt @($AncestorPhysicalPaths).Count; $i++) {
+                $awc = Get-CxWebConfigCoreState -PhysicalPath $AncestorPhysicalPaths[$i]
+                if ($awc.State -ne 'ok') { continue }
+                if ($awc.IsCore -and $awc.Inheritable) {
+                    $runtime = 'AspNetCore'; $source = 'inherited'
+                    $inheritedFrom = if ($i -lt @($InheritedFromLabels).Count) { $InheritedFromLabels[$i] } else { $AncestorPhysicalPaths[$i] }
+                    $reason = "it has no web.config of its own, but <aspNetCore> is inherited from '$inheritedFrom', so this is an ASP.NET Core application"
+                }
+                # Only the NEAREST readable ancestor decides; anything above it is shadowed.
+                break
+            }
+            if ($runtime -eq 'Unknown') {
+                $fsEv = @($fs.Evidence)
+                if ($fsEv -contains 'Global.asax' -or $fsEv -contains 'classic page files') {
+                    $runtime = 'AspNetFramework'; $source = 'filesystem'
+                    $reason  = "classic ASP.NET files are present in the application root ($($fsEv -join ', ')), so this is an ASP.NET Framework application"
+                } elseif ($wc.DirMissing) {
+                    $runtime = 'NonDotNet'; $source = 'filesystem'
+                    $reason  = "the physical path '$PhysicalPath' does not exist, so IIS cannot serve this application at all"
+                } elseif (-not $fs.Accessible) {
+                    $reason  = "the application root '$PhysicalPath' could not be enumerated, so the runtime cannot be determined"
+                } elseif ($fsEv -contains 'bin/*.dll' -or $fsEv -contains 'dotnet publish artifacts') {
+                    # Deliberately NOT promoted to Framework: static sites carry stray bin
+                    # folders and an out-of-process Core publish puts DLLs in the app root.
+                    $runtime = 'Unknown'; $source = 'filesystem'
+                    $reason  = "managed assemblies are present ($($fsEv -join ', ')) but nothing in web.config wires them to a request pipeline, so the runtime is ambiguous"
+                } elseif ($wc.State -eq 'absent') {
+                    $runtime = 'NonDotNet'; $source = 'filesystem'
+                    $reason  = "no web.config and no .NET content in '$PhysicalPath' - ASP.NET Core is wired by <aspNetCore> and classic ASP.NET by <system.web>, so this is static or non-.NET content. Normal for the stock Default Web Site."
+                } else {
+                    $runtime = 'NonDotNet'; $source = 'webconfig'
+                    $reason  = 'web.config parsed but declares neither <aspNetCore> nor classic ASP.NET configuration - static content, a native/ISAPI handler, or a reverse proxy to a backend process'
+                }
+            }
+        }
+    }
+
+    # The .NET auto-instrumentation supports .NET Framework 4.6.2+; the desktop CLR 2 (.NET 2.0/3.5) is
+    # out of scope for it, so such an app is Unsupported - the app itself runs perfectly well. Keep this
+    # identical to Get-IISAppInstrumentability in deploy/Resolve-IISAppRuntime.ps1: this file is a
+    # standalone FORK of that classifier, and when it lacked this branch it reported a CLR-2 pool as
+    # Supported/pass, so an operator using the standalone doctor instrumented an app that can never
+    # report.
+    $isClr2 = ($null -ne $PoolManagedRuntimeVersion) -and (([string]$PoolManagedRuntimeVersion) -match '^v?2(\.|$)')
+
+    $instr = switch ($runtime) {
+        'AspNetCore'      { if ($poolClrLoads) { 'Misconfigured' } else { 'Supported' } }
+        'AspNetFramework' {
+            if (-not $poolClrLoads) { 'Misconfigured' }   # No Managed Code: the app is DOWN
+            elseif ($isClr2)        { 'Unsupported'   }   # runs, but nothing can instrument it
+            else                    { 'Supported'     }
+        }
+        'NonDotNet'       { 'Unsupported' }
+        default           { 'RequiresOverride' }
+    }
+
+    if ($instr -eq 'Unsupported' -and $runtime -eq 'AspNetFramework') {
+        $shownClr = if ($null -eq $PoolManagedRuntimeVersion) { '<inherited default, v4.0>' } else { [string]$PoolManagedRuntimeVersion }
+        $reason = "$reason, but its pool has managedRuntimeVersion=$shownClr. The .NET OpenTelemetry automatic instrumentation supports .NET Framework 4.6.2+, so a CLR 2.0 pool cannot be instrumented at all. The application itself runs normally. Fix: move the app to a v4.0 pool if it needs telemetry."
+    }
+
+    if ($instr -eq 'Misconfigured') {
+        $shown = if ($null -eq $PoolManagedRuntimeVersion) { '<inherited default, v4.0>' } elseif (([string]$PoolManagedRuntimeVersion) -eq '') { "'' (No Managed Code)" } else { [string]$PoolManagedRuntimeVersion }
+        if ($runtime -eq 'AspNetCore') {
+            $reason = "$reason, but its pool has managedRuntimeVersion=$shown. Microsoft recommends No Managed Code for ASP.NET Core; the pool loads a desktop CLR nothing uses. The application still runs and still reports. Fix: set the pool's .NET CLR Version to No Managed Code."
+        } else {
+            $reason = "$reason, but its pool has managedRuntimeVersion=$shown. A .NET Framework application needs a CLR-loading pool (usually v4.0); with No Managed Code its managed handlers cannot load and IIS fails the request. Fix: set the pool's .NET CLR Version to v4.0."
+        }
+    }
+
+    return [pscustomobject]@{
+        DotNetRuntime = $runtime; Instrumentability = $instr; RuntimeSource = $source
+        InheritedFrom = $inheritedFrom; WebConfigState = $wcState
+        PoolClrLoads = $poolClrLoads; PoolManagedRuntimeVersion = $PoolManagedRuntimeVersion
+        RuntimeReason = $reason
+    }
+}
+
+function New-CxRuntimeFinding {
+    <#
+      The single (runtime, instrumentability) -> code/severity/message mapping.
+
+      NON_DOTNET_APP_NOT_INSTRUMENTED is 'info', never 'warn': the stock Default Web Site is
+      non-.NET and exists on essentially every host, so grading it warn would pin the whole
+      fleet at exit 2 forever. FRAMEWORK_POOL_NO_MANAGED_CLR is 'warn' not 'fail' even though
+      the app is down - 'fail' means the AGENT cannot do its job, and the agent neither caused
+      this nor is blocked by it.
+
+      POOL_NOT_NO_MANAGED_CODE keeps its name rather than becoming
+      ASPNETCORE_POOL_HAS_MANAGED_CLR: same condition, and it is a token the docs already tell
+      operators to grep for.
+    #>
+    [CmdletBinding()]
+    param($Record, [string] $Target, [string] $Check = 'poolRuntime')
+
+    if (-not $Record) { return $null }
+    $code = ''; $sev = 'info'
+    switch ("$($Record.DotNetRuntime)/$($Record.Instrumentability)") {
+        'AspNetCore/Supported'          { $code = 'ASPNETCORE_NO_MANAGED_CODE_OK';   $sev = 'pass' }
+        'AspNetCore/Misconfigured'      { $code = 'POOL_NOT_NO_MANAGED_CODE';        $sev = 'warn' }
+        'AspNetFramework/Supported'     { $code = 'FRAMEWORK_POOL_OK';               $sev = 'pass' }
+        'AspNetFramework/Misconfigured' { $code = 'FRAMEWORK_POOL_NO_MANAGED_CLR';   $sev = 'warn' }
+        # info, not warn - the application is healthy and this is a property of its pool's CLR, not a
+        # defect to act on. Its own code so it never reads as "we think this is static".
+        'AspNetFramework/Unsupported'   { $code = 'FRAMEWORK_CLR2_NOT_INSTRUMENTABLE'; $sev = 'info' }
+        'NonDotNet/Unsupported'         { $code = 'NON_DOTNET_APP_NOT_INSTRUMENTED'; $sev = 'info' }
+        default                         { $code = 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE';  $sev = 'unknown' }
+    }
+    $msg = $Record.RuntimeReason
+    if ($code -eq 'FRAMEWORK_CLR2_NOT_INSTRUMENTABLE') {
+        $msg = "$msg. No OTEL_SERVICE_NAME is written and the app is not claimed in CX_IIS_SERVICES, because a name that never reports is worse than no name."
+    } elseif ($code -eq 'NON_DOTNET_APP_NOT_INSTRUMENTED') {
+        $msg = "$msg. The .NET OpenTelemetry automatic instrumentation does not apply, so no OTEL_SERVICE_NAME is written and the app is not claimed in CX_IIS_SERVICES. If IIS reverse-proxies to a backend process, instrument that backend where it runs."
+    } elseif ($code -eq 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE') {
+        $msg = "$msg. Not instrumented and not claimed in CX_IIS_SERVICES rather than guessed. Resolve it with -RuntimeOverrides @{'$Target'='AspNetCore'|'AspNetFramework'|'NonDotNet'}."
+    }
+    return (New-Finding -Check $Check -Severity $sev -Code $code -Target $Target -Message $msg -Data @{
+        dotNetRuntime = $Record.DotNetRuntime; instrumentability = $Record.Instrumentability
+        runtimeSource = $Record.RuntimeSource; inheritedFrom = $Record.InheritedFrom
+        managedRuntimeVersion = $Record.PoolManagedRuntimeVersion
+    })
+}
+
+function Resolve-CxRuntimeOverrides {
+    <#
+      Normalize -RuntimeOverrides into a case-insensitive table keyed by app identity
+      ("<Site><virtual path>", root apps ending in '/'). A key with no '/' is treated as a root
+      application, so 'Wallet' is accepted as an alias for 'Wallet/' - that is the shape an
+      operator copies from -ServiceNameOverrides, a DIFFERENT key space.
+
+      Throws on a value outside the allowed set. A typo must fail loudly rather than silently
+      classify nothing and let the run report success.
+    #>
+    [CmdletBinding()]
+    param([hashtable] $Table = @{})
+
+    $allowed = @('AspNetCore','AspNetFramework','NonDotNet')
+    $out = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in @($Table.Keys)) {
+        $key = ([string]$k).Trim()
+        if (-not $key) { continue }
+        while ($key.Contains('//')) { $key = $key.Replace('//','/') }
+        if (-not $key.Contains('/')) { $key = $key + '/' }
+        $v = ([string]$Table[$k]).Trim()
+        $m = @($allowed | Where-Object { $_ -eq $v })
+        if ($m.Count -ne 1) { throw "Invalid -RuntimeOverrides value '$($Table[$k])' for '$k'. Allowed: $($allowed -join ', ')." }
+        $out[$key] = $m[0]
+    }
+    return $out
 }
 
 function Get-CxEffectivePoolEnv {
@@ -2223,6 +2604,11 @@ function Get-CxEffectivePoolEnv {
       A pool's own <environmentVariables> block REPLACES applicationPoolDefaults;
       it is not merged. Checking the defaults alone therefore reports a false pass
       for any pool that has its own block.
+
+      The block is a snapshot of the defaults as they were at its FIRST write, and a
+      pool can acquire one before the agent is ever installed (any earlier appcmd
+      write of any env var - a connection string, say). Such a pool predates the OTLP
+      defaults and never sees them.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)] $Pool, [hashtable] $Defaults)
@@ -2404,7 +2790,7 @@ function Test-CxIis {
         if (-not $endpoint) {
             if ($pool.HasOwnEnvBlock -and $defEndpoint) {
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_LOST_INHERITANCE' -Target $poolName `
-                    -Message 'pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do' `
+                    -Message 'pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do. Usually a pool that owned a block before the agent was installed. Re-run Instrument-IIS.ps1 and recycle the pool: it writes the OTLP vars straight onto pools that own a block.' `
                     -Data @{ defaultsEndpoint = $defEndpoint; poolEnvKeys = @($pool.Env.Keys) })
             } else {
                 Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target $poolName `
@@ -2438,36 +2824,81 @@ function Test-CxIis {
         }
     }
 
-    # Wrong runtime here means NO telemetry at all, regardless of everything above.
+    # What runtime is each app, and does its pool match? "No Managed Code" is a POOL property,
+    # not an app property: correct for ASP.NET Core, wrong for ASP.NET Framework, and irrelevant
+    # to a static, native, PHP, Node or reverse-proxied app. Classify first, then judge.
+    $rtOverrides = $null
+    try { $rtOverrides = Resolve-CxRuntimeOverrides -Table $RuntimeOverrides }
+    catch {
+        Add-F (New-Finding -Check 'poolRuntime' -Severity 'fail' -Code 'BAD_ARGUMENT' `
+            -Message "-RuntimeOverrides could not be parsed: $($_.Exception.Message)")
+    }
+
+    if ($rtOverrides -and $rtOverrides.Count -gt 0) {
+        $present = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($a in @($model.Apps)) {
+            $ap = ([string]$a.AppPath); if (-not $ap) { $ap = '/' }
+            [void]$present.Add("$($a.Site)$($ap)")
+        }
+        foreach ($k in @($rtOverrides.Keys | Where-Object { -not $present.Contains([string]$_) })) {
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'RUNTIME_OVERRIDE_UNMATCHED' -Target $k `
+                -Message "-RuntimeOverrides has an entry for '$k' but no such IIS application exists on this host, so that classification is not in force. Runtime keys are '<Site><virtual path>' with root apps ending in '/' - a key copied from -ServiceNameOverrides will not match.")
+        }
+    }
+
     foreach ($app in $model.Apps) {
         $label = "$($app.Site)$($app.AppPath)"
-        $isCore = Test-CxAspNetCoreApp -PhysicalPath $app.PhysicalPath
 
-        if ($null -eq $isCore) {
+        # A read FAILURE is genuinely unknown. A web.config that is simply not there is not,
+        # and reporting both as "cannot read web.config" made the stock Default Web Site -
+        # wwwroot ships iisstart.htm and no web.config - look like an ACL problem on every
+        # host in the fleet. Kept as its own finding because it describes the FILE, where the
+        # classification below describes the APPLICATION.
+        $wc = Get-CxWebConfigCoreState -PhysicalPath $app.PhysicalPath
+        if ($wc.State -eq 'unreadable' -or $wc.State -eq 'nopath') {
             Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
-                -Message "cannot read web.config, so it is unknown whether this is an ASP.NET Core app needing 'No Managed Code'" `
-                -Data @{ physicalPath = $app.PhysicalPath })
+                -Message "$($wc.Error) - so this application's runtime cannot be determined" `
+                -Data @{ physicalPath = $app.PhysicalPath; error = $wc.Error })
             continue
         }
-        if (-not $isCore) { continue }   # Framework app: a managed runtime is correct
 
         $pool = $model.Pools[$app.Pool]
         if (-not $pool) {
             Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $label `
-                -Message "pool '$($app.Pool)' is not declared in applicationHost.config")
+                -Message "pool '$($app.Pool)' is not declared in applicationHost.config, so its CLR setting cannot be checked")
             continue
         }
 
-        $mrv = $pool.ManagedRuntimeVersion
-        if ($mrv -eq '') {
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'pass' -Target $label `
-                -Message "ASP.NET Core app on pool '$($app.Pool)' is No Managed Code")
-        } else {
-            $shown = if ($null -eq $mrv) { '<inherited default>' } else { $mrv }
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'POOL_NOT_NO_MANAGED_CODE' -Target $label `
-                -Message "ASP.NET Core app but pool '$($app.Pool)' has managedRuntimeVersion=$shown - it must be '' (No Managed Code) or the app emits NO telemetry at all" `
-                -Data @{ pool = $app.Pool; managedRuntimeVersion = $mrv })
+        $anc = @(Get-CxAncestorApps -Model $model -App $app)
+        $ov  = ''
+        if ($rtOverrides -and $rtOverrides.Contains($label)) { $ov = [string]$rtOverrides[$label] }
+
+        $rt = Resolve-CxAppRuntime -PhysicalPath $app.PhysicalPath `
+            -PoolManagedRuntimeVersion $pool.ManagedRuntimeVersion `
+            -AncestorPhysicalPaths @($anc | ForEach-Object { [string]$_.PhysicalPath }) `
+            -InheritedFromLabels @($anc | ForEach-Object { "$($_.Site)$($_.AppPath)" }) `
+            -Override $ov
+
+        # web.config state, reported ALONGSIDE the verdict rather than instead of it - they
+        # answer different questions. Suppressed when the app is Core by inheritance, where a
+        # missing file is expected rather than informative.
+        if ($wc.State -eq 'absent' -and $rt.RuntimeSource -ne 'inherited') {
+            $msg = if ($wc.DirMissing) {
+                "physical path '$($app.PhysicalPath)' does not exist, so there is no web.config - IIS cannot serve this app at all"
+            } else {
+                "no web.config at '$($app.PhysicalPath)' - ASP.NET Core in IIS is wired by <aspNetCore> in web.config and classic ASP.NET by <system.web>, so neither is configured here. Normal for the stock Default Web Site."
+            }
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'info' -Code 'WEBCONFIG_ABSENT' -Target $label `
+                -Message $msg -Data @{ physicalPath = $app.PhysicalPath; dirMissing = [bool]$wc.DirMissing })
         }
+
+        if ($ov) {
+            Add-F (New-Finding -Check 'poolRuntime' -Severity 'info' -Code 'RUNTIME_OVERRIDE_APPLIED' -Target $label `
+                -Message "runtime forced to $ov by -RuntimeOverrides; detection was not consulted. The install must be given the same override or the two will disagree about what is instrumented." `
+                -Data @{ override = $ov })
+        }
+
+        Add-F (New-CxRuntimeFinding -Record $rt -Target $label)
     }
 
     return , @($findings.ToArray())
