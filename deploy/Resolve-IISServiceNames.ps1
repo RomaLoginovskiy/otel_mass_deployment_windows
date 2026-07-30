@@ -410,3 +410,141 @@ function Remove-WebConfigServiceName {
     $xml.Save($webConfig)
     return $true
 }
+
+function Set-WebConfigAppSettingServiceName {
+    <#
+    .SYNOPSIS
+      Name ONE iisnode application per-app, by writing OTEL_SERVICE_NAME into its own
+      web.config <appSettings>.
+
+    .DESCRIPTION
+      The pool-level route cannot name an iisnode app that shares its pool: one
+      <environmentVariables> collection reaches every application in the pool, so a single
+      OTEL_SERVICE_NAME would either name two Node services the same or silently RENAME a
+      .NET co-tenant that was reporting correctly.
+
+      iisnode gives us a genuinely per-application channel. MEASURED in its source
+      (src/iisnode/cmoduleconfiguration.cpp, CreateNodeEnvironment): it copies w3wp's
+      environment block, then appends every <appSettings> key/value from the configuration
+      resolved for THAT application as a `key=value` entry. The node.exe child therefore sees
+      the app's own appSettings as environment variables, and two apps in one pool see
+      different ones.
+
+      Consequences that shape the contract, both of them load-bearing:
+
+      * ORDER MATTERS. The parent environment is copied FIRST and appSettings appended after
+        it, and GetEnvironmentVariableW returns the FIRST match in the block. A pool-level
+        OTEL_SERVICE_NAME therefore SHADOWS the appSettings one - it does not lose to it. The
+        caller must ensure the pool carries no OTEL_SERVICE_NAME before relying on this
+        function, which is why Instrument-IIS.ps1 removes a stale pool value on the per-app
+        path and refuses when the pool carries a foreign one.
+      * NOT A SUBSTITUTE FOR THE FRAMEWORK CASE. On .NET Framework the OTel SDK reads OTEL_*
+        out of web.config and promotes it to PROCESS-level environment variables, once per
+        worker process. For an app that is iisnode AND instrumented ASP.NET Framework on a
+        shared pool, this write would leak that name onto its co-tenants via w3wp. The caller
+        must exclude that shape (Instrument-IIS.ps1 reports IISNODE_SHARED_POOL_FRAMEWORK);
+        this function is safe for a pure-Node app, and for a hybrid on a DEDICATED pool where
+        there is nobody to leak onto.
+
+      Conversion is CP_ACP inside iisnode, so a non-ASCII service name is not round-trip safe -
+      the same constraint the comma/quote rule in Get-IISServiceLabelValue already imposes.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $PhysicalPath,
+        [Parameter(Mandatory)][string] $ServiceName,
+        # Optional backup/manifest session (from Backup-Config.ps1).
+        $Session = $null
+    )
+
+    if (-not $PhysicalPath) {
+        Write-Warning "  [appsettings] no physical path for '$ServiceName' - skipping."
+        return $false
+    }
+    $webConfig = Join-Path $PhysicalPath 'web.config'
+    if (-not (Test-Path $webConfig)) {
+        # An iisnode app cannot exist without one (the handler mapping lives there), so this is
+        # a real anomaly rather than the routine "classic app has no web.config" case.
+        Write-Warning "  [appsettings] no web.config at '$webConfig' - cannot name '$ServiceName' per-app."
+        return $false
+    }
+
+    [xml]$xml = Get-Content -LiteralPath $webConfig -Raw
+
+    # /configuration/appSettings, NOT //appSettings: a <location>-scoped block targets a
+    # different path than this application, and writing into it would name something else.
+    $appSettings  = $xml.SelectSingleNode('/configuration/appSettings')
+    $existingNode = if ($appSettings) { $appSettings.SelectSingleNode("add[@key='OTEL_SERVICE_NAME']") } else { $null }
+    $priorValue   = if ($existingNode) { [string]$existingNode.GetAttribute('value') } else { $null }
+
+    if ($Session) {
+        Backup-DeployFile -Session $Session -Path $webConfig | Out-Null
+        # -Kind appSettings so uninstall reverses THIS edit with the matching remover. Without
+        # it the manifest replay would look for an <aspNetCore> node that was never touched and
+        # leave the appSettings entry behind.
+        Record-WebConfigEdit -Session $Session -Path $webConfig -AddedNode (-not $existingNode) `
+            -PriorValue $priorValue -SetValue $ServiceName -Kind 'appSettings'
+    }
+
+    if (-not $appSettings) {
+        $appSettings = $xml.CreateElement('appSettings')
+        # appSettings must be a child of <configuration>; prepend so it precedes
+        # <system.webServer> as the schema's documented order suggests.
+        if ($xml.DocumentElement.FirstChild) { [void]$xml.DocumentElement.InsertBefore($appSettings, $xml.DocumentElement.FirstChild) }
+        else                                 { [void]$xml.DocumentElement.AppendChild($appSettings) }
+    }
+
+    $node = $appSettings.SelectSingleNode("add[@key='OTEL_SERVICE_NAME']")
+    if (-not $node) {
+        $node = $xml.CreateElement('add')
+        [void]$node.SetAttribute('key', 'OTEL_SERVICE_NAME')
+        [void]$appSettings.AppendChild($node)
+    }
+    [void]$node.SetAttribute('value', $ServiceName)
+
+    $xml.Save($webConfig)
+    Write-Host "  [appsettings] $webConfig -> OTEL_SERVICE_NAME=$ServiceName (per-app; iisnode promotes appSettings into node.exe's environment)" -ForegroundColor Green
+    return $true
+}
+
+function Remove-WebConfigAppSettingServiceName {
+    <#
+      Inverse of Set-WebConfigAppSettingServiceName - used by Uninstall-Agent.ps1.
+      Same ownership rules as Remove-WebConfigServiceName: a value that does not match
+      -ExpectedValue is left alone, a non-empty -PriorValue is restored rather than deleted,
+      and an <appSettings> element left empty by our removal is pruned.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $PhysicalPath,
+        [string] $ExpectedValue,
+        [AllowNull()][string] $PriorValue
+    )
+
+    if (-not $PhysicalPath) { Write-Warning "  [appsettings] no physical path - skipping."; return $false }
+    $webConfig = Join-Path $PhysicalPath 'web.config'
+    if (-not (Test-Path $webConfig)) { Write-Warning "  [appsettings] no web.config at '$webConfig' - skipping."; return $false }
+
+    [xml]$xml = Get-Content -LiteralPath $webConfig -Raw
+    $appSettings = $xml.SelectSingleNode('/configuration/appSettings')
+    if (-not $appSettings) { return $true }   # nothing we could have added
+    $node = $appSettings.SelectSingleNode("add[@key='OTEL_SERVICE_NAME']")
+    if (-not $node) { return $true }
+
+    $cur = [string]$node.GetAttribute('value')
+    if ($PSBoundParameters.ContainsKey('ExpectedValue') -and $ExpectedValue -and $cur -ne $ExpectedValue) {
+        Write-Warning "  [appsettings] '$webConfig' OTEL_SERVICE_NAME='$cur' != installer value '$ExpectedValue' - leaving (not installer-owned)."
+        return $false
+    }
+
+    if (-not [string]::IsNullOrEmpty($PriorValue)) {
+        [void]$node.SetAttribute('value', $PriorValue)
+        Write-Host "  [appsettings] $webConfig -> restored OTEL_SERVICE_NAME=$PriorValue" -ForegroundColor Yellow
+    } else {
+        [void]$appSettings.RemoveChild($node)
+        if (-not $appSettings.SelectSingleNode('add')) { [void]$xml.DocumentElement.RemoveChild($appSettings) }
+        Write-Host "  [appsettings] $webConfig -> removed OTEL_SERVICE_NAME" -ForegroundColor Yellow
+    }
+    $xml.Save($webConfig)
+    return $true
+}

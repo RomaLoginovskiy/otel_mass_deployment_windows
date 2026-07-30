@@ -746,6 +746,130 @@ function New-IISRuntimeFinding {
     })
 }
 
+function Get-IISNodeNamingDecision {
+    <#
+    .SYNOPSIS
+      WHERE (or whether) an iisnode application's OTEL_SERVICE_NAME can be written. One
+      implementation, called by Instrument-IIS.ps1 and by misc\Enable-IisnodeInstrumentation.ps1.
+
+    .DESCRIPTION
+      This used to be two copies of a co-tenancy gate that had to be kept identical by hand, with
+      a comment in each saying so. It is one function now: a host patched by the standalone script
+      and later re-deployed must not flip between instrumented and not, and that guarantee should
+      not depend on someone noticing a divergence in review.
+
+      Three outcomes:
+
+        pool     the pool serves nobody else that reads OTEL_SERVICE_NAME, so the name goes on the
+                 pool - the simplest mechanism, and the one that also covers the node child of a
+                 hybrid app
+        perApp   the pool is shared, so the name goes into the application's OWN web.config
+                 <appSettings>, which iisnode appends to the environment block it builds for
+                 node.exe. The pool then carries only what its applications genuinely share: the
+                 bootstrap and the OTLP endpoint
+        refuse   naming it by either route would mis-name or rename something, so nothing is
+                 written. .Outcome carries the New-IISNodeFinding token that says which case
+
+      RemovePoolName is $true when a pool-level name this installer wrote must come off the pool
+      first. It is not optional cleanup: iisnode copies the parent environment BEFORE appending
+      appSettings, and Windows resolves the FIRST entry in the block, so a leftover pool value
+      SHADOWS the per-app one and the application reports under the wrong name with both values
+      looking correct.
+
+      Peers are normalised by the caller (its record shape is its own business) into objects with
+      .Key, .Pool, .IsIisnode and .IsDotNetInstrumented. The whole rival predicate lives here
+      because it is the part that must not drift, and that includes the POOL filter: a caller is
+      free to pass every application on the host, and one in a different pool must not change this
+      application's route. A co-tenant only forces per-app naming if it READS OTEL_SERVICE_NAME - a
+      static site, a native handler or an ARR proxy does not.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $Key,
+        [Parameter(Mandatory)][string] $Pool,
+        [string]   $ServiceName,
+        [object[]] $Peers = @(),
+        [AllowNull()][string] $ExistingPoolServiceName,
+        # Names this installer computes for the applications in this pool. A pool value inside this
+        # set is one we wrote and may remove; anything else belongs to somebody else.
+        [string[]] $PoolOwnNames = @(),
+        # The application's own .NET side is instrumented ASP.NET Framework.
+        [bool]     $IsFrameworkInstrumented = $false
+    )
+
+    $rivals = @($Peers | Where-Object {
+        $_ -and $_.Pool -eq $Pool -and $_.Key -ne $Key -and ($_.IsIisnode -or $_.IsDotNetInstrumented)
+    })
+    $rivalLabels = @($rivals | ForEach-Object { "$($_.Key)$(if ($_.IsIisnode) { ' (iisnode)' } else { ' (.NET)' })" }) -join ', '
+
+    if (@($rivals).Count -eq 0) {
+        # Nobody else in the pool reads the variable. A pool value that is not this app's name still
+        # means something else claimed the pool, so refuse rather than overwrite it.
+        if ($ExistingPoolServiceName -and $ExistingPoolServiceName -ne $ServiceName) {
+            return [pscustomobject]@{
+                Mode = 'refuse'; Outcome = 'poolNameShadow'; Rivals = @(); RemovePoolName = $false
+                Reason = "pool '$Pool' already carries OTEL_SERVICE_NAME='$ExistingPoolServiceName', which is not the name for this application - something else has claimed this pool and overwriting it would rename that service"
+            }
+        }
+        return [pscustomobject]@{ Mode = 'pool'; Outcome = 'instrumented'; Rivals = @(); RemovePoolName = $false; Reason = $null }
+    }
+
+    # Shared pool. Per-app naming is available, with one exception.
+    if ($IsFrameworkInstrumented) {
+        return [pscustomobject]@{
+            Mode = 'refuse'; Outcome = 'sharedPoolFw'; Rivals = $rivalLabels; RemovePoolName = $false
+            Reason = "this application is iisnode AND instrumented ASP.NET Framework and shares pool '$Pool' with $rivalLabels. The Framework SDK promotes web.config OTEL_* values to PROCESS-level environment variables, so a per-app name would leak through w3wp and rename its co-tenants"
+        }
+    }
+    if ($ExistingPoolServiceName -and -not ($PoolOwnNames -contains $ExistingPoolServiceName)) {
+        return [pscustomobject]@{
+            Mode = 'refuse'; Outcome = 'poolNameShadow'; Rivals = $rivalLabels; RemovePoolName = $false
+            Reason = "pool '$Pool' carries OTEL_SERVICE_NAME='$ExistingPoolServiceName' that this installer did not write, and a pool value shadows the per-app one, so the per-app name would not take effect"
+        }
+    }
+    return [pscustomobject]@{
+        Mode = 'perApp'; Outcome = 'perAppNamed'; Rivals = $rivalLabels
+        RemovePoolName = [bool]$ExistingPoolServiceName
+        Reason = "shares pool '$Pool' with $rivalLabels, so the name goes in this application's own web.config <appSettings>"
+    }
+}
+
+function Get-CxWebConfigAppSetting {
+    <#
+    .SYNOPSIS
+      Read one <appSettings> value out of an application's own web.config.
+
+    .DESCRIPTION
+      The read side of per-app iisnode naming. iisnode appends every appSettings key/value of the
+      application's resolved configuration to the environment block it builds for node.exe
+      (src/iisnode/cmoduleconfiguration.cpp, CreateNodeEnvironment), so this is where a
+      pool-sharing app's OTEL_SERVICE_NAME lives - the pool cannot carry it without renaming its
+      co-tenants.
+
+      Returns $null for every "not there" case (no path, no file, unreadable, key absent) and
+      never throws: the doctor grades a missing name as a finding, and a reader that threw would
+      take the whole per-app report down with it. /configuration/appSettings only - a
+      <location>-scoped block applies to a different path than this application.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $PhysicalPath,
+        [Parameter(Mandatory)][string] $Key
+    )
+
+    if (-not $PhysicalPath) { return $null }
+    $webConfig = Join-Path $PhysicalPath 'web.config'
+    if (-not (Test-Path -LiteralPath $webConfig -ErrorAction SilentlyContinue)) { return $null }
+    try {
+        [xml]$xml = Get-Content -LiteralPath $webConfig -Raw -ErrorAction Stop
+    } catch { return $null }
+    $node = $xml.SelectSingleNode("/configuration/appSettings/add[@key='$Key']")
+    if (-not $node) { return $null }
+    $v = [string]$node.GetAttribute('value')
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    return $v
+}
+
 function New-IISNodeFinding {
     <#
     .SYNOPSIS
@@ -763,8 +887,17 @@ function New-IISNodeFinding {
         missing        iisnode app with no bootstrap on its pool - it is dark    warn
         esmUnsupported the app is an ES module, and iisnode cannot host one at
                        all - so there is nothing here to instrument             warn
-        sharedPool     two or more iisnode apps share one pool, so a single
-                       pool-level OTEL_SERVICE_NAME cannot name either           warn
+        perAppNamed    a pool-sharing app named in its OWN web.config
+                       <appSettings>, which iisnode promotes into the node
+                       child's environment; the pool carries only the shared
+                       bootstrap                                                 pass
+        sharedPool     the app shares its pool and could not be named per-app
+                       either, so nothing was written                            warn
+        sharedPoolFw   iisnode AND instrumented ASP.NET Framework on a shared
+                       pool: naming it per-app would leak that name onto its
+                       co-tenants through w3wp                                   warn
+        poolNameShadow the pool carries a foreign OTEL_SERVICE_NAME, which
+                       SHADOWS the per-app appSettings value                     warn
         packageMissing the Node instrumentation package is not staged here       warn
         stalePath      the bootstrap points at a register.js that is gone        warn
         customCmdLine  <iisnode nodeProcessCommandLine> overrides the node
@@ -775,7 +908,7 @@ function New-IISNodeFinding {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('instrumented','missing','esmUnsupported','sharedPool','packageMissing','stalePath','customCmdLine')]
+        [Parameter(Mandatory)][ValidateSet('instrumented','perAppNamed','missing','esmUnsupported','sharedPool','sharedPoolFw','poolNameShadow','packageMissing','stalePath','customCmdLine')]
         [string] $Outcome,
         $Record,
         [string] $Target,
@@ -813,9 +946,33 @@ function New-IISNodeFinding {
             $code = 'IISNODE_ESM_NOT_HOSTABLE'; $sev = 'warn'
             $msg  = "this application is an ES module$(if ($entry) { " ($entry)" }) and iisnode cannot host ES modules: its interceptor.js require()s the entry point, so the application fails with ERR_REQUIRE_ESM and returns HTTP 500 on every request (measured on iisnode 0.2.26 / Node 20 - with and without instrumentation). Not instrumented and not claimed as a service, because there is no working process to instrument. Fix is application-side and unrelated to telemetry: give it a CommonJS entry point that dynamic-import()s the ESM app, or host it under PM2 / a Windows service instead of iisnode"
         }
+        'perAppNamed' {
+            # The pool-sharing case is NOT a refusal any more. iisnode appends the application's
+            # own <appSettings> to the environment block it builds for node.exe
+            # (cmoduleconfiguration.cpp, CreateNodeEnvironment), so each application in a shared
+            # pool can carry its own name while the pool carries only what they genuinely share -
+            # the bootstrap and the OTLP endpoint.
+            $code = 'IISNODE_APP_NAMED_PER_APP'; $sev = 'pass'
+            $msg  = "iisnode application sharing its app pool: OTEL_SERVICE_NAME is set per-app in its own web.config <appSettings> (iisnode promotes appSettings into the node.exe environment) and the pool carries the shared NODE_OPTIONS bootstrap. No pool-level OTEL_SERVICE_NAME is written, so no co-tenant is renamed"
+        }
         'sharedPool' {
             $code = 'IISNODE_SHARED_POOL_AMBIGUOUS'; $sev = 'warn'
-            $msg  = "two or more iisnode applications share this app pool. Their node.exe children inherit ONE pool environment, so a single OTEL_SERVICE_NAME cannot name them apart and none is written - a name that maps to two services is worse than no name. Fix: give each application its own pool, or set the bootstrap per app via <iisnode nodeProcessCommandLine>"
+            $msg  = "this iisnode application shares its app pool and could not be named per-app either, so nothing was written - a name that maps to two services is worse than no name. Per-app naming writes OTEL_SERVICE_NAME into the application's own web.config <appSettings>; it needs that file to be present and writable. Fix: make it writable, or give the application its own pool"
+        }
+        'sharedPoolFw' {
+            # The one shape per-app appSettings CANNOT solve. On .NET Framework the OTel SDK reads
+            # OTEL_* out of web.config and promotes it to PROCESS-level environment variables, once
+            # per worker process - so on a shared pool this app's name would reach its co-tenants
+            # through w3wp and rename services that were reporting correctly.
+            $code = 'IISNODE_SHARED_POOL_FRAMEWORK'; $sev = 'warn'
+            $msg  = "this application is iisnode AND instrumented ASP.NET Framework, and it shares its app pool. Naming it per-app is not safe here: on .NET Framework the OTel SDK promotes web.config OTEL_* values to PROCESS-level environment variables, so the name would leak through w3wp onto its co-tenants and rename services that were reporting correctly. Nothing is written. Fix: give this application its own app pool - then the name goes on the pool and there is nobody to leak onto"
+        }
+        'poolNameShadow' {
+            # Ordering fact, measured in iisnode's source: the parent environment is copied FIRST
+            # and appSettings appended after it, and GetEnvironmentVariableW returns the FIRST
+            # match. So a pool-level value WINS over the per-app one - silently.
+            $code = 'IISNODE_POOL_NAME_SHADOWS_APP'; $sev = 'warn'
+            $msg  = "this application's app pool carries an OTEL_SERVICE_NAME that this installer did not write. iisnode copies the pool environment BEFORE appending the application's <appSettings>, and Windows resolves the FIRST entry in the block, so the pool value SHADOWS the per-app one: the application would report under the pool's name whatever appSettings says. Nothing is written, because the per-app name would not take effect. Fix: remove the OTEL_SERVICE_NAME from the pool (it cannot correctly name a shared pool anyway), then re-run"
         }
         'packageMissing' {
             $code = 'IISNODE_PACKAGE_MISSING'; $sev = 'warn'

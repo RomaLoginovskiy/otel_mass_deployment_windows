@@ -276,7 +276,13 @@ try {
             foreach ($w in @($manifest.webConfig)) {
                 if (-not $w) { continue }
                 $phys = Split-Path -Parent $w.path
-                Remove-WebConfigServiceName -PhysicalPath $phys -ExpectedValue $w.setValue -PriorValue $w.priorValue | Out-Null
+                # kind says which element carries the name. Absent on manifests written before
+                # per-app iisnode naming existed, and those only ever wrote <aspNetCore>.
+                if ([string]$w.kind -eq 'appSettings') {
+                    Remove-WebConfigAppSettingServiceName -PhysicalPath $phys -ExpectedValue $w.setValue -PriorValue $w.priorValue | Out-Null
+                } else {
+                    Remove-WebConfigServiceName -PhysicalPath $phys -ExpectedValue $w.setValue -PriorValue $w.priorValue | Out-Null
+                }
             }
         }
         if ($manifest -and $manifest.poolEnv) {
@@ -335,6 +341,11 @@ try {
                 foreach ($r in @($svcMap)) {
                     if ($r.Scope -eq 'webconfig' -and $r.PhysicalPath) {
                         Remove-WebConfigServiceName -PhysicalPath $r.PhysicalPath | Out-Null
+                        # And the per-app iisnode name, which lives in <appSettings> instead. The
+                        # map is built with -SkipRuntimeClassification here, so there is no
+                        # NodeHosting to filter on - the remover is a no-op when the element or the
+                        # entry is absent, which is the case for every non-iisnode app.
+                        Remove-WebConfigAppSettingServiceName -PhysicalPath $r.PhysicalPath | Out-Null
                     }
                 }
             } catch { Write-Warning "[uninstall] could not enumerate IIS apps for web.config cleanup: $_" }
