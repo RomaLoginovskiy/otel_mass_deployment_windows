@@ -113,6 +113,25 @@ $rtLib = Join-Path $script:CxIisHere 'Resolve-IISAppRuntime.ps1'
 if (Test-Path -LiteralPath $rtLib -ErrorAction SilentlyContinue) {
     try { . $rtLib } catch { }
 }
+
+# Node helpers, for iisnode applications - Node hosted BY IIS, whose node.exe is a child of w3wp
+# and inherits the APP POOL's environment. Two things here need them: Test-CxNodeAppIsEsm (without
+# it Resolve-IISAppRuntime answers "CommonJS" for every app, and a CommonJS answer for an ESM app
+# is the silent-zero-telemetry case this doctor exists to catch) and the bootstrap parser below.
+$nodeLib = Join-Path $script:CxIisHere 'Resolve-NodeServiceNames.ps1'
+if (Test-Path -LiteralPath $nodeLib -ErrorAction SilentlyContinue) {
+    try { . $nodeLib } catch { }
+}
+if (-not (Get-Command Get-CxRegisterPathFromNodeOptions -ErrorAction SilentlyContinue)) {
+    function Get-CxRegisterPathFromNodeOptions {
+        param([string] $NodeOptions)
+        if (-not $NodeOptions) { return $null }
+        $m = [regex]::Match($NodeOptions, '--require(?:=|\s+)(?:"([^"]+)"|(\S+))')
+        if (-not $m.Success) { return $null }
+        if ($m.Groups[1].Success) { return $m.Groups[1].Value }
+        return $m.Groups[2].Value
+    }
+}
 if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) {
     function New-Finding {
         param([string]$Check, [string]$Severity, [string]$Code = '', [string]$Message = '', [string]$Target = '', $Data = $null)
@@ -724,6 +743,36 @@ function Test-IISInstrumentation {
                 -Message "-RuntimeOverrides has an entry for '$k' but no such IIS application exists on this host, so that classification is not in force. Usual causes: the key was copied from -ServiceNameOverrides (a different key space - runtime keys are '<Site><virtual path>' with root apps ending in '/'), a typo, or a decommissioned site.")
         }
 
+        # ONE read per application, cached - the loop below needs the state twice (once for the
+        # WEBCONFIG_* findings, once via the classifier) and the iisnode-per-pool tally has to be
+        # complete BEFORE any app is judged, because "can a pool-level OTEL_SERVICE_NAME name this
+        # app" is a question about the pool's other tenants.
+        #
+        # The tally counts apps whose OWN web.config declares iisnode. An app that inherits the
+        # handler from a parent is still classified (and instrumented) correctly, it just does not
+        # add to the count - so a pool shared between a parent and an inheriting child can escape
+        # the sharedPool finding here. Instrument-IIS.ps1 gates on the full records, inheritance
+        # included, so the install decision is not affected; only this report can under-warn.
+        $wcCache      = @{}
+        $iisnodePools = @{}
+        $claimPools   = @{}
+        foreach ($app in $model.Apps) {
+            $st = Get-CxWebConfigRuntimeState -PhysicalPath $app.PhysicalPath
+            $wcCache["$($app.Site)$($app.AppPath)"] = $st
+            if (@($st.NodeEvidence).Count -gt 0) {
+                if ($iisnodePools.ContainsKey($app.Pool)) { $iisnodePools[$app.Pool]++ }
+                else { $iisnodePools[$app.Pool] = 1 }
+            }
+            # Apps that READ OTEL_SERVICE_NAME, whether Node or .NET. Two of these in one pool means
+            # the pool-level name can only be right for one of them - the same gate the installer
+            # applies, so the doctor does not pass an app the installer refused (or the reverse).
+            # Positive evidence only, exactly as the classifier does it.
+            if (@($st.NodeEvidence).Count -gt 0 -or @($st.CoreEvidence).Count -gt 0 -or @($st.FrameworkEvidence).Count -gt 0) {
+                if ($claimPools.ContainsKey($app.Pool)) { $claimPools[$app.Pool]++ }
+                else { $claimPools[$app.Pool] = 1 }
+            }
+        }
+
         foreach ($app in $model.Apps) {
             $label = "$($app.Site)$($app.AppPath)"
 
@@ -732,7 +781,7 @@ function Test-IISInstrumentation {
             # Site - wwwroot ships iisstart.htm and no web.config - look like an ACL problem
             # on every host in the fleet. Kept as its own finding because it describes the
             # FILE, where the classification below describes the APPLICATION.
-            $wc = Get-CxWebConfigRuntimeState -PhysicalPath $app.PhysicalPath
+            $wc = $wcCache[$label]
             if ($wc.State -eq 'unreadable' -or $wc.State -eq 'nopath') {
                 Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
                     -Message "$($wc.Error) - so this application's runtime cannot be determined" `
@@ -777,6 +826,66 @@ function Test-IISInstrumentation {
             }
 
             Add-F (New-IISRuntimeFinding -Record $rt -Target $label)
+
+            # -- iisnode: Node hosted BY IIS ------------------------------------
+            # Graded separately from the .NET verdict because it is a different process. An
+            # iisnode app's node.exe is a CHILD of w3wp and inherits the POOL's environment, so
+            # everything the Node doctor checks on a PM2 app has to be checked here on the pool -
+            # and Test-NodeInstrumentation cannot see these apps at all, because PM2 does not
+            # manage them. Without this block a host could report a clean bill on both doctors
+            # while every iisnode app emitted nothing.
+            if ($rt.NodeHosting -eq 'iisnode') {
+                $poolEnvEff = Get-CxEffectivePoolEnv -Pool $pool -Defaults $model.Defaults
+                $nodeOpts   = if ($poolEnvEff -and $poolEnvEff.ContainsKey('NODE_OPTIONS')) { [string]$poolEnvEff['NODE_OPTIONS'] } else { '' }
+                $reg        = Get-CxRegisterPathFromNodeOptions -NodeOptions $nodeOpts
+                $nodeCount  = if ($iisnodePools.ContainsKey($app.Pool)) { [int]$iisnodePools[$app.Pool] } else { 0 }
+                $claimCount = if ($claimPools.ContainsKey($app.Pool))   { [int]$claimPools[$app.Pool]   } else { 0 }
+
+                if ($nodeCount -gt 1 -or $claimCount -gt 1) {
+                    $detail = if ($nodeCount -gt 1) {
+                        "$nodeCount iisnode applications share pool '$($app.Pool)'"
+                    } else {
+                        "pool '$($app.Pool)' hosts $claimCount applications that read OTEL_SERVICE_NAME (this one plus at least one instrumented .NET application), so a pool-level name would rename one of them"
+                    }
+                    Add-F (New-IISNodeFinding -Outcome 'sharedPool' -Record $rt -Target $label -Detail $detail)
+                }
+                elseif ($rt.NodeIsEsm) {
+                    # Checked BEFORE the bootstrap checks, and it outranks them: an ESM app under
+                    # iisnode returns HTTP 500 to every request (ERR_REQUIRE_ESM in its
+                    # interceptor), so whether a bootstrap is present is not the interesting fact
+                    # about it - and grading it a pass would be a green report on a dead app.
+                    Add-F (New-IISNodeFinding -Outcome 'esmUnsupported' -Record $rt -Target $label)
+                }
+                elseif (-not $nodeOpts -or -not $reg) {
+                    Add-F (New-IISNodeFinding -Outcome 'missing' -Record $rt -Target $label `
+                        -Detail "Pool '$($app.Pool)' has no NODE_OPTIONS=--require <register>")
+                }
+                elseif (-not (Test-Path -LiteralPath $reg -ErrorAction SilentlyContinue)) {
+                    Add-F (New-IISNodeFinding -Outcome 'stalePath' -Record $rt -Target $label `
+                        -Detail "The bootstrap on pool '$($app.Pool)' points at $reg")
+                }
+                elseif (-not (Get-Command Test-CxNodeAppIsEsm -ErrorAction SilentlyContinue)) {
+                    # NodeIsEsm above is only trustworthy when the probe was loadable. Without it
+                    # every app reads as CommonJS - and an ESM app under iisnode is a 500, not a
+                    # silent success, so say the verdict is undetermined rather than pass it.
+                    Add-F (New-Finding -Check 'iisnode' -Severity 'unknown' -Code 'IISNODE_ESM_UNDETERMINED' -Target $label `
+                        -Message "the bootstrap is present on pool '$($app.Pool)', but Resolve-NodeServiceNames.ps1 was not next to this script, so this application's module system could not be determined. iisnode cannot host an ES module at all (ERR_REQUIRE_ESM), so if this one is ESM it is returning HTTP 500 rather than reporting telemetry. Copy the full package and re-run.")
+                }
+                else {
+                    Add-F (New-IISNodeFinding -Outcome 'instrumented' -Record $rt -Target $label)
+                    # Same localhost trap as everywhere else: ::1 first, export silently dropped.
+                    $nodeEp = if ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_EXPORTER_OTLP_ENDPOINT')) { [string]$poolEnvEff['OTEL_EXPORTER_OTLP_ENDPOINT'] } else { '' }
+                    if ($nodeEp -match 'localhost') {
+                        Add-F (New-Finding -Check 'iisnode' -Severity 'warn' -Code 'OTLP_ENDPOINT_LOCALHOST' -Target $label `
+                            -Message "pool '$($app.Pool)' exports to '$nodeEp'; localhost resolves to ::1 first and the OTLP export is silently dropped. Use http://127.0.0.1:4318." `
+                            -Data @{ endpoint = $nodeEp })
+                    }
+                    if (-not ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_SERVICE_NAME') -and $poolEnvEff['OTEL_SERVICE_NAME'])) {
+                        Add-F (New-Finding -Check 'iisnode' -Severity 'warn' -Code 'IISNODE_SERVICE_NAME_MISSING' -Target $label `
+                            -Message "the bootstrap is on pool '$($app.Pool)' but no OTEL_SERVICE_NAME is - its spans land under the SDK default (unknown_service:node)")
+                    }
+                }
+            }
         }
     }
 

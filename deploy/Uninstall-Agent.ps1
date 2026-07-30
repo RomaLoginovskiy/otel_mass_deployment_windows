@@ -126,6 +126,87 @@ function Remove-PoolEnvEntry {
     Write-Host "[uninstall] removed pool env: $Pool / $Name"
 }
 
+function Get-PoolEnvValueRaw {
+    # The current value of an env var on a pool (or on applicationPoolDefaults), or $null.
+    param([string] $Pool, [string] $Name)
+    if (-not $iisPresent -or -not (Test-Path $appHostConfig)) { return $null }
+    try { [xml]$c = Get-Content -LiteralPath $appHostConfig -Raw } catch { return $null }
+    $base = if ($Pool -eq 'applicationPoolDefaults') {
+        "/configuration/system.applicationHost/applicationPools/applicationPoolDefaults"
+    } else {
+        "/configuration/system.applicationHost/applicationPools/add[@name='$Pool']"
+    }
+    $n = $c.SelectSingleNode("$base/environmentVariables/add[@name='$Name']")
+    if (-not $n) { return $null }
+    return [string]$n.GetAttribute('value')
+}
+
+function Set-PoolEnvEntry {
+    # Write half of Remove-PoolEnvEntry. Only used to put an app's OWN NODE_OPTIONS flags back
+    # after our bootstrap has been stripped out of the merged value.
+    param([string] $Pool, [string] $Name, [string] $Value)
+    if (-not $iisPresent) { return }
+    if ($Pool -eq 'applicationPoolDefaults') {
+        & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/-applicationPoolDefaults.environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
+        & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/+applicationPoolDefaults.environmentVariables.[name='$Name',value='$Value']" /commit:apphost | Out-Null
+    } else {
+        & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/-[name='$Pool'].environmentVariables.[name='$Name']" /commit:apphost 2>$null | Out-Null
+        & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/+[name='$Pool'].environmentVariables.[name='$Name',value='$Value']" /commit:apphost | Out-Null
+    }
+    Write-Host "[uninstall] pool env kept, ours stripped: $Pool / $Name=$Value"
+}
+
+function Remove-PoolNodeBootstrap {
+    <#
+      Strip the iisnode bootstrap out of one pool's NODE_OPTIONS.
+
+      NODE_OPTIONS cannot be handled like the other pool variables, and the difference is not
+      cosmetic:
+
+        * Its value is MERGED. Instrument-IIS.ps1 preserves the application's own flags
+          (--max-old-space-size, --tls-*, --icu-data-dir) and appends our bootstrap, so deleting
+          the entry would silently remove the app's heap ceiling during an uninstall. Nothing
+          would report that, and it would surface later as an OOM nobody connects to this.
+        * `preexisted` therefore does NOT mean "not ours". For every other variable, a
+          pre-existing entry means someone else owns it and uninstall must keep its hands off.
+          For NODE_OPTIONS it means the app had flags and we merged into them - skipping it is
+          exactly what leaves the bootstrap behind forever, pointing at a register.js that this
+          uninstall is about to delete.
+
+      So: recompute the value without our tokens. Empty result -> remove the entry. Non-empty ->
+      write the remainder back. Ownership is still enforced, one token at a time, by
+      Remove-CxNodeOptionsBootstrap.
+    #>
+    param([string] $Pool, [string] $InstallPrefix)
+
+    if (-not (Get-Command Remove-CxNodeOptionsBootstrap -ErrorAction SilentlyContinue)) {
+        Write-Warning "[uninstall] Resolve-NodeServiceNames.ps1 is missing, so NODE_OPTIONS on pool '$Pool' was left as-is. Remove our --require/--experimental-loader tokens by hand, or the app preloads a bootstrap that is no longer installed."
+        return $false
+    }
+    $current = Get-PoolEnvValueRaw -Pool $Pool -Name 'NODE_OPTIONS'
+    if (-not $current) { return $false }
+
+    # Exact targets when the package is still on disk - that covers a vendored or renamed copy
+    # under a custom prefix, whose path carries none of the usual markers. When it is already gone
+    # (or the prefix is unknown), the marker fallback inside the helper is what recognises it.
+    $owned = @()
+    if ($InstallPrefix -and (Get-Command Resolve-CxNodeBootstrap -ErrorAction SilentlyContinue)) {
+        try {
+            $b = Resolve-CxNodeBootstrap -InstallPrefix $InstallPrefix
+            $owned = @($b.RegisterPath, $b.HookUrl) | Where-Object { $_ }
+        } catch {}
+    }
+    $cleaned = Remove-CxNodeOptionsBootstrap -Existing $current -OwnedTargets $owned
+    if ($cleaned -eq $current) { return $false }   # nothing of ours in there
+    if ($cleaned) { Set-PoolEnvEntry  -Pool $Pool -Name 'NODE_OPTIONS' -Value $cleaned }
+    else          { Remove-PoolEnvEntry -Pool $Pool -Name 'NODE_OPTIONS' }
+    return $true
+}
+
 function Remove-InstallerOtlpFromAllPools {
     <#
       Value-matched sweep of the installer's OTLP endpoint/protocol env from
@@ -199,8 +280,19 @@ try {
             }
         }
         if ($manifest -and $manifest.poolEnv) {
+            $nodePrefix = if ($manifest.nodeInstallPrefix) { [string]$manifest.nodeInstallPrefix } else { 'C:\cx\otel-node' }
+            $nodeOptDone = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($pe in @($manifest.poolEnv)) {
                 if (-not $pe) { continue }
+                # NODE_OPTIONS first, and regardless of `preexisted` - see Remove-PoolNodeBootstrap
+                # for why that flag means something different for a merged value. Once per pool:
+                # the manifest carries one entry per write, and re-running the strip is wasted work.
+                if ($pe.name -eq 'NODE_OPTIONS') {
+                    if ($nodeOptDone.Add([string]$pe.pool)) {
+                        Remove-PoolNodeBootstrap -Pool $pe.pool -InstallPrefix $nodePrefix | Out-Null
+                    }
+                    continue
+                }
                 if ($pe.preexisted) { Write-Host "[uninstall] keep pre-existing pool env: $($pe.pool) / $($pe.name)"; continue }
                 Remove-PoolEnvEntry -Pool $pe.pool -Name $pe.name
             }
@@ -225,6 +317,13 @@ try {
                 Remove-PoolEnvEntry -Pool $p -Name 'OTEL_SERVICE_NAME'
                 Remove-PoolEnvEntry -Pool $p -Name 'OTEL_EXPORTER_OTLP_ENDPOINT'
                 Remove-PoolEnvEntry -Pool $p -Name 'OTEL_EXPORTER_OTLP_PROTOCOL'
+                # iisnode pools also carry the Node exporter trio and a merged NODE_OPTIONS. The
+                # trio is ours outright; NODE_OPTIONS is token-stripped so the app keeps its own
+                # flags.
+                Remove-PoolEnvEntry -Pool $p -Name 'OTEL_TRACES_EXPORTER'
+                Remove-PoolEnvEntry -Pool $p -Name 'OTEL_METRICS_EXPORTER'
+                Remove-PoolEnvEntry -Pool $p -Name 'OTEL_LOGS_EXPORTER'
+                Remove-PoolNodeBootstrap -Pool $p -InstallPrefix 'C:\cx\otel-node' | Out-Null
             }
             try {
                 # -SkipRuntimeClassification on purpose. Uninstall must clean up names written
