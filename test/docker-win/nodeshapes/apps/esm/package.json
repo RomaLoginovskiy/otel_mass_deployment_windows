@@ -1,8 +1,0 @@
-{
-  "name": "cx-app-esm",
-  "version": "1.0.0",
-  "private": true,
-  "main": "server.js",
-  "type": "module",
-  "//": "\"type\": \"module\" makes server.js an ES module even with a .js extension. This is the shape that fails SILENTLY under --require: the app boots fine and emits nothing. Instrument-NodePM2.ps1 must pick --import here."
-}

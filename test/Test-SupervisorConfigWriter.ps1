@@ -28,7 +28,7 @@
 
   WHY A UNIT TEST AT ALL. Every test\docker-win harness installs with CX_NO_SUPERVISOR=1 (the
   vendor installer cannot fetch the collector MSI in a Server Core container), so the supervisor
-  branch never runs there. Run-NodeShapesTest.ps1 asserts workload.pm2.home=C:\ProgramData\pm2
+  branch never runs there. The container harnesses assert workload.pm2.home=C:\ProgramData\pm2
   where it is PRODUCED, never where it is SERIALIZED. And Coralogix-side checks see the
   collector's own resourcedetection attributes, which say nothing about supervisor config.yaml.
   The VM loop covers the runtime half; this file pins the string rules, which is the half that

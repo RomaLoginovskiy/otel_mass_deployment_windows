@@ -105,29 +105,6 @@ test/docker-win/*
 !test/docker-win/Dockerfile.e2e
 !test/docker-win/entrypoint.e2e.ps1
 
-# Node deployment SHAPE matrix (Run-NodeShapesTest.ps1): every way Node runs on Windows - PM2
-# per-user, PM2 as a service under three accounts, a stopped daemon, bare node.exe, node-as-service,
-# iisnode, and IIS ARR in front of PM2. The scripts and app fixtures are text and belong here; what
-# it needs at BUILD time does not and stays ignored (node.zip, npm-global/, otel-node/,
-# otelcol-contrib.exe, nodeapp/node_modules/, vendor/iis/*.msi - see test/docker-win/README.md).
-!test/docker-win/Run-NodeShapesTest.ps1
-!test/docker-win/Dockerfile.nodeshapes
-!test/docker-win/entrypoint.nodeshapes.ps1
-!test/docker-win/setup-nodeshape.ps1
-!test/docker-win/nodeshapes
-test/docker-win/nodeshapes/*
-!test/docker-win/nodeshapes/collector.nodeshapes.yaml
-!test/docker-win/nodeshapes/pm2-service
-!test/docker-win/nodeshapes/apps
-test/docker-win/nodeshapes/apps/*
-!test/docker-win/nodeshapes/apps/package.json
-!test/docker-win/nodeshapes/apps/cjs
-!test/docker-win/nodeshapes/apps/esm
-!test/docker-win/nodeshapes/apps/mjs
-!test/docker-win/nodeshapes/apps/bare
-!test/docker-win/nodeshapes/apps/iisnode
-!test/docker-win/nodeshapes/apps/arr
-
 !test/docker-win/README.md
 
 # Artifacts the deploy scripts PRODUCE on the host they run on. The package is an

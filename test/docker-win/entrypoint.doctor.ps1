@@ -8,11 +8,8 @@
     * three dedicated-pool sites (Scope='pool'  -> OTEL_SERVICE_NAME on the pool)
     * one shared pool hosting two apps (Scope='webconfig' -> name in web.config),
       which is the only way to exercise the web.config readback
-    * applicationPoolDefaults carrying the OTLP endpoint, with 'localhost'
-      hand-planted so the OTLP_ENDPOINT_LOCALHOST finding fires. This USED to be
-      the shipped default; the instrumenters now default to 127.0.0.1 and rewrite
-      a `localhost` value, so the fault has to be injected deliberately - which is
-      why it is written straight through appcmd below and not via Instrument-IIS.ps1
+    * applicationPoolDefaults carrying the OTLP endpoint, deliberately using the
+      SHIPPED default 'localhost' so the OTLP_ENDPOINT_LOCALHOST finding fires
 
   It does NOT install a collector. Checks 3-7 are therefore expected to report
   FAIL/WARN - that is intentional: those are the failure branches, and this
@@ -85,79 +82,12 @@ foreach ($sub in 'api','admin') {
     }
 }
 
-# --- 2b. runtime-classification fixtures -----------------------------------
-# The container had NO ASP.NET Framework app at all, so nothing exercised "detect
-# Framework from <system.web>, not from the pool's CLR version" - which is the rule that
-# stops a static site on a v4.0 pool being misread as a Framework app and re-claimed in
-# CX_IIS_SERVICES. These three cover the runtimes the shapes above cannot.
-
-# legacy: classic ASP.NET on a CORRECT v4.0 pool -> AspNetFramework / Supported.
-if (-not (Test-Path 'IIS:\AppPools\legacy')) { New-WebAppPool -Name 'legacy' | Out-Null }
-Set-ItemProperty 'IIS:\AppPools\legacy' -Name managedRuntimeVersion -Value 'v4.0'
-New-Item -ItemType Directory -Force -Path 'C:\inetpub\legacy' | Out-Null
-Set-Content -Path 'C:\inetpub\legacy\index.html' -Value '<h1>legacy</h1>' -Encoding utf8
-Set-Content -Path 'C:\inetpub\legacy\web.config' -Encoding utf8 -Value @'
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <system.web>
-    <compilation targetFramework="4.8" />
-  </system.web>
-</configuration>
-'@
-if (-not (Get-Website -Name 'legacy' -ErrorAction SilentlyContinue)) {
-    New-Website -Name 'legacy' -Port 8091 -PhysicalPath 'C:\inetpub\legacy' -ApplicationPool 'legacy' | Out-Null
-}
-
-# staticwc: a web.config that exists but declares no runtime. Kills the "has a web.config
-# therefore .NET" heuristic, and it sits on a No-Managed-Code pool to show the pool setting
-# is not what decides.
-if (-not (Test-Path 'IIS:\AppPools\staticwc')) { New-WebAppPool -Name 'staticwc' | Out-Null }
-Set-ItemProperty 'IIS:\AppPools\staticwc' -Name managedRuntimeVersion -Value ''
-New-Item -ItemType Directory -Force -Path 'C:\inetpub\staticwc' | Out-Null
-Set-Content -Path 'C:\inetpub\staticwc\index.html' -Value '<h1>static</h1>' -Encoding utf8
-Set-Content -Path 'C:\inetpub\staticwc\web.config' -Encoding utf8 -Value @'
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <system.webServer>
-    <staticContent><mimeMap fileExtension=".woff2" mimeType="font/woff2" /></staticContent>
-  </system.webServer>
-</configuration>
-'@
-if (-not (Get-Website -Name 'staticwc' -ErrorAction SilentlyContinue)) {
-    New-Website -Name 'staticwc' -Port 8092 -PhysicalPath 'C:\inetpub\staticwc' -ApplicationPool 'staticwc' | Out-Null
-}
-
-# corepool-defaults: a Core app whose <application> omits applicationPool, so the pool comes
-# from <sites><applicationDefaults>. New-Website always writes the attribute, so clear it
-# afterwards. This carries the applicationDefaults-resolution pin that the stock Default Web
-# Site used to - it can no longer, because it is static and is now correctly left unnamed.
-New-Item -ItemType Directory -Force -Path 'C:\inetpub\corepool-defaults' | Out-Null
-Set-Content -Path 'C:\inetpub\corepool-defaults\index.html' -Value '<h1>corepool</h1>' -Encoding utf8
-Set-Content -Path 'C:\inetpub\corepool-defaults\web.config' -Encoding utf8 -Value @'
-<?xml version="1.0" encoding="utf-8"?>
-<configuration>
-  <system.webServer>
-    <aspNetCore processPath="dotnet" arguments=".\App.dll" hostingModel="inprocess" />
-  </system.webServer>
-</configuration>
-'@
-if (-not (Get-Website -Name 'corepool-defaults' -ErrorAction SilentlyContinue)) {
-    New-Website -Name 'corepool-defaults' -Port 8093 -PhysicalPath 'C:\inetpub\corepool-defaults' | Out-Null
-}
-& $appcmd set config -section:system.applicationHost/sites `
-    "/[name='corepool-defaults'].[path='/'].applicationPool:" /commit:apphost | Out-Null
-
 Write-Host "[iis] sites: $((Get-Website | ForEach-Object Name) -join ', ')"
 
-# --- 3. OTLP defaults, with a hand-planted 'localhost' fault -----------------
-# localhost -> ::1 first on a dual-stack host, the collector listens on IPv4 only,
-# and the export is dropped with no exporter error - a real documented silent-failure
-# mode, so the container reproduces it on purpose and the doctor must warn about it.
-#
-# Written straight through appcmd rather than via Instrument-IIS.ps1: that script now
-# defaults to 127.0.0.1 AND rewrites a `localhost` value it is handed
-# (Resolve-CxOtlpEndpoint), so it can no longer produce this state. Keeping the raw
-# write is what preserves OTLP_ENDPOINT_LOCALHOST detector coverage.
+# --- 3. OTLP defaults, using the SHIPPED default endpoint -------------------
+# Instrument-IIS.ps1 defaults -OtlpEndpoint to http://localhost:4318. That is a real
+# documented silent-failure mode (localhost -> ::1 first, OTLP dropped), so the
+# container reproduces it on purpose and the doctor must warn about it.
 & $appcmd set config -section:system.applicationHost/applicationPools `
     "/-applicationPoolDefaults.environmentVariables.[name='OTEL_EXPORTER_OTLP_ENDPOINT']" /commit:apphost 2>$null | Out-Null
 & $appcmd set config -section:system.applicationHost/applicationPools `
@@ -170,31 +100,20 @@ Write-Host "[iis] sites: $((Get-Website | ForEach-Object Name) -join ', ')"
 # --- 4. per-app OTEL_SERVICE_NAME + CX_IIS_SERVICES via the REAL library ----
 . C:\cx\deploy\Resolve-IISServiceNames.ps1
 $svcMap = Get-IISServiceMap
-# Mirror Instrument-IIS.ps1's membership rule: only apps that classify as .NET are named, and
-# CX_IIS_SERVICES is built from those alone. This fixture produces the state Run-DoctorTest.ps1
-# asserts against, so if it over-claimed here (as it did before runtime classification - the
-# static Default Web Site got a name purely for having its own pool) Test-Agent.ps1 would
-# compute a narrower expected set and every later case would inherit a permanent
-# CX_IIS_SERVICES_DRIFT.
-$namedApps = New-Object System.Collections.ArrayList
 foreach ($r in $svcMap) {
-    if ($r.Instrumentability -eq 'Unsupported' -or $r.Instrumentability -eq 'RequiresOverride') {
-        Write-Host "[names] skip $($r.Site)$($r.AppPath) - $($r.DotNetRuntime)/$($r.Instrumentability)"
-        continue
-    }
     if ($r.Scope -eq 'pool') {
         & $appcmd set config -section:system.applicationHost/applicationPools "/-[name='$($r.Pool)'].environmentVariables.[name='OTEL_SERVICE_NAME']" /commit:apphost 2>$null | Out-Null
         & $appcmd set config -section:system.applicationHost/applicationPools "/+[name='$($r.Pool)'].environmentVariables.[name='OTEL_SERVICE_NAME',value='$($r.ServiceName)']" /commit:apphost | Out-Null
-        [void]$namedApps.Add($r)
     } else {
-        if (Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName) { [void]$namedApps.Add($r) }
+        [void](Set-WebConfigServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName)
     }
 }
-$cxiis = Get-IISServiceLabelValue -Map @($namedApps.ToArray())
+$cxiis = Get-IISServiceLabelValue -Map $svcMap
 [Environment]::SetEnvironmentVariable('CX_IIS_SERVICES', $cxiis, 'Machine')
 $env:CX_IIS_SERVICES = $cxiis
 
-Write-Host "[names] scopes: $((@($svcMap | ForEach-Object { "$($_.ServiceName)=$($_.Scope)/$($_.DotNetRuntime)" })) -join ', ')"
+$perApp = @($svcMap | ForEach-Object { $_.ServiceName } | Select-Object -Unique)
+Write-Host "[names] scopes: $((@($svcMap | ForEach-Object { "$($_.ServiceName)=$($_.Scope)" })) -join ', ')"
 Write-Host "[names] CX_IIS_SERVICES: $cxiis"
 
 # --- 5. other machine env the doctor reads ---------------------------------

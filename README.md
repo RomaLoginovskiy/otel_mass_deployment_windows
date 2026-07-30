@@ -25,7 +25,6 @@ flowchart LR
 | `docs/fleet-deployment.md` | Fleet-scale runbook: build a package, push with BatchPatch, Supervisor mode, workload detection → selector attributes, Fleet Management. |
 | `docs/agent-diagnostics.md` | **When something is wrong on a host.** Read-only diagnostics (`doctor.bat` / `Test-Agent.ps1` / the two instrumentation validators), graded exit codes, and what each finding means. |
 | `docs/iis-e2e-matrix.md` | The IIS shapes and log layouts the end-to-end loop covers — and **every layout that needs a fix or a non-default setting** before telemetry works. |
-| `docs/nodejs-windows-shape-matrix.md` | Every way **Node.js** runs on Windows — PM2 per-user, PM2 as a service under three different accounts, stopped daemon, bare `node.exe`, node-as-a-service, iisnode, IIS ARR → PM2 — which ones get zero-code telemetry, and which are reported out of scope rather than silently assumed. |
 | `deploy/` | The deployment package payload (see below). |
 | `Build-DeploymentPackage.ps1` | Zips `deploy/` into `coralogix-agent-deploy.zip`. |
 | `poc/` | VirtualBox harness to validate the package on a throwaway Windows Server 2025 VM before fleet rollout. |
