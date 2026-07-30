@@ -29,9 +29,14 @@
     * npm install. IIS hosts are frequently offline or proxy-bound; the package must already be
       staged (Instrument-NodePM2.ps1 stages it, or copy a prepared node_modules tree in).
     * PM2. Use Instrument-NodePM2.ps1.
-    * CX_IIS_SERVICES / CX_NODE_SERVICES / CX_SERVICES ownership labels. Use
-      misc\Set-CxServiceLabels.ps1, which owns that shape.
-    * The collector, its config, and its service.
+    * The per-runtime label variables CX_IIS_SERVICES / CX_NODE_SERVICES. Deriving those is
+      misc\Set-CxServiceLabels.ps1's job, and it owns that shape.
+      NOT the same thing as CX_SERVICES: see -RefreshServiceLabels below. Instrumenting an
+      application without adding it to the variable the collector reads produces a host that has
+      spans in APM and claims no ownership for the service - which reads as a Coralogix problem.
+    * The collector's CONFIG. It is restarted (so it re-reads the machine environment) when the
+      label refresh runs, but nothing in its configuration is touched - the config is owned
+      remotely by Fleet Management.
     * The .NET profiler. On a host running another APM agent this matters: the CLR loads exactly
       ONE ICorProfiler, so if something else already occupies that slot in w3wp, attaching a
       second is not double telemetry - it is a conflict. This script never touches those variables.
@@ -52,6 +57,17 @@
   window - but note that until the recycle happens the host reads as instrumented and emits
   nothing, which is the silent state this tooling exists to remove. NEVER runs iisreset: only the
   pools that changed are recycled.
+
+.PARAMETER RefreshServiceLabels
+  With -Apply, add the instrumented application names to machine CX_NODE_SERVICES, republish
+  CX_SERVICES (the union the collector actually reads for host Service ownership), and restart the
+  collector so it re-reads them. Default $true. Suppress with -RefreshServiceLabels:$false to leave
+  every machine variable alone and touch only the app pools.
+
+  Why on by default: the collector's transform reads `${env:CX_SERVICES}`, not the per-runtime
+  slices. An application instrumented without that update reports spans in APM while the HOST
+  entity claims no ownership for it - and every variable involved still looks correct, so there is
+  nothing to notice. The collector reads its environment at process start, hence the restart.
 
 .PARAMETER Pools
   Only these app pools. This is the staged rollout: prove one app end to end, then widen. A
@@ -102,6 +118,7 @@
 param(
     [switch]    $Apply,
     [bool]      $Recycle              = $true,
+    [bool]      $RefreshServiceLabels = $true,
     [string[]]  $Pools,
     [string[]]  $Apps,
     [string]    $InstallPrefix        = 'C:\cx\otel-node',
@@ -411,6 +428,10 @@ foreach ($d in $libDirs) {
         try {
             . $nd
             . $rt
+            # Also Update-CxServicesUnion / Restart-CxCollector, so the label refresh below uses the
+            # same union the deploy path writes rather than a second implementation of it.
+            $wd = Join-Path $d 'Write-DeployLog.ps1'
+            if (Test-Path -LiteralPath $wd -ErrorAction SilentlyContinue) { . $wd }
             $libMode = "libraries from $((Resolve-Path $d).Path)"
             break
         } catch { }
@@ -765,6 +786,110 @@ foreach ($w in $work) {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Stage 3b - host Service ownership labels
+#
+# Writing pool environment instruments the application; it does NOT make the host claim the
+# service. The collector's transform reads ${env:CX_SERVICES} - the union - so an application
+# instrumented without updating that variable reports spans in APM while Infrastructure Explorer
+# shows no ownership for it, with every variable involved still looking correct. That is a silent
+# half-finished state, so this runs by default.
+# ---------------------------------------------------------------------------------------------
+
+Write-Host ''
+Write-Host '--- host ownership labels ---' -ForegroundColor Cyan
+
+$instrumentedNames = @($work | ForEach-Object { [string]$_.Record.ServiceName } | Where-Object { $_ } | Select-Object -Unique)
+if (-not $RefreshServiceLabels) {
+    Write-Step WARN "-RefreshServiceLabels:`$false - CX_NODE_SERVICES / CX_SERVICES were NOT updated, so this host does not claim $(@($instrumentedNames).Count) newly instrumented service(s): $($instrumentedNames -join ', '). They will report in APM with no host ownership." `
+        -Fix 'run misc\Set-CxServiceLabels.ps1 -Apply, or re-run this script without -RefreshServiceLabels:$false'
+} elseif (@($instrumentedNames).Count -eq 0) {
+    Write-Step INFO 'nothing was instrumented, so the label variables need no change'
+} else {
+    # CX_NODE_SERVICES, not CX_IIS_SERVICES: the IIS variable is the .NET/profiler claim set and
+    # Test-Agent.ps1 rebuilds it with that same filter, so a Node name there reports
+    # CX_IIS_SERVICES_DRIFT permanently. UNION with what is there, so PM2 and .NET-service names
+    # already published on this host survive.
+    $priorNode = [Environment]::GetEnvironmentVariable('CX_NODE_SERVICES', 'Machine')
+    $existing  = @()
+    if ($priorNode) { $existing = @($priorNode -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    $union = @(@($existing) + @($instrumentedNames) | Where-Object { $_ } | Select-Object -Unique)
+    $nodeValue = ($union -join ',')
+    if ($nodeValue -eq [string]$priorNode) {
+        Write-Step OK "CX_NODE_SERVICES already lists them: $nodeValue"
+    } else {
+        [Environment]::SetEnvironmentVariable('CX_NODE_SERVICES', $nodeValue, 'Machine')
+        $env:CX_NODE_SERVICES = $nodeValue
+        Write-Step APPLY "CX_NODE_SERVICES=$nodeValue"
+    }
+
+    # The union the collector actually reads. Prefer the shared helper so this script and the
+    # deploy path cannot disagree about ordering or de-duplication; fall back to an inline copy for
+    # a host with no deploy package next to this file.
+    if (Get-Command Update-CxServicesUnion -ErrorAction SilentlyContinue) {
+        $val = Update-CxServicesUnion -RestartCollector -LogPrefix '[labels]'
+        Write-Step APPLY "CX_SERVICES=$val (republished via the deploy helper, collector restarted)"
+    } else {
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $all  = New-Object System.Collections.Generic.List[string]
+        foreach ($v in 'CX_IIS_SERVICES','CX_NODE_SERVICES','CX_DOTNET_SERVICES') {
+            $raw = [Environment]::GetEnvironmentVariable($v, 'Machine')
+            if (-not $raw) { continue }
+            foreach ($n in ($raw -split ',')) { $t = "$n".Trim(); if ($t -and $seen.Add($t)) { [void]$all.Add($t) } }
+        }
+        if ($all.Count) {
+            $val = ($all.ToArray() -join ',')
+            [Environment]::SetEnvironmentVariable('CX_SERVICES', $val, 'Machine')
+            $env:CX_SERVICES = $val
+            Write-Step APPLY "CX_SERVICES=$val (standalone union)"
+        }
+        # The collector reads its environment at process start, so the value above does nothing
+        # until it restarts. Supervisor mode has no collector service - the collector is a child of
+        # opampsupervisor, so restarting the supervisor is what relaunches it.
+        $svc = @(Get-Service -Name 'opampsupervisor','otelcol-contrib' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($svc) {
+            try { Restart-Service -Name $svc[0].Name -Force -ErrorAction Stop; Write-Step APPLY "restarted $($svc[0].Name) so it re-reads the machine environment" }
+            catch { Write-Step WARN "could not restart $($svc[0].Name): $($_.Exception.Message) - it keeps the OLD environment, so the labels have not taken effect yet" -Fix "restart it by hand: Restart-Service $($svc[0].Name) -Force" }
+        } else {
+            Write-Step WARN 'no collector service found, so nothing was restarted - the labels apply when one starts'
+        }
+    }
+
+    # Setting the variable is not the same as the collector USING it: a config that predates
+    # CX_SERVICES support stamps ownership from CX_IIS_SERVICES only, and then a Node service is
+    # published everywhere and claimed nowhere. Measured on a real host, so it is checked here.
+    $cfgs = @(
+        'C:\ProgramData\opampsupervisor\state\effective.yaml',
+        'C:\Program Files\OpenTelemetry OpAMP Supervisor\collector.yaml',
+        'C:\ProgramData\OpenTelemetry\Collector\config.yaml'
+    )
+    # The FIRST READABLE file in precedence order is the verdict, whether it matches or not - the
+    # effective config alone when it exists. Accepting "any config that mentions CX_SERVICES" is
+    # wrong and was measured wrong: on a real host the staged base config had been updated and read
+    # CX_SERVICES while the effective config (base merged with what Fleet Management sends, and
+    # literally otelcol's --config) was the older remote version reading CX_IIS_SERVICES only. The
+    # remote config wins, so consulting the base masks the live behaviour exactly when it matters.
+    $seenCfg  = $null
+    $consumes = $false
+    $isEff    = $false
+    foreach ($c in $cfgs) {
+        if (-not (Test-Path -LiteralPath $c -ErrorAction SilentlyContinue)) { continue }
+        try { $live = (Get-Content -LiteralPath $c | Where-Object { $_ -notmatch '^\s*#' }) -join "`n" } catch { continue }
+        $seenCfg  = $c
+        $consumes = [bool]($live -match 'CX_SERVICES')
+        $isEff    = ($c -eq $cfgs[0])
+        break
+    }
+    if (-not $seenCfg) {
+        Write-Step INFO 'no collector config was readable here, so whether it stamps ownership from CX_SERVICES could not be checked - deploy\Test-Agent.ps1 grades it'
+    } elseif ($consumes) {
+        Write-Step OK "the $(if ($isEff) { 'effective' } else { 'base' }) config in force reads CX_SERVICES ($seenCfg), so the host will claim these services"
+    } else {
+        Write-Step WARN "the collector config in force ($seenCfg) does NOT read `${env:CX_SERVICES} - it stamps host ownership from CX_IIS_SERVICES only (the pre-CX_SERVICES fallback), so these Node services will NOT be claimed by the host no matter how correct the variables are. They still report in APM, which is what makes this look like a Coralogix-side problem." `
+            -Fix $(if ($isEff) { 'that file is the EFFECTIVE config (base merged with what Fleet Management sends), so the fix belongs in the REMOTE config for this host - a newer base config on disk will not override it. Use deploy\config.supervisor.yaml transform/iis_service_labels as the reference: it reads CX_SERVICES and keeps CX_IIS_SERVICES as a fallback' } else { 're-deploy the current template: deploy\config.supervisor.yaml transform/iis_service_labels reads CX_SERVICES and keeps CX_IIS_SERVICES as a fallback' })
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
 # Stage 4 - recycle
 # ---------------------------------------------------------------------------------------------
 
@@ -793,7 +918,7 @@ Write-Host '--- next ---' -ForegroundColor Cyan
 Write-Step INFO 'send a request to each instrumented application - a Node SDK emits its first spans on the first request, so an idle app proves nothing'
 Write-Step INFO 'grade the host: deploy\Test-IISInstrumentation.ps1 (iisnode findings) and deploy\Test-NodeInstrumentation.ps1 (PM2 + the CX_NODE_SERVICES set)'
 Write-Step INFO 'confirm telemetry by QUERY, not by the UI: scripts\Verify-CoralogixNodeSpans.ps1 for the service names above'
-Write-Step INFO 'host Service-ownership labels (CX_NODE_SERVICES / CX_SERVICES) are NOT written by this script - misc\Set-CxServiceLabels.ps1 owns that, and the collector must restart to re-read them'
+Write-Step INFO 'grade the whole host with deploy\Test-Agent.ps1 - it checks CX_SERVICES membership AND whether the collector config in force actually reads it (CX_SERVICES_NOT_CONSUMED)'
 
 Write-Host ''
 $summary = ($script:Counts.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '  '

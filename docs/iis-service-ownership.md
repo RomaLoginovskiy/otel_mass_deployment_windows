@@ -49,6 +49,23 @@ comma-joined. It is the union of the per-workload slices — `CX_IIS_SERVICES` f
 `Instrument-IIS.ps1`, `CX_NODE_SERVICES` from the Node instrumenters, `CX_DOTNET_SERVICES` from
 the .NET service instrumenter — published by `Install-Agent.ps1`.
 
+**Every writer of a slice must republish the union.** `CX_IIS_SERVICES` / `CX_NODE_SERVICES` /
+`CX_DOTNET_SERVICES` are *inputs*; `CX_SERVICES` is the only one the collector reads.
+`Install-Agent.ps1` recomputes it at the end of a full install, so the gap appears when an
+instrumenter runs **on its own** — the slice gains a name, `CX_SERVICES` keeps the old value, and
+the new service has spans in APM while the host claims no ownership for it, with every variable
+looking correct. `Instrument-IIS.ps1` and `Instrument-NodePM2.ps1` therefore call the shared
+`Update-CxServicesUnion` (`Write-DeployLog.ps1`), and restart the collector when they are not
+running under the orchestrator — **the collector reads its environment at process start**, so a
+changed value does nothing until it restarts.
+
+> **Setting the variable is not the same as the collector using it.** A host whose **effective**
+> config predates `CX_SERVICES` support stamps ownership from `CX_IIS_SERVICES` alone, so every
+> non-IIS service is published and claimed by nobody. The effective config is the staged base merged
+> with what Fleet Management sends, and it is what `otelcol` actually runs — a newer base config on
+> disk does not override it. `Test-Agent.ps1` reports this as `CX_SERVICES_NOT_CONSUMED`, decided
+> from the effective config, and says when the fix belongs in the remote config.
+
 > **iisnode apps land in `CX_NODE_SERVICES`, not `CX_IIS_SERVICES`** — even though
 > `Instrument-IIS.ps1` is what writes them. `CX_IIS_SERVICES` is the set instrumented by the .NET
 > profiler, and `Test-Agent.ps1` rebuilds it with that same .NET-only filter, so a Node service in

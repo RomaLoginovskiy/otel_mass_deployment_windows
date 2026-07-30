@@ -821,6 +821,21 @@ if (@($iisnodeApps).Count -gt 0) {
     $env:CX_NODE_SERVICES = $nodeValue
     Write-Host "[iis-instr] set machine CX_NODE_SERVICES=$nodeValue ($(@($nodeNames).Count) iisnode service(s) added to the Node ownership set)" -ForegroundColor Green
 }
+
+# ---- 2b-iv. Republish CX_SERVICES ---------------------------------------------
+# CX_NODE_SERVICES and CX_IIS_SERVICES are INPUTS; the collector reads CX_SERVICES. Writing a slice
+# without republishing the union is invisible: every variable looks right, the service has spans in
+# APM, and the host entity claims no ownership for it. Install-Agent.ps1 recomputes the union at the
+# end of a full install, so this matters for a STANDALONE run of this script - which is exactly how
+# an operator closes a gap on one host.
+#
+# -RestartCollector only when running standalone: under the orchestrator ($Session set) step 4 of
+# Install-Agent.ps1 restarts it once, and restarting twice would drop telemetry for no reason.
+if (Get-Command Update-CxServicesUnion -ErrorAction SilentlyContinue) {
+    Update-CxServicesUnion -Session $Session -RestartCollector:(-not $Session) -LogPrefix '[iis-instr]' | Out-Null
+} else {
+    Write-Warning '[iis-instr] Write-DeployLog.ps1 is missing, so CX_SERVICES was not republished. The collector reads THAT variable for host Service ownership, so these services will not be claimed until it is updated.'
+}
 if ($Session) {
     $Session.Manifest.iisnodeInstrumented = (@($iisnodeApps).Count -gt 0)
     $Session.Manifest.iisnodeApps         = @($iisnodeApps | ForEach-Object { Get-IISAppKey -Site $_.Site -AppPath $_.AppPath })
