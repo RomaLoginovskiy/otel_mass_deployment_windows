@@ -226,6 +226,13 @@ try {
             # Exit 1 means at least one service was refused with a reason, which is information, not
             # a reason to fail the whole install - the reasons are already printed.
             $status.nodeServiceInstrumented = ($LASTEXITCODE -eq 0)
+        } else {
+            # A silent skip here is how an incomplete package passes for a successful install: the
+            # transcript says nothing, the status JSON says nothing, and a fleet reports green while
+            # no Node service on any host was ever instrumented.
+            $status.nodeServiceInstrumented = $null
+            $status.nodeServiceScriptMissing = $true
+            Write-Warning "[agent] Instrument-NodeService.ps1 is missing from the payload - Node.js Windows services (services running node.exe without PM2) were NOT instrumented. Rebuild the package with Build-DeploymentPackage.ps1."
         }
 
         $dotnetSvcScript = Join-Path $here 'Instrument-DotNetService.ps1'

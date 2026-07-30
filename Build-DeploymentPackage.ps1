@@ -58,6 +58,7 @@ $required = @('deploy.bat','uninstall.bat','doctor.bat','Resolve-IISLogPaths.ps1
               'Install-CoralogixSupervisor.ps1','Detect-Workloads.ps1',
               'Instrument-IIS.ps1','Resolve-IISServiceNames.ps1','Resolve-IISAppRuntime.ps1',
               'Instrument-NodePM2.ps1','Resolve-NodeServiceNames.ps1',
+              'Instrument-NodeService.ps1','Instrument-DotNetService.ps1',
               'Backup-Config.ps1','Write-DeployLog.ps1','Resolve-CxRegion.ps1',
               'Test-Agent.ps1','Test-IISInstrumentation.ps1','Test-NodeInstrumentation.ps1',
               'config.supervisor.yaml')
