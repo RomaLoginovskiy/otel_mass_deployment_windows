@@ -140,6 +140,22 @@ try {
     Write-Host "[agent] config backup session -> $($session.Dir)"
 
     # -- 1. Detect workloads ----------------------------------------------------
+    # One -Environment feeds TWO stores that are written by different scripts with
+    # different overwrite rules: Detect-Workloads.ps1 rebuilds OTEL_RESOURCE_ATTRIBUTES
+    # from scratch every run (so omitting the flag DROPS deployment.environment.name from
+    # it), while Install-CoralogixSupervisor.ps1 only rewrites CX_ENVIRONMENT when a value
+    # was actually passed (so it KEEPS the old one). A re-run without the flag therefore
+    # split the host in two: the collector kept stamping the previous label while the
+    # Fleet selector attribute silently vanished. Inherit the persisted value so both
+    # stores always move together. Same fallback idiom as Install-CoralogixSupervisor.ps1,
+    # which reads machine OTEL_RESOURCE_ATTRIBUTES and CORALOGIX_DOMAIN this way.
+    if (-not $Environment) {
+        $Environment = [Environment]::GetEnvironmentVariable('CX_ENVIRONMENT', 'Machine')
+        if ($Environment) {
+            Write-Host "[agent] -Environment not given; inheriting persisted CX_ENVIRONMENT=$Environment"
+        }
+    }
+
     $extra = @{}
     if ($Environment) { $extra['deployment.environment.name'] = $Environment }
     $roles = & (Join-Path $here 'Detect-Workloads.ps1') -SetEnv $true -ExtraAttributes $extra -Session $session
@@ -170,7 +186,7 @@ try {
     if ($Domain) { $supArgs['Domain'] = $Domain }
     if ($NoSupervisor) { $supArgs['NoSupervisor'] = $true }
     if ($PrivateKey) { $supArgs['PrivateKey'] = $PrivateKey } else { $supArgs['KeyFile'] = $KeyFile }
-    # Persist CX_ENVIRONMENT (machine) so the collector's resource/environment
+    # Persist CX_ENVIRONMENT (machine) so the collector's transform/environment
     # processor stamps the env label onto all signals.
     if ($Environment) { $supArgs['Environment'] = $Environment }
     # Persist CX_APPLICATION (machine) so transform/appname stamps service.namespace.
