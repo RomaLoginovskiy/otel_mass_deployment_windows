@@ -1,0 +1,19 @@
+# Extra Node processes to leave alone, one regex per line. Matched against the process command line and
+# the process name, case-insensitively, IN ADDITION to the built-in defaults in
+# Resolve-NodeServiceNames.ps1 (Test-CxNodeProcessBlocked).
+#
+# This file exists because the reference agent keeps the same thing in configuration rather than in code
+# (ruxitagentproc.conf [blocklist], with app and exe filters): the list is site-specific and an operator
+# needs to extend it without editing a script.
+#
+# ANCHOR YOUR PATTERNS. A bare word like `npm` also matches an application called
+# "npm-dashboard", which would then silently never be instrumented. Prefer a path separator or a word
+# boundary, e.g.  [\\/]my-build-tool\b
+#
+# Built-in defaults already cover: npm, npx, corepack, yarn, pnpm, the PM2 daemon and CLI, the
+# node-windows service wrapper, tsc, webpack, jest, eslint and nodemon. Processes running under
+# --inspect, and `node -e`/`--eval`/`-p`/`--print`/`-i` (no entry script), are always skipped.
+#
+# Examples - uncomment and adapt:
+# [\\/]internal-migration-runner\.js\b
+# [\\/]tools[\\/]codegen([\\/]|\.js\b)

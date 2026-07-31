@@ -190,7 +190,8 @@ function Get-IISServiceMap {
 
                 $rt = Resolve-IISAppRuntime -PhysicalPath $r.PhysicalPath `
                     -PoolManagedRuntimeVersion $mrv -PoolFound ($poolClr.Contains($r.Pool)) `
-                    -AncestorPhysicalPaths $ancPaths -InheritedFromLabels $ancLabels -Override $ov
+                    -AncestorPhysicalPaths $ancPaths -InheritedFromLabels $ancLabels -Override $ov `
+                    -Pool $r.Pool
 
                 $r.DotNetRuntime             = $rt.DotNetRuntime
                 $r.Instrumentability         = $rt.Instrumentability

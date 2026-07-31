@@ -23,6 +23,11 @@
   profilerMalformed  write an Environment REG_MULTI_SZ containing an empty entry
   profilerStalePath  register a profiler whose DLL path does not exist
   profilerClear      remove the W3SVC Environment value entirely
+  profilerForeign    register ANOTHER vendor's profiler CLSID + DLL path (simulates a host
+                     where third-party APM agents owns the one CLR profiler slot)
+  profilerPathHijack keep OUR CLSID but point *_PROFILER_PATH_64 outside OTEL_DOTNET_AUTO_HOME
+                     (the silent shape: the CLR loads that DLL, asks for our CLSID, gets nothing)
+  profilerRestore    put a correct, self-consistent registration back
   logDirCustom       point a site's access logs at a non-default directory
   restoreLogDir      undo logDirCustom
   logFormatIis       switch a site from W3C to the IIS log format
@@ -40,6 +45,7 @@ param(
     [ValidateSet('inspect','clearIisServices','staleIisServices','restoreIisServices',
                  'poolManagedRuntime','restorePoolRuntime','poolEnvStale',
                  'profilerMalformed','profilerStalePath','profilerClear',
+                 'profilerForeign','profilerPathHijack','profilerRestore',
                  'logDirCustom','restoreLogDir','logFormatIis','logDisabled',
                  'logCentralW3C','restoreLogCentral','clearLogSlots')]
     [string] $Case,
@@ -149,6 +155,67 @@ switch ($Case) {
     'profilerClear' {
         Remove-ItemProperty -Path $w3svcKey -Name Environment -ErrorAction SilentlyContinue
         Write-Host 'W3SVC Environment removed'
+    }
+
+    'profilerForeign' {
+        # The registration half of the foreign-agent host shape measured on cx-e2e-c1: somebody else's
+        # CLSID in the slot, so ours can never attach. Only the REGISTRATION is simulated - no
+        # foreign profiler is actually loaded into w3wp, because that would mean shipping a working
+        # ICorProfiler. So this case proves PROFILER_FOREIGN_OWNER fires and names the vendor from
+        # the DLL path; the in-process half (PROFILER_NOT_LOADED_IN_PROCESS with a foreign module
+        # named) is only reachable on a host that really runs another agent.
+        #
+        # The path is BUILT FROM the signature file rather than hardcoded, so this fixture cannot
+        # drift from what the doctor actually matches on, and no vendor string lives in the test.
+        $sig = Join-Path $PSScriptRoot '..\..\deploy\cx-foreign-apm.json'
+        $row = $null
+        if (Test-Path -LiteralPath $sig) {
+            $row = @((Get-Content -LiteralPath $sig -Raw | ConvertFrom-Json).vendors |
+                        Where-Object { $_.installDir })[0]
+        }
+        if (-not $row) { throw "cannot build the foreign-profiler fixture: no vendor with an installDir in $sig" }
+        $fake = Join-Path $row.installDir 'agent\lib64\foreignprofiler.dll'
+        $expectVendor = $row.name
+        Set-ItemProperty -Path $w3svcKey -Name Environment -Type MultiString -Value @(
+            'CORECLR_ENABLE_PROFILING=1'
+            'CORECLR_PROFILER={B7038F67-52FC-4DA2-AB02-969B3C1EDA03}'
+            "CORECLR_PROFILER_PATH_64=$fake"
+            'OTEL_DOTNET_AUTO_HOME=C:\Program Files\OpenTelemetry .NET AutoInstrumentation'
+        )
+        Write-Host "W3SVC now registers a FOREIGN profiler CLSID pointing at $fake"
+        Write-Host "  expect: PROFILER_FOREIGN_OWNER (fail), vendor hint `"$expectVendor`""
+    }
+
+    'profilerPathHijack' {
+        # Our CLSID, another agent's library. Silent on a real host: the CLR loads that DLL, asks it
+        # for our CLSID, gets nothing back and attaches NO profiler - with every variable reading as
+        # configured. The *_PATH_64 name outranks the unsuffixed one, which is how a leftover from a
+        # previously-installed agent produces this.
+        $autoHome = 'C:\Program Files\OpenTelemetry .NET AutoInstrumentation'
+        Set-ItemProperty -Path $w3svcKey -Name Environment -Type MultiString -Value @(
+            'CORECLR_ENABLE_PROFILING=1'
+            'CORECLR_PROFILER={918728DD-259F-4A6A-AC2B-B85E1B658318}'
+            'CORECLR_PROFILER_PATH_64=C:\Program Files\newrelic\netcore\NewRelic.Profiler.dll'
+            "OTEL_DOTNET_AUTO_HOME=$autoHome"
+        )
+        Write-Host 'W3SVC keeps OUR CLSID but *_PATH_64 points at a foreign library'
+        Write-Host '  expect: PROFILER_PATH_FOREIGN (fail)'
+    }
+
+    'profilerRestore' {
+        # Self-consistent registration: our CLSID, our library, under our AUTO_HOME. Whether the
+        # DLL exists depends on the image having run the installer; the doctor grades the path
+        # separately (PROFILER_PATH_MISSING), which is the point - registration and presence are
+        # different findings.
+        $autoHome = 'C:\Program Files\OpenTelemetry .NET AutoInstrumentation'
+        Set-ItemProperty -Path $w3svcKey -Name Environment -Type MultiString -Value @(
+            'CORECLR_ENABLE_PROFILING=1'
+            'CORECLR_PROFILER={918728DD-259F-4A6A-AC2B-B85E1B658318}'
+            "CORECLR_PROFILER_PATH_64=$autoHome\win-x64\OpenTelemetry.AutoInstrumentation.Native.dll"
+            "CORECLR_PROFILER_PATH_32=$autoHome\win-x86\OpenTelemetry.AutoInstrumentation.Native.dll"
+            "OTEL_DOTNET_AUTO_HOME=$autoHome"
+        )
+        Write-Host 'W3SVC profiler registration restored to ours'
     }
 
     # ---- IIS access-log placement ------------------------------------------
