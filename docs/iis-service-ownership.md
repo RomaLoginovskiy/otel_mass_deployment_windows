@@ -188,13 +188,13 @@ transform/iis_service_labels:
   # so a host installed before the union variable existed keeps its IIS ownership.
 ```
 
-Wired into the two logs-signal pipelines, immediately after `resource/environment`:
+Wired into the two logs-signal pipelines, immediately after `transform/environment`:
 
 ```yaml
 logs:
-  processors: [ …, resource/environment, transform/iis_service_labels, transform/reduce, transform/iis, batch ]
+  processors: [ …, transform/environment, transform/iis_service_labels, transform/reduce, transform/iis, batch ]
 logs/resource_catalog:
-  processors: [ …, resource/environment, transform/iis_service_labels, resourcedetection/entity, resourcedetection/region, transform/entity-event ]
+  processors: [ …, transform/environment, transform/iis_service_labels, resourcedetection/entity, resourcedetection/region, transform/entity-event ]
 ```
 
 - `logs` carries Windows Event Log and IIS access logs.
