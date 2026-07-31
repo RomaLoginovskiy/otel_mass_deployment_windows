@@ -59,6 +59,12 @@ Typing **any** argument skips the environment-variable block entirely. Mixing th
 the same parameter twice, which PowerShell rejects outright ("parameter is specified more than
 once") — the script would never run and the fleet tool would show a red row with no diagnostics.
 
+When arguments are given, `deploy.bat` **names every variable it is therefore ignoring** on stderr
+and continues. It does not fail: a host that meant to pass arguments and happens to carry a stale
+variable still deserves its deploy. The warning exists because the drop used to be silent, and
+`set CX_ENVIRONMENT=prod && deploy.bat -Region eu2` would deploy with no environment label at all
+while exiting 0.
+
 | Variable | Becomes |
 | --- | --- |
 | `CORALOGIX_PRIVATE_KEY` | `-PrivateKey <value>` |
@@ -83,7 +89,7 @@ and records every config it changes.
 | `-Domain` | string | none | Full ingress domain for a private endpoint. Wins over `-Region`, taken verbatim, not validated against the region list. |
 | `-KeyFile` | string | `SendDataKey.txt` beside the script | **Path** to a file holding the Send-Your-Data key. |
 | `-PrivateKey` | string | none | The key **value**. Overrides `-KeyFile`. |
-| `-Environment` | string | none | `deployment.environment.name` for this host, e.g. `prod`. |
+| `-Environment` | string | none | `deployment.environment.name` for this host, e.g. `prod`. Omit it on a re-run and the persisted machine `CX_ENVIRONMENT` is inherited, so the two stores that hold this label cannot drift apart. |
 | `-Application` | string | none | Coralogix application name for this host. Omit to fall back to the host's own name. |
 | `-NoSupervisor` | switch | off | Install the plain `otelcol-contrib` service with a local config instead of the OpAMP Supervisor. Affects only the vendor-installer arguments. |
 | `-SkipInstrument` | switch | off | Install the collector and leave IIS/Node/.NET services alone. |

@@ -72,6 +72,7 @@ Not variables — finding codes the doctor emits *about* the variables above. Fu
 | `CX_IIS_SERVICES_DRIFT` | Set, but does not match the apps present (set comparison). |
 | `CX_SERVICES_MISSING` / `CX_SERVICES_DRIFT` | The union is unset, or disagrees with its slices. |
 | `CX_ENVIRONMENT_MISSING` | Unset, so this host's telemetry is labelled `unspecified`. |
+| `CX_ENVIRONMENT_MISMATCH` | `CX_ENVIRONMENT` and the `deployment.environment.name` inside `OTEL_RESOURCE_ATTRIBUTES` disagree — one host reporting two environment identities. |
 
 ## Collector runtime variables
 

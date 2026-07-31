@@ -155,14 +155,20 @@ tag *all* of that host's telemetry with the deployment environment, so Coralogix
 `prod`, `staging` and `dev` in Infrastructure Explorer and APM.
 
 - Persisted as a machine variable by `Install-CoralogixSupervisor.ps1`.
-- The base config's `resource/environment` processor upserts it — from
-  `${env:CX_ENVIRONMENT:-unspecified}` — onto every pipeline: host metrics and logs, IIS logs,
-  application spans, **and** the Infrastructure Explorer host entity — under three keys:
-  `tags.cx_environment`, `tags.cx_env`, and the OTel semantic-convention
+- The base config's `transform/environment` processor stamps it onto every pipeline: host metrics
+  and logs, IIS logs, application spans, **and** the Infrastructure Explorer host entity — under
+  three keys: `tags.cx_environment`, `tags.cx_env`, and the OTel semantic-convention
   `deployment.environment.name`.
-- Unset becomes `unspecified`, so a forgotten host is obvious rather than silently "production".
+- When `CX_ENVIRONMENT` **is** set, the host value wins over anything an application supplied for
+  itself. When it is **not** set, the processor fills `unspecified` only where nothing else has
+  claimed the key — so a forgotten host is still obvious rather than silently "production", but an
+  application that labelled itself keeps its own answer instead of having it overwritten.
 - The same value is fed to the OpAMP AgentDescription, so you can group by environment in Fleet
   Management.
+- Two stores hold this label: machine `CX_ENVIRONMENT` and `deployment.environment.name` inside
+  machine `OTEL_RESOURCE_ATTRIBUTES`. A re-run that omits the flag inherits the persisted value
+  rather than clearing one of them, and `doctor.bat` reports `CX_ENVIRONMENT_MISMATCH` if they
+  ever disagree.
 
 ## Application naming
 
