@@ -323,23 +323,73 @@ processors:
       - '"${env:CX_APPLICATION:-}" != ""'
       statements:
       - set(resource.attributes["service.namespace"], "${env:CX_APPLICATION:-}") where resource.attributes["service.namespace"] == nil
-  # Per-host environment label (production/staging/dev/...). The deploy scripts set
-  # the machine env var CX_ENVIRONMENT; this stamps it under both the Coralogix
-  # visible-tag keys (cx_environment/cx_env) and the OTel semconv key so it drives
-  # Infra Explorer labels AND the native environment facet. upsert so the host value
-  # wins over any app-supplied value. Default "unspecified" makes a host that forgot
-  # to set it obvious rather than silently mislabeled "production".
-  resource/environment:
-    attributes:
-    - action: upsert
-      key: tags.cx_environment
-      value: ${env:CX_ENVIRONMENT:-unspecified}
-    - action: upsert
-      key: tags.cx_env
-      value: ${env:CX_ENVIRONMENT:-unspecified}
-    - action: upsert
-      key: deployment.environment.name
-      value: ${env:CX_ENVIRONMENT:-unspecified}
+  # Per-host environment label (production/staging/dev/...). The deploy scripts set the
+  # machine env var CX_ENVIRONMENT; this stamps it under both the Coralogix visible-tag
+  # keys (cx_environment/cx_env) and the OTel semconv key, so it drives Infra Explorer
+  # labels AND the native environment facet.
+  #
+  # Two branches, because one unconditional upsert of "${env:CX_ENVIRONMENT:-unspecified}"
+  # was destructive: on a host where CX_ENVIRONMENT is unset it OVERWROTE a correct label
+  # the app had supplied through its own OTEL_RESOURCE_ATTRIBUTES with the literal string
+  # "unspecified". resourcedetection/env runs first and is deliberately override: false so
+  # that an app-supplied value survives - and this processor then threw it away anyway.
+  #   set   -> the host label wins over any app-supplied value (the documented intent).
+  #   unset -> fill "unspecified" ONLY where nothing else claimed the key, so a host that
+  #            forgot the flag is still obvious rather than silently "production", while an
+  #            app that did label itself keeps its own answer.
+  #
+  # This must be a transform, not an attributes/resource processor: confmap turns a
+  # whole-string "${env:X:-}" into nil and the processor then fails to start, taking the
+  # collector with it. The conditions are the same guard shape as transform/appname above.
+  # All three of log_/metric_/trace_statements must be present - omitting trace_statements
+  # leaves every span untagged, and does so silently.
+  transform/environment:
+    error_mode: silent
+    log_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_ENVIRONMENT:-}" != ""'
+      statements:
+      - set(resource.attributes["tags.cx_environment"], "${env:CX_ENVIRONMENT:-}")
+      - set(resource.attributes["tags.cx_env"], "${env:CX_ENVIRONMENT:-}")
+      - set(resource.attributes["deployment.environment.name"], "${env:CX_ENVIRONMENT:-}")
+    - context: resource
+      conditions:
+      - '"${env:CX_ENVIRONMENT:-}" == ""'
+      statements:
+      - set(resource.attributes["tags.cx_environment"], "unspecified") where resource.attributes["tags.cx_environment"] == nil
+      - set(resource.attributes["tags.cx_env"], "unspecified") where resource.attributes["tags.cx_env"] == nil
+      - set(resource.attributes["deployment.environment.name"], "unspecified") where resource.attributes["deployment.environment.name"] == nil
+    metric_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_ENVIRONMENT:-}" != ""'
+      statements:
+      - set(resource.attributes["tags.cx_environment"], "${env:CX_ENVIRONMENT:-}")
+      - set(resource.attributes["tags.cx_env"], "${env:CX_ENVIRONMENT:-}")
+      - set(resource.attributes["deployment.environment.name"], "${env:CX_ENVIRONMENT:-}")
+    - context: resource
+      conditions:
+      - '"${env:CX_ENVIRONMENT:-}" == ""'
+      statements:
+      - set(resource.attributes["tags.cx_environment"], "unspecified") where resource.attributes["tags.cx_environment"] == nil
+      - set(resource.attributes["tags.cx_env"], "unspecified") where resource.attributes["tags.cx_env"] == nil
+      - set(resource.attributes["deployment.environment.name"], "unspecified") where resource.attributes["deployment.environment.name"] == nil
+    trace_statements:
+    - context: resource
+      conditions:
+      - '"${env:CX_ENVIRONMENT:-}" != ""'
+      statements:
+      - set(resource.attributes["tags.cx_environment"], "${env:CX_ENVIRONMENT:-}")
+      - set(resource.attributes["tags.cx_env"], "${env:CX_ENVIRONMENT:-}")
+      - set(resource.attributes["deployment.environment.name"], "${env:CX_ENVIRONMENT:-}")
+    - context: resource
+      conditions:
+      - '"${env:CX_ENVIRONMENT:-}" == ""'
+      statements:
+      - set(resource.attributes["tags.cx_environment"], "unspecified") where resource.attributes["tags.cx_environment"] == nil
+      - set(resource.attributes["tags.cx_env"], "unspecified") where resource.attributes["tags.cx_env"] == nil
+      - set(resource.attributes["deployment.environment.name"], "unspecified") where resource.attributes["deployment.environment.name"] == nil
   # ---- IIS service labels on INFRASTRUCTURE data only (metrics + logs/resource_catalog) ----
   # Stamps the service(s) running on IIS onto host telemetry, so Coralogix Infrastructure
   # Explorer -> Ownership -> Service can populate on a bare Windows/IIS host (no EC2/Azure
@@ -824,7 +874,7 @@ service:
       - resourcedetection/env
       - resource/metadata
       - transform/appname
-      - resource/environment
+      - transform/environment
       - transform/iis_service_labels
       - transform/reduce
       - transform/iis
@@ -842,7 +892,7 @@ service:
       - memory_limiter
       - resource/metadata
       - transform/appname
-      - resource/environment
+      - transform/environment
       - transform/iis_service_labels
       - resourcedetection/entity
       - resourcedetection/region
@@ -858,7 +908,7 @@ service:
       - resourcedetection/env
       - resource/metadata
       - transform/appname
-      - resource/environment
+      - transform/environment
       - transform/spanmetrics
       - transform/reduce
       - transform/prometheus
@@ -901,7 +951,7 @@ service:
       - resourcedetection/env
       - resource/metadata
       - transform/appname
-      - resource/environment
+      - transform/environment
       - transform/spanmetrics
       - redaction/spanname
       - transform/reduce
