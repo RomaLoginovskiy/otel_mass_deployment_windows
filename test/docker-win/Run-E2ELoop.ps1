@@ -25,6 +25,7 @@
     P3  failures      F1..F7: break -> doctor names it -> fix -> green again
     P4  telemetry     spans / logs / metrics actually in Coralogix
     P5  idempotency   a second deploy.bat changes nothing
+    P6  environment   the environment label reaches both stores, and stays there
 
   WHAT IS EXPECTED TO BE IMPERFECT, and is asserted as such rather than hidden:
   the `legacy` (ASP.NET Framework) and `nocfg` (shared pool, no web.config) apps
@@ -122,12 +123,17 @@ function Invoke-Deploy {
     <#
       The thing under test. Runs deploy.bat exactly as BatchPatch would, with the
       same env-var switches an operator would set in the remote command.
+
+      -BatArgs passes command-line arguments as well. deploy.bat treats arguments and
+      env vars as mutually exclusive - any argument makes it skip the whole env-var
+      block - so this is how the "arguments given, variables ignored" path gets tested.
     #>
-    param([hashtable] $Env = @{})
+    param([hashtable] $Env = @{}, [string[]] $BatArgs = @())
     $a = @('exec')
     foreach ($k in $Env.Keys) { $a += @('-e', "$k=$($Env[$k])") }
     $a += @('-e', "CORALOGIX_PRIVATE_KEY=$PrivateKey", '-e', "CORALOGIX_DOMAIN=$Domain")
     $a += @($Container, 'cmd', '/c', 'C:\cx\deploy\deploy.bat')
+    if ($BatArgs.Count) { $a += $BatArgs }
     $out = & docker @a 2>&1 | Out-String
     return @{ Out = $out; Code = $LASTEXITCODE }
 }
@@ -310,6 +316,19 @@ if (Use-Case 'P1') {
         -Expect @('-Config') -Reject @('-SupervisorCollectorBaseConfig')
     $r2 = Invoke-Exec "Test-Path 'C:\cx\deploy\config.recommended.yaml'"
     Assert-True 'recommended config produced into the script folder' ($r2.Out.Trim() -eq 'True')
+
+    # The environment label, in BOTH stores that persist it - the collector stamps host
+    # and infra signals from CX_ENVIRONMENT, while the app SDKs and the Fleet selector
+    # read deployment.environment.name out of OTEL_RESOURCE_ATTRIBUTES. Asserted here
+    # rather than behind the MSI branch below because the deploy writes both before the
+    # vendor installer is ever reached, so these hold even in an image that cannot
+    # download the collector.
+    $envMachine = Invoke-Exec "[Environment]::GetEnvironmentVariable('CX_ENVIRONMENT','Machine')"
+    Assert-True 'CX_ENVIRONMENT persisted at machine scope' ($envMachine.Out.Trim() -eq 'e2e') `
+        "got '$($envMachine.Out.Trim())'"
+    $envAttrs = Invoke-Exec "[Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES','Machine')"
+    Assert-True 'deployment.environment.name reached OTEL_RESOURCE_ATTRIBUTES' `
+        ($envAttrs.Out -match 'deployment\.environment\.name=e2e') $envAttrs.Out.Trim()
 
     # Decide from the REAL outcome, not the pre-probe. Only the vendor installer's
     # own MSI-download error counts as environmental; anything else is a defect and
@@ -562,6 +581,51 @@ if (Use-Case 'P5') {
 [xml]$x = Get-Content 'C:\Windows\System32\inetsrv\config\applicationHost.config' -Raw; ($x.SelectNodes('//applicationPools/add/environmentVariables/add') | Group-Object { $_.ParentNode.ParentNode.GetAttribute('name') + '/' + $_.GetAttribute('name') } | Where-Object { $_.Count -gt 1 } | Measure-Object).Count
 '@)
     Assert-True 'no duplicate pool env entries after two runs' ($dupes.Out.Trim() -eq '0') $dupes.Out.Trim()
+}
+
+# ---------------------------------------------------------------------------
+# P6. Environment label propagation
+# ---------------------------------------------------------------------------
+# Regression cover for two silent failures. Neither was visible from the outside: the
+# deploy exited 0 and the doctor reported CX_ENVIRONMENT 'pass' while the label had
+# either vanished from one of the two stores or never been forwarded at all.
+if (Use-Case 'P6') {
+    Write-Host ''
+    Write-Host '== P6. environment label propagation ==' -ForegroundColor Cyan
+
+    # Everything below is relative to the state P1 left behind.
+    $pre = Invoke-Exec "[Environment]::GetEnvironmentVariable('CX_ENVIRONMENT','Machine')"
+    if ($pre.Out.Trim() -ne 'e2e') {
+        Skip-Case 'environment label propagation' `
+            "P1 did not leave CX_ENVIRONMENT=e2e (got '$($pre.Out.Trim())'), so there is no baseline to compare against"
+    } else {
+        # -- a. a re-run that omits the label must not change it -------------------
+        # Detect-Workloads.ps1 rebuilds OTEL_RESOURCE_ATTRIBUTES from scratch on every
+        # run, while the supervisor installer only rewrites CX_ENVIRONMENT when a value
+        # was passed. So a re-run without the flag used to DROP
+        # deployment.environment.name while CX_ENVIRONMENT kept the old value - one
+        # host, two environment identities, no finding anywhere.
+        $null = Invoke-Deploy -Env @{ CX_NO_SUPERVISOR = '1' }
+        $a1 = Invoke-Exec "[Environment]::GetEnvironmentVariable('CX_ENVIRONMENT','Machine')"
+        Assert-True 'CX_ENVIRONMENT survives a re-run that omits it' ($a1.Out.Trim() -eq 'e2e') `
+            "got '$($a1.Out.Trim())'"
+        $a2 = Invoke-Exec "[Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES','Machine')"
+        Assert-True 'deployment.environment.name survives a re-run that omits it' `
+            ($a2.Out -match 'deployment\.environment\.name=e2e') $a2.Out.Trim()
+
+        # -- b. arguments given, so the env vars are ignored - and named ------------
+        # The two channels cannot be merged: a duplicate -Domain makes PowerShell fail
+        # parameter binding outright and the script never runs. So the rule stays; what
+        # changed is that deploy.bat now names what it discarded instead of discarding
+        # it in silence. Exit code is deliberately not asserted - no key is passed as an
+        # argument here, so the install itself is not expected to get far.
+        $b = Invoke-Deploy -Env @{ CX_ENVIRONMENT = 'must-be-reported' } -BatArgs @('-SkipInstrument')
+        Assert-Case -Name 'deploy.bat names the env vars an argument discards' -Result $b `
+            -Expect @('are IGNORED', 'CX_ENVIRONMENT')
+        $b2 = Invoke-Exec "[Environment]::GetEnvironmentVariable('CX_ENVIRONMENT','Machine')"
+        Assert-True 'the discarded CX_ENVIRONMENT was not applied' ($b2.Out.Trim() -ne 'must-be-reported') `
+            "got '$($b2.Out.Trim())'"
+    }
 }
 
 # ---------------------------------------------------------------------------
