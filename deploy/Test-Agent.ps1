@@ -189,8 +189,9 @@ if (-not (Get-Command Get-CxAppHostConfigPath -ErrorAction SilentlyContinue)) {
 
 if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) {
     function New-Finding {
-        param([string]$Check, [string]$Severity, [string]$Code = '', [string]$Message = '', [string]$Target = '', $Data = $null)
-        [pscustomobject]@{ check = $Check; severity = $Severity; code = $Code; target = $Target; message = $Message; data = $Data }
+        param([string]$Check, [string]$Severity, [string]$Code = '', [string]$Message = '', [string]$Target = '', $Data = $null,
+              [string]$Verified = 'none')
+        [pscustomobject]@{ check = $Check; severity = $Severity; code = $Code; target = $Target; message = $Message; data = $Data; verified = $Verified }
     }
     function Get-GradedExitCode {
         param([object[]]$Findings)
@@ -293,11 +294,11 @@ $cxIisServices = Get-MachineVar 'CX_IIS_SERVICES'
 if (Use-Check 'env') {
     $privateKey = Get-MachineVar 'CORALOGIX_PRIVATE_KEY'
     if (-not $privateKey) {
-        Add-F (New-Finding -Check 'env' -Severity 'fail' -Code 'PRIVATE_KEY_MISSING' -Target 'CORALOGIX_PRIVATE_KEY' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'fail' -Code 'PRIVATE_KEY_MISSING' -Target 'CORALOGIX_PRIVATE_KEY' `
             -Message 'not set at machine scope - the collector cannot authenticate and nothing reaches Coralogix')
     } else {
         # Never print the key. Length only, as proof of presence.
-        Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CORALOGIX_PRIVATE_KEY' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CORALOGIX_PRIVATE_KEY' `
             -Message "present ($($privateKey.Length) chars)" -Data @{ length = $privateKey.Length })
     }
 
@@ -306,7 +307,7 @@ if (Use-Check 'env') {
     # config decides" - it is "this host silently ships to eu1".
     $domain = Get-MachineVar 'CORALOGIX_DOMAIN'
     if (-not $domain) {
-        Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'DOMAIN_MISSING' -Target 'CORALOGIX_DOMAIN' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'DOMAIN_MISSING' -Target 'CORALOGIX_DOMAIN' `
             -Message 'not set - the config default applies and this host ships to eu1. Re-deploy with -Region <code> (or CX_REGION), or -Domain / CX_DOMAIN for a private ingress, if that is not the account.')
     } else {
         # Name the region when the domain is one Coralogix publishes; flag it when it is
@@ -314,10 +315,10 @@ if (Use-Check 'env') {
         # the collector reports healthy either way.
         $regionCode = if (Get-Command Get-CxRegionForDomain -ErrorAction SilentlyContinue) { Get-CxRegionForDomain -Domain $domain } else { $null }
         if ($regionCode) {
-            Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CORALOGIX_DOMAIN' `
+            Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CORALOGIX_DOMAIN' `
                 -Message "$domain (region $regionCode)" -Data @{ domain = $domain; region = $regionCode })
         } else {
-            Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'DOMAIN_NOT_A_KNOWN_REGION' -Target 'CORALOGIX_DOMAIN' `
+            Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'DOMAIN_NOT_A_KNOWN_REGION' -Target 'CORALOGIX_DOMAIN' `
                 -Message "$domain is not a published Coralogix region domain - data goes to ingress.$domain. Expected for a private ingress (-Domain / CX_DOMAIN); a typo in that value otherwise." `
                 -Data @{ domain = $domain })
         }
@@ -325,18 +326,18 @@ if (Use-Check 'env') {
 
     $environment = Get-MachineVar 'CX_ENVIRONMENT'
     if (-not $environment) {
-        Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISSING' -Target 'CX_ENVIRONMENT' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISSING' -Target 'CX_ENVIRONMENT' `
             -Message "not set - all telemetry from this host is labelled 'unspecified'")
     } else {
-        Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_ENVIRONMENT' -Message $environment)
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CX_ENVIRONMENT' -Message $environment)
     }
 
     $attrs = Get-MachineVar 'OTEL_RESOURCE_ATTRIBUTES'
     if (-not $attrs) {
-        Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'RESOURCE_ATTRS_MISSING' -Target 'OTEL_RESOURCE_ATTRIBUTES' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'RESOURCE_ATTRS_MISSING' -Target 'OTEL_RESOURCE_ATTRIBUTES' `
             -Message 'not set - Fleet Management agent-selector attributes (cx.host.role / workload.*) will be absent')
     } else {
-        Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'OTEL_RESOURCE_ATTRIBUTES' -Message $attrs)
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'OTEL_RESOURCE_ATTRIBUTES' -Message $attrs)
     }
 
     # The environment label is persisted TWICE, by two different scripts: machine
@@ -351,15 +352,15 @@ if (Use-Check 'env') {
         if ($envAttrMatch.Success) {
             $attrEnv = $envAttrMatch.Groups[1].Value.Trim()
             if (-not $environment) {
-                Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISMATCH' -Target 'deployment.environment.name' `
+                Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISMATCH' -Target 'deployment.environment.name' `
                     -Message "OTEL_RESOURCE_ATTRIBUTES says '$attrEnv' but CX_ENVIRONMENT is not set - app signals keep '$attrEnv' while host and infrastructure signals are labelled 'unspecified'. Re-deploy with -Environment to label the whole host." `
                     -Data @{ resourceAttributes = $attrEnv; machineVar = '' })
             } elseif ($attrEnv -ne $environment) {
-                Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISMATCH' -Target 'deployment.environment.name' `
+                Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISMATCH' -Target 'deployment.environment.name' `
                     -Message "two environment identities on one host: CX_ENVIRONMENT='$environment' but OTEL_RESOURCE_ATTRIBUTES says '$attrEnv'. Re-deploy with -Environment to bring both stores back into step." `
                     -Data @{ resourceAttributes = $attrEnv; machineVar = $environment })
             } else {
-                Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'deployment.environment.name' `
+                Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'deployment.environment.name' `
                     -Message "$attrEnv (agrees with CX_ENVIRONMENT)")
             }
         }
@@ -368,20 +369,20 @@ if (Use-Check 'env') {
     # CX_IIS_SERVICES: the variable this whole exercise started with.
     if (-not $iisPresent) {
         if ($cxIisServices) {
-            Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_IIS_SERVICES_STALE' -Target 'CX_IIS_SERVICES' `
+            Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_IIS_SERVICES_STALE' -Target 'CX_IIS_SERVICES' `
                 -Message "set to '$cxIisServices' but this host has no IIS - a stale value from a prior deploy is being stamped on its telemetry" `
                 -Data @{ value = $cxIisServices })
         } else {
-            Add-F (New-Finding -Check 'env' -Severity 'skip' -Code 'IIS_ABSENT' -Target 'CX_IIS_SERVICES' `
+            Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'skip' -Code 'IIS_ABSENT' -Target 'CX_IIS_SERVICES' `
                 -Message 'no IIS on this host, so no IIS service label is expected')
         }
     } elseif (-not $cxIisServices) {
         # Deliberately not graded here - check 2 knows whether apps exist and can
         # say whether this is a real problem or a legitimately empty host.
-        Add-F (New-Finding -Check 'env' -Severity 'info' -Target 'CX_IIS_SERVICES' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'info' -Target 'CX_IIS_SERVICES' `
             -Message 'not set (see the iisServiceName check for whether that is expected on this host)')
     } else {
-        Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_IIS_SERVICES' -Message $cxIisServices `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CX_IIS_SERVICES' -Message $cxIisServices `
             -Data @{ value = $cxIisServices })
     }
 
@@ -401,20 +402,20 @@ if (Use-Check 'env') {
         Where-Object { $_ } | ForEach-Object { $_ -split ',' } | ForEach-Object { "$_".Trim() } |
         Where-Object { $_ } | Sort-Object -Unique)
     if (-not $unionSet.Count) {
-        Add-F (New-Finding -Check 'env' -Severity 'info' -Target 'CX_SERVICES' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'info' -Target 'CX_SERVICES' `
             -Message 'not set, and no IIS/Node/.NET service names are published either - nothing is instrumented on this host to claim')
     } elseif (-not $cxServices) {
-        Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_MISSING' -Target 'CX_SERVICES' `
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_MISSING' -Target 'CX_SERVICES' `
             -Message "not set, but $($unionSet.Count) service name(s) are published across CX_IIS_SERVICES/CX_NODE_SERVICES/CX_DOTNET_SERVICES. The collector falls back to IIS names only, so non-IIS services are not claimed for host ownership. Re-deploy: Install-Agent.ps1 publishes the union." `
             -Data @{ expected = $unionSet })
     } else {
         $haveSet = @($cxServices -split ',' | ForEach-Object { "$_".Trim() } | Where-Object { $_ } | Sort-Object -Unique)
         if (Compare-Object -ReferenceObject $unionSet -DifferenceObject $haveSet) {
-            Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_DRIFT' -Target 'CX_SERVICES' `
+            Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_DRIFT' -Target 'CX_SERVICES' `
                 -Message "set to '$cxServices', which is not the union of the per-runtime variables ($($unionSet -join ',')) - a partial or stale deploy. Re-run the installer to republish it." `
                 -Data @{ cxServices = $haveSet; expected = $unionSet })
         } else {
-            Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_SERVICES' -Message $cxServices `
+            Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CX_SERVICES' -Message $cxServices `
                 -Data @{ value = $haveSet })
         }
 
@@ -459,7 +460,7 @@ if (Use-Check 'env') {
             }
 
             if (-not $readCfg) {
-                Add-F (New-Finding -Check 'env' -Severity 'unknown' -Code 'CX_SERVICES_CONSUMER_UNKNOWN' -Target 'CX_SERVICES' `
+                Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'unknown' -Code 'CX_SERVICES_CONSUMER_UNKNOWN' -Target 'CX_SERVICES' `
                     -Message "no collector config could be read, so whether the running config stamps host Service ownership from CX_SERVICES could not be determined. $($beyondIis.Count) non-IIS service(s) depend on it: $($beyondIis -join ', ')." `
                     -Data @{ beyondIis = $beyondIis })
             } elseif (-not $consumes) {
@@ -468,18 +469,18 @@ if (Use-Check 'env') {
                 } else {
                     'No effective config was readable, so this is the base/local config the collector starts from. Fix: re-deploy the current template'
                 }
-                Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_NOT_CONSUMED' -Target 'CX_SERVICES' `
+                Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_SERVICES_NOT_CONSUMED' -Target 'CX_SERVICES' `
                     -Message "the collector config in force ($readCfg) does not read `${env:CX_SERVICES} - it stamps host Service ownership from CX_IIS_SERVICES only, which is the pre-CX_SERVICES fallback. So $($beyondIis.Count) service(s) published here are NOT claimed by this host however correct the variables look: $($beyondIis -join ', '). They still report in APM, which is why this reads as a Coralogix-side problem rather than a config one. $where - deploy\config.supervisor.yaml's transform/iis_service_labels reads CX_SERVICES and keeps CX_IIS_SERVICES as a fallback." `
                     -Data @{ config = $readCfg; fromEffectiveConfig = $fromEffective; beyondIis = $beyondIis; cxServices = $haveSet })
             } else {
-                Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'CX_SERVICES consumer' `
+                Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CX_SERVICES consumer' `
                     -Message "the $(if ($fromEffective) { 'effective' } else { 'base' }) config in force reads `${env:CX_SERVICES}, so all $($haveSet.Count) service(s) - including $($beyondIis.Count) non-IIS - are claimed for host ownership" `
                     -Data @{ config = $readCfg; fromEffectiveConfig = $fromEffective })
             }
         }
     }
 } else {
-    Add-F (New-Finding -Check 'env' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+    Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
 }
 
 # ---------------------------------------------------------------------------
@@ -519,22 +520,22 @@ function Get-WebConfigServiceName {
 
 if (Use-Check 'iisServiceName') {
     if (-not $iisPresent) {
-        Add-F (New-Finding -Check 'iisServiceName' -Severity 'skip' -Code 'IIS_ABSENT' `
+        Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'skip' -Code 'IIS_ABSENT' `
             -Message 'no IIS on this host')
     } elseif (-not (Get-Command Get-CxAppHostModel -ErrorAction SilentlyContinue)) {
-        Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'HELPER_MISSING' `
+        Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'unknown' -Code 'HELPER_MISSING' `
             -Message 'Test-IISInstrumentation.ps1 is not present, so applicationHost.config cannot be parsed')
     } else {
         $model = Get-CxAppHostModel -Path (Get-CxAppHostConfigPath)
 
         if (-not $model.Ok) {
             $code = if ($model.Denied) { 'APPHOST_ACCESS_DENIED' } else { 'APPHOST_UNREADABLE' }
-            Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code $code -Message $model.Error)
+            Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'unknown' -Code $code -Message $model.Error)
         } elseif (@($model.Apps).Count -eq 0) {
-            Add-F (New-Finding -Check 'iisServiceName' -Severity 'skip' -Code 'IIS_NO_APPS' `
+            Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'skip' -Code 'IIS_NO_APPS' `
                 -Message 'IIS is installed but hosts no applications')
             if ($cxIisServices) {
-                Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_STALE' -Target 'CX_IIS_SERVICES' `
+                Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_STALE' -Target 'CX_IIS_SERVICES' `
                     -Message "set to '$cxIisServices' but IIS hosts no applications - re-run Instrument-IIS.ps1 to clear it" `
                     -Data @{ value = $cxIisServices })
             }
@@ -551,11 +552,11 @@ if (Use-Check 'iisServiceName') {
             if ($rtCapable) {
                 try { $rtOverrides = Resolve-IISRuntimeOverrides -Table $RuntimeOverrides -JsonPath $RuntimeOverridesJson }
                 catch {
-                    Add-F (New-Finding -Check 'iisServiceName' -Severity 'fail' -Code 'BAD_ARGUMENT' `
+                    Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'fail' -Code 'BAD_ARGUMENT' `
                         -Message "-RuntimeOverrides could not be parsed: $($_.Exception.Message)")
                 }
             } else {
-                Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'HELPER_MISSING' `
+                Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'unknown' -Code 'HELPER_MISSING' `
                     -Message 'Resolve-IISAppRuntime.ps1 is not present, so non-.NET apps cannot be told apart from uninstrumented ones. Every named app is counted toward CX_IIS_SERVICES, which is the pre-classification behaviour and may report drift against an installer that filtered them out.')
             }
 
@@ -577,7 +578,7 @@ if (Use-Check 'iisServiceName') {
                     if ($rtOverrides) { $mapArgs['RuntimeOverrides'] = $rtOverrides }
                     $expectedMap = @(Get-IISServiceMap @mapArgs)
                 } catch {
-                    Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'WEBADMINISTRATION_MISSING' `
+                    Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'unknown' -Code 'WEBADMINISTRATION_MISSING' `
                         -Message "Get-IISServiceMap failed ($($_.Exception.Message)) - falling back to deriving names from applicationHost.config")
                 }
             }
@@ -609,7 +610,8 @@ if (Use-Check 'iisServiceName') {
                             -PoolFound ([bool]$model.Pools[$app.Pool]) `
                             -AncestorPhysicalPaths @($anc | ForEach-Object { [string]$_.PhysicalPath }) `
                             -InheritedFromLabels @($anc | ForEach-Object { "$($_.Site)$($_.AppPath)" }) `
-                            -Override (Get-IISRuntimeOverrideFor -Overrides $rtOverrides -Site $app.Site -AppPath $app.AppPath)
+                            -Override (Get-IISRuntimeOverrideFor -Overrides $rtOverrides -Site $app.Site -AppPath $app.AppPath) `
+                            -Pool $app.Pool
                     } catch { $rt = $null }
                 }
                 # Instrumentable = the installer would have written a name for it. Unknown
@@ -630,22 +632,32 @@ if (Use-Check 'iisServiceName') {
                 $effective = if ($wcValue) { $wcValue } elseif ($poolValue) { $poolValue } else { $null }
                 $scope     = if ($wcValue) { 'webconfig' } elseif ($poolValue) { 'pool' } else { 'none' }
 
+                # X-1: the LIVE row for this app, captured here because this is the only place that has
+                # both the effective name and the runtime verdict. Collected into a script-scoped list so
+                # the drift comparison further down can use it - it has no access to $model or $app.
+                if ($null -eq $script:CxLiveIisRows) { $script:CxLiveIisRows = @() }
+                $script:CxLiveIisRows += [pscustomobject]@{
+                    Target      = (Get-IISAppKey -Site $app.Site -AppPath $app.AppPath)
+                    ServiceName = [string]$effective
+                    Runtime     = if ($rt) { [string]$rt.DotNetRuntime } else { '' }
+                }
+
                 if (-not $effective -and -not $instrumentable) {
                     # Unnamed ON PURPOSE. Reporting this as IIS_SERVICE_NAME_MISSING (warn)
                     # would pin every host carrying the stock Default Web Site - i.e. nearly
                     # all of them - at exit 2 forever, for a static site that was never going
                     # to emit .NET telemetry.
                     if ($rt.DotNetRuntime -eq 'Unknown') {
-                        Add-F (New-Finding -Check 'iisServiceName' -Severity 'unknown' -Code 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE' -Target $label `
+                        Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'unknown' -Code 'RUNTIME_UNKNOWN_NEEDS_OVERRIDE' -Target $label `
                             -Message "$($rt.RuntimeReason). Not named, and not claimed in CX_IIS_SERVICES, rather than guessed. Resolve it with -RuntimeOverrides @{'$(Get-IISAppKey -Site $app.Site -AppPath $app.AppPath)'='AspNetCore'|'AspNetFramework'|'NonDotNet'} on BOTH the install and this check." `
                             -Data @{ pool = $app.Pool; physicalPath = $app.PhysicalPath })
                     } else {
-                        Add-F (New-Finding -Check 'iisServiceName' -Severity 'info' -Code 'NON_DOTNET_APP_NOT_INSTRUMENTED' -Target $label `
+                        Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'info' -Code 'NON_DOTNET_APP_NOT_INSTRUMENTED' -Target $label `
                             -Message "$($rt.RuntimeReason). The .NET OpenTelemetry automatic instrumentation does not apply, so no OTEL_SERVICE_NAME is expected and the app is deliberately absent from CX_IIS_SERVICES." `
                             -Data @{ pool = $app.Pool; physicalPath = $app.PhysicalPath; dotNetRuntime = $rt.DotNetRuntime })
                     }
                 } elseif (-not $effective) {
-                    Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'IIS_SERVICE_NAME_MISSING' -Target $label `
+                    Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'warn' -Code 'IIS_SERVICE_NAME_MISSING' -Target $label `
                         -Message "no OTEL_SERVICE_NAME on pool '$($app.Pool)' or in web.config - this app's spans land under a default service name" `
                         -Data @{ pool = $app.Pool; expected = $expectedName; physicalPath = $app.PhysicalPath })
                 } elseif (-not $instrumentable) {
@@ -656,7 +668,7 @@ if (Use-Check 'iisServiceName') {
                     # on a re-run, because the installer now removes such names.
                     # Not reported as a pass either: "OTEL_SERVICE_NAME=x" next to "this app
                     # emits nothing" is the contradiction this whole change exists to remove.
-                    Add-F (New-Finding -Check 'iisServiceName' -Severity 'info' -Code 'NON_DOTNET_APP_NOT_INSTRUMENTED' -Target $label `
+                    Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'info' -Code 'NON_DOTNET_APP_NOT_INSTRUMENTED' -Target $label `
                         -Message "OTEL_SERVICE_NAME=$effective ($scope) is set, but this app is $($rt.DotNetRuntime) and emits no .NET telemetry - a leftover from an installer that did not classify runtimes. Excluded from the expected CX_IIS_SERVICES set; re-run Instrument-IIS.ps1 to remove it." `
                         -Data @{ value = $effective; scope = $scope; dotNetRuntime = $rt.DotNetRuntime })
                 } else {
@@ -664,11 +676,11 @@ if (Use-Check 'iisServiceName') {
                     # to build $namedApps, or the two sets can never agree.
                     $actualNames += $effective
                     if ($expectedName -and $effective -ne $expectedName) {
-                        Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'IIS_SERVICE_NAME_DRIFT' -Target $label `
+                        Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'warn' -Code 'IIS_SERVICE_NAME_DRIFT' -Target $label `
                             -Message "OTEL_SERVICE_NAME is '$effective' ($scope) but the current IIS layout implies '$expectedName' - the site was renamed or moved after instrumentation" `
                             -Data @{ actual = $effective; expected = $expectedName; scope = $scope })
                     } else {
-                        Add-F (New-Finding -Check 'iisServiceName' -Severity 'pass' -Target $label `
+                        Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'pass' -Target $label `
                             -Message "OTEL_SERVICE_NAME=$effective ($scope)" `
                             -Data @{ value = $effective; scope = $scope })
                     }
@@ -676,7 +688,7 @@ if (Use-Check 'iisServiceName') {
             }
 
             if ($derived) {
-                Add-F (New-Finding -Check 'iisServiceName' -Severity 'info' `
+                Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'info' `
                     -Message 'expected names were derived from applicationHost.config (WebAdministration unavailable), so they follow the documented convention rather than Get-IISServiceMap')
             }
 
@@ -697,21 +709,21 @@ if (Use-Check 'iisServiceName') {
             }
 
             if ($varSet.Count -eq 0 -and $expSet.Count -gt 0) {
-                Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_MISSING' -Target 'CX_IIS_SERVICES' `
+                Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_MISSING' -Target 'CX_IIS_SERVICES' `
                     -Message "not set at machine scope, but $($expSet.Count) instrumented app(s) exist - host Service ownership in Infrastructure Explorer will be BLANK. Re-run Instrument-IIS.ps1 (elevated) and restart the collector." `
                     -Data @{ appServiceNames = $expSet })
             } elseif ($varSet.Count -gt 0 -and $expSet.Count -gt 0 -and (Compare-Object $expSet $varSet -CaseSensitive)) {
-                Add-F (New-Finding -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_DRIFT' -Target 'CX_IIS_SERVICES' `
+                Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'warn' -Code 'CX_IIS_SERVICES_DRIFT' -Target 'CX_IIS_SERVICES' `
                     -Message "does not match the apps on this host. var=[$($varSet -join ', ')] apps=[$($expSet -join ', ')] - re-run Instrument-IIS.ps1 and restart the collector. apps[] lists only INSTRUMENTABLE applications (ASP.NET Core or ASP.NET Framework); static, native, reverse-proxied and undeterminable apps are excluded by design, so a name here that is missing from apps[] is usually a leftover the re-run will remove." `
                     -Data @{ cxIisServices = $varSet; appServiceNames = $expSet })
             } elseif ($varSet.Count -gt 0) {
-                Add-F (New-Finding -Check 'iisServiceName' -Severity 'pass' -Target 'CX_IIS_SERVICES' `
+                Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'pass' -Target 'CX_IIS_SERVICES' `
                     -Message "matches the apps on this host: $($varSet -join ', ')" -Data @{ value = $varSet })
             }
         }
     }
 } else {
-    Add-F (New-Finding -Check 'iisServiceName' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+    Add-F (New-Finding -Verified 'config' -Check 'iisServiceName' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
 }
 
 # ---------------------------------------------------------------------------
@@ -725,17 +737,17 @@ if (Use-Check 'services') {
     $col = Get-Service -Name 'otelcol-contrib'  -ErrorAction SilentlyContinue
 
     if (-not $sup -and -not $col) {
-        Add-F (New-Finding -Check 'services' -Severity 'fail' -Code 'COLLECTOR_SERVICE_MISSING' `
+        Add-F (New-Finding -Verified 'config' -Check 'services' -Severity 'fail' -Code 'COLLECTOR_SERVICE_MISSING' `
             -Message 'neither opampsupervisor nor otelcol-contrib is installed - no collector on this host')
     } else {
         foreach ($svc in @($sup, $col)) {
             if (-not $svc) { continue }
             if ($svc.Status -ne 'Running') {
-                Add-F (New-Finding -Check 'services' -Severity 'fail' -Code 'COLLECTOR_SERVICE_STOPPED' -Target $svc.Name `
+                Add-F (New-Finding -Verified 'config' -Check 'services' -Severity 'fail' -Code 'COLLECTOR_SERVICE_STOPPED' -Target $svc.Name `
                     -Message "service is '$($svc.Status)', not Running - no telemetry is being collected" `
                     -Data @{ status = "$($svc.Status)" })
             } else {
-                Add-F (New-Finding -Check 'services' -Severity 'pass' -Target $svc.Name -Message 'Running')
+                Add-F (New-Finding -Verified 'config' -Check 'services' -Severity 'pass' -Target $svc.Name -Message 'Running')
             }
 
             # StartType is set to Automatic at install and never re-verified;
@@ -743,7 +755,7 @@ if (Use-Check 'services') {
             $st = $null
             try { $st = (Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'" -ErrorAction SilentlyContinue).StartMode } catch { }
             if ($st -and $st -notmatch '^Auto') {
-                Add-F (New-Finding -Check 'services' -Severity 'warn' -Code 'STARTTYPE_NOT_AUTOMATIC' -Target $svc.Name `
+                Add-F (New-Finding -Verified 'config' -Check 'services' -Severity 'warn' -Code 'STARTTYPE_NOT_AUTOMATIC' -Target $svc.Name `
                     -Message "StartType is '$st', not Automatic - this service will not return after a reboot" `
                     -Data @{ startMode = $st })
             }
@@ -753,16 +765,16 @@ if (Use-Check 'services') {
         if ($sup -and $sup.Status -eq 'Running' -and -not $col) {
             $childs = @(Get-Process -Name 'otelcol-contrib','otelcol' -ErrorAction SilentlyContinue)
             if ($childs.Count -eq 0) {
-                Add-F (New-Finding -Check 'services' -Severity 'fail' -Code 'COLLECTOR_PROCESS_MISSING' `
+                Add-F (New-Finding -Verified 'config' -Check 'services' -Severity 'fail' -Code 'COLLECTOR_PROCESS_MISSING' `
                     -Message 'opampsupervisor is Running but no otelcol process exists - the collector is crash-looping or failed to start. Check the Application event log, source otelcol-contrib.')
             } else {
-                Add-F (New-Finding -Check 'services' -Severity 'pass' -Target 'otelcol (child process)' `
+                Add-F (New-Finding -Verified 'config' -Check 'services' -Severity 'pass' -Target 'otelcol (child process)' `
                     -Message "$($childs.Count) process(es) running" -Data @{ pids = @($childs | ForEach-Object { $_.Id }) })
             }
         }
     }
 } else {
-    Add-F (New-Finding -Check 'services' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+    Add-F (New-Finding -Verified 'config' -Check 'services' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
 }
 
 # ---------------------------------------------------------------------------
@@ -785,17 +797,17 @@ if (Use-Check 'health') {
     }
 
     if ($ok) {
-        Add-F (New-Finding -Check 'health' -Severity 'pass' -Target $HealthUrl -Message 'HTTP 200')
+        Add-F (New-Finding -Verified 'config' -Check 'health' -Severity 'pass' -Target $HealthUrl -Message 'HTTP 200')
     } elseif ($status) {
-        Add-F (New-Finding -Check 'health' -Severity 'fail' -Code 'HEALTH_UNHEALTHY' -Target $HealthUrl `
+        Add-F (New-Finding -Verified 'config' -Check 'health' -Severity 'fail' -Code 'HEALTH_UNHEALTHY' -Target $HealthUrl `
             -Message "health endpoint returned HTTP $status - the collector is running but reporting unhealthy" `
             -Data @{ status = $status })
     } else {
-        Add-F (New-Finding -Check 'health' -Severity 'fail' -Code 'HEALTH_UNREACHABLE' -Target $HealthUrl `
+        Add-F (New-Finding -Verified 'config' -Check 'health' -Severity 'fail' -Code 'HEALTH_UNREACHABLE' -Target $HealthUrl `
             -Message "no response after $HealthRetries attempt(s): $lastErr" -Data @{ error = $lastErr })
     }
 } else {
-    Add-F (New-Finding -Check 'health' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+    Add-F (New-Finding -Verified 'config' -Check 'health' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
 }
 
 # ---------------------------------------------------------------------------
@@ -806,7 +818,7 @@ if (Use-Check 'exportCounters') {
     try { $metrics = (Invoke-WebRequest -Uri $MetricsUrl -UseBasicParsing -TimeoutSec $TimeoutSec).Content } catch { }
 
     if (-not $metrics) {
-        Add-F (New-Finding -Check 'exportCounters' -Severity 'warn' -Code 'METRICS_UNREACHABLE' -Target $MetricsUrl `
+        Add-F (New-Finding -Verified 'config' -Check 'exportCounters' -Severity 'warn' -Code 'METRICS_UNREACHABLE' -Target $MetricsUrl `
             -Message 'collector internal metrics endpoint did not respond - cannot tell whether anything is being exported')
     } else {
         # Split on \r?\n, NOT "`n": a CRLF payload leaves a trailing \r on every
@@ -831,9 +843,9 @@ if (Use-Check 'exportCounters') {
         $desc = (@($sent.Keys | ForEach-Object { "$_=$(if ($null -eq $sent[$_]) { 'n/a' } else { $sent[$_] })" }) -join ' ')
 
         if ($any) {
-            Add-F (New-Finding -Check 'exportCounters' -Severity 'pass' -Message "exporting: $desc" -Data $sent)
+            Add-F (New-Finding -Verified 'config' -Check 'exportCounters' -Severity 'pass' -Message "exporting: $desc" -Data $sent)
         } else {
-            Add-F (New-Finding -Check 'exportCounters' -Severity 'warn' -Code 'EXPORT_COUNTERS_ZERO' `
+            Add-F (New-Finding -Verified 'config' -Check 'exportCounters' -Severity 'warn' -Code 'EXPORT_COUNTERS_ZERO' `
                 -Message "nothing has been exported to Coralogix yet ($desc). Normal for a collector restarted moments ago; otherwise the exporter is not reaching the endpoint." `
                 -Data $sent)
         }
@@ -849,13 +861,13 @@ if (Use-Check 'exportCounters') {
             }
         }
         if ($failed.Count -gt 0) {
-            Add-F (New-Finding -Check 'exportCounters' -Severity 'warn' -Code 'EXPORT_SEND_FAILED' `
+            Add-F (New-Finding -Verified 'config' -Check 'exportCounters' -Severity 'warn' -Code 'EXPORT_SEND_FAILED' `
                 -Message "$($failed.Count) non-zero export failure counter(s) - telemetry is being produced but rejected or dropped" `
                 -Data @{ counters = $failed })
         }
     }
 } else {
-    Add-F (New-Finding -Check 'exportCounters' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+    Add-F (New-Finding -Verified 'config' -Check 'exportCounters' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
 }
 
 # ---------------------------------------------------------------------------
@@ -863,27 +875,27 @@ if (Use-Check 'exportCounters') {
 # ---------------------------------------------------------------------------
 if (Use-Check 'ports') {
     if (-not (Get-Command Test-PortListening -ErrorAction SilentlyContinue)) {
-        Add-F (New-Finding -Check 'ports' -Severity 'unknown' -Code 'HELPER_MISSING' `
+        Add-F (New-Finding -Verified 'config' -Check 'ports' -Severity 'unknown' -Code 'HELPER_MISSING' `
             -Message 'Detect-Workloads.ps1 is not present, so the port probe is unavailable')
     } else {
         # 4318 (HTTP) is what the IIS and Node instrumentation actually use.
         if (Test-PortListening @($OtlpHttpPort)) {
-            Add-F (New-Finding -Check 'ports' -Severity 'pass' -Target "$OtlpHttpPort/http" -Message 'listening')
+            Add-F (New-Finding -Verified 'config' -Check 'ports' -Severity 'pass' -Target "$OtlpHttpPort/http" -Message 'listening')
         } else {
-            Add-F (New-Finding -Check 'ports' -Severity 'warn' -Code 'PORT_4318_NOT_LISTENING' -Target "$OtlpHttpPort/http" `
+            Add-F (New-Finding -Verified 'config' -Check 'ports' -Severity 'warn' -Code 'PORT_4318_NOT_LISTENING' -Target "$OtlpHttpPort/http" `
                 -Message "nothing is listening on $OtlpHttpPort - instrumented apps have nowhere to send OTLP")
         }
         # 4317 (gRPC) is informational: the shipped config enables it, but nothing
         # in this repo's instrumentation path uses it.
         if (Test-PortListening @($OtlpGrpcPort)) {
-            Add-F (New-Finding -Check 'ports' -Severity 'pass' -Target "$OtlpGrpcPort/grpc" -Message 'listening')
+            Add-F (New-Finding -Verified 'config' -Check 'ports' -Severity 'pass' -Target "$OtlpGrpcPort/grpc" -Message 'listening')
         } else {
-            Add-F (New-Finding -Check 'ports' -Severity 'info' -Target "$OtlpGrpcPort/grpc" `
+            Add-F (New-Finding -Verified 'config' -Check 'ports' -Severity 'info' -Target "$OtlpGrpcPort/grpc" `
                 -Message 'not listening (only matters if something here exports over gRPC)')
         }
     }
 } else {
-    Add-F (New-Finding -Check 'ports' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+    Add-F (New-Finding -Verified 'config' -Check 'ports' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
 }
 
 # ---------------------------------------------------------------------------
@@ -911,14 +923,14 @@ if (Use-Check 'effectiveConfig') {
     }
 
     if (-not $cfgPath) {
-        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_CONFIG_NOT_FOUND' `
+        Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_CONFIG_NOT_FOUND' `
             -Message "no collector config found (looked at: $($searched -join '; '))")
     } else {
         $text = $null
         try { $text = Get-Content -LiteralPath $cfgPath -Raw -ErrorAction Stop } catch { }
 
         if (-not $text) {
-            Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_CONFIG_UNREADABLE' -Target $cfgPath `
+            Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_CONFIG_UNREADABLE' -Target $cfgPath `
                 -Message 'config file could not be read')
         } else {
             # No YAML parser is available in PS 5.1, so this is a text match.
@@ -944,13 +956,13 @@ if (Use-Check 'effectiveConfig') {
             # to every host. Emptying the list is what keeps the loop body untouched.
             $iisProcs = if ($iisPresent -or $cxIisServices) { @($RequiredProcessors) } else { @() }
             if (-not $iisProcs) {
-                Add-F (New-Finding -Check 'effectiveConfig' -Severity 'skip' -Code 'IIS_ABSENT' `
+                Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'skip' -Code 'IIS_ABSENT' `
                     -Message 'no IIS on this host, so the IIS service-label processor is not expected')
             }
 
             foreach ($proc in $iisProcs) {
                 if ($live -notmatch [regex]::Escape($proc)) {
-                    Add-F (New-Finding -Check 'effectiveConfig' -Severity 'warn' -Code 'EFFECTIVE_PROCESSOR_MISSING' -Target $proc `
+                    Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'warn' -Code 'EFFECTIVE_PROCESSOR_MISSING' -Target $proc `
                         -Message "not present in $cfgPath - CX_IIS_SERVICES is never stamped onto telemetry, so Service ownership stays blank however correct the env var is. Add the processor to the REMOTE Fleet Management config." `
                         -Data @{ config = $cfgPath })
                     continue
@@ -960,13 +972,13 @@ if (Use-Check 'effectiveConfig') {
                 foreach ($pipe in @($RequiredPipelines)) {
                     $block = [regex]::Match($pipesText, "(?ms)^\s{4}$([regex]::Escape($pipe)):\s*$.*?(?=^\s{4}\S|\z)")
                     if (-not $block.Success) {
-                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_PIPELINE_NOT_FOUND' -Target "$pipe" `
+                        Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_PIPELINE_NOT_FOUND' -Target "$pipe" `
                             -Message "could not locate the '$pipe' pipeline block in $cfgPath to confirm the processor is wired into it")
                     } elseif ($block.Value -match [regex]::Escape($proc)) {
-                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'pass' -Target "$pipe" `
+                        Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'pass' -Target "$pipe" `
                             -Message "$proc is wired into the $pipe pipeline")
                     } else {
-                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'warn' -Code 'EFFECTIVE_PROCESSOR_NOT_WIRED' -Target "$pipe" `
+                        Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'warn' -Code 'EFFECTIVE_PROCESSOR_NOT_WIRED' -Target "$pipe" `
                             -Message "$proc is defined but NOT listed in the '$pipe' pipeline's processors - it therefore never runs for that signal" `
                             -Data @{ config = $cfgPath })
                     }
@@ -979,32 +991,66 @@ if (Use-Check 'effectiveConfig') {
             # a remote Fleet config that redefines these pipelines drops the processor
             # and the label never reaches a single signal.
             if ($live -notmatch [regex]::Escape($EnvironmentProcessor)) {
-                Add-F (New-Finding -Check 'effectiveConfig' -Severity 'warn' -Code 'ENV_PROCESSOR_MISSING' -Target $EnvironmentProcessor `
+                Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'warn' -Code 'ENV_PROCESSOR_MISSING' -Target $EnvironmentProcessor `
                     -Message "not present in $cfgPath - CX_ENVIRONMENT is never stamped onto telemetry, so this host's signals arrive with no environment label however correct the env var is. Add the processor to the REMOTE Fleet Management config." `
                     -Data @{ config = $cfgPath })
             } else {
                 foreach ($pipe in @($EnvironmentPipelines)) {
                     $block = [regex]::Match($pipesText, "(?ms)^\s{4}$([regex]::Escape($pipe)):\s*$.*?(?=^\s{4}\S|\z)")
                     if (-not $block.Success) {
-                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'ENV_PIPELINE_NOT_FOUND' -Target "$pipe" `
+                        Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'unknown' -Code 'ENV_PIPELINE_NOT_FOUND' -Target "$pipe" `
                             -Message "could not locate the '$pipe' pipeline block in $cfgPath to confirm $EnvironmentProcessor is wired into it")
                     } elseif ($block.Value -match [regex]::Escape($EnvironmentProcessor)) {
-                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'pass' -Target "$pipe" `
+                        Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'pass' -Target "$pipe" `
                             -Message "$EnvironmentProcessor is wired into the $pipe pipeline")
                     } else {
-                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'warn' -Code 'ENV_PROCESSOR_NOT_WIRED' -Target "$pipe" `
+                        Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'warn' -Code 'ENV_PROCESSOR_NOT_WIRED' -Target "$pipe" `
                             -Message "$EnvironmentProcessor is defined but NOT listed in the '$pipe' pipeline's processors - $pipe therefore carries no environment label" `
                             -Data @{ config = $cfgPath })
                     }
                 }
             }
 
-            Add-F (New-Finding -Check 'effectiveConfig' -Severity 'info' -Target $cfgPath `
+            Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'info' -Target $cfgPath `
                 -Message 'checked by text match (no YAML parser in PS 5.1); comment lines were excluded')
         }
     }
 } else {
-    Add-F (New-Finding -Check 'effectiveConfig' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+    Add-F (New-Finding -Verified 'config' -Check 'effectiveConfig' -Severity 'skip' -Code 'NOT_SELECTED' -Message 'not selected by -Only')
+}
+
+# ---------------------------------------------------------------------------
+# X-1. Drift against the installer's recorded decisions
+# ---------------------------------------------------------------------------
+# The point of the record is that this check no longer needs to be handed the same -RuntimeOverrides the
+# installer got. If the file is absent we say so and fall back to today's behaviour rather than pretending
+# there is no drift.
+if ((Use-Check 'iisServiceName') -and (Get-Command Get-CxInstrumentationState -ErrorAction SilentlyContinue)) {
+    $expected = Get-CxInstrumentationState
+    if (-not $expected) {
+        Add-F (New-Finding -Check 'stateRecord' -Severity 'info' -Code 'STATE_RECORD_ABSENT' `
+            -Message 'no installer decision record (C:\ProgramData\cx\instrumentation-state.json) - either the installer predates it or it never ran here. Drift can only be judged against this doctor''s own re-derivation, which is why runtime overrides had to be passed twice.')
+    } else {
+        # Captured during the iisServiceName check above. If that check did not run (or found no apps)
+        # there is nothing to compare, and saying so beats reporting every recorded target as missing.
+        $liveRows = @($script:CxLiveIisRows)
+        if (@($liveRows).Count -eq 0) {
+            Add-F (New-Finding -Check 'stateRecord' -Severity 'unknown' -Code 'STATE_RECORD_NOT_COMPARED' `
+                -Message "the installer recorded $(@($expected.targets).Count) decision(s), but no live IIS application rows were collected in this run, so drift could not be computed. Run without -Only, or with -Only iisServiceName, to compare.")
+            $liveRows = $null
+        }
+        $drift = if ($null -eq $liveRows) { @() } else { @(Compare-CxInstrumentationState -Expected $expected -Live $liveRows) }
+        if ($null -ne $liveRows -and @($drift).Count -eq 0) {
+            Add-F (New-Finding -Verified 'config' -Check 'stateRecord' -Severity 'pass' `
+                -Message "live state matches all $(@($expected.targets).Count) decision(s) recorded by the installer at $($expected.whenUtc)")
+        } else {
+            foreach ($d in $drift) {
+                Add-F (New-Finding -Verified 'config' -Check 'stateRecord' -Severity 'warn' -Code 'STATE_RECORD_DRIFT' -Target $d.Target `
+                    -Message "$($d.Reason). Expected '$($d.Expected)', found '$($d.Actual)'. Either the host changed since the install or the install did not take - the record is not adjusted to match, so this stays visible until one side is fixed." `
+                    -Data @{ field = $d.Field; expected = $d.Expected; actual = $d.Actual })
+            }
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1025,8 +1071,12 @@ if (Use-Check 'iisInstrumentation') {
         if ($RuntimeOverridesJson) { $iisArgs['RuntimeOverridesJson'] = $RuntimeOverridesJson }
         try { Add-Many (Test-IISInstrumentation @iisArgs) }
         catch {
-            Add-F (New-Finding -Check 'iisInstrumentation' -Severity 'unknown' -Code 'CHECK_ERRORED' `
-                -Message "Test-IISInstrumentation failed: $($_.Exception.Message)")
+            # 'warn', NOT 'unknown'. Get-GradedExitCode only escalates on fail/warn, so an
+            # 'unknown' here meant a validator that CRASHED still graded the host exit=0 - a
+            # green doctor that checked nothing. HELPER_MISSING stays 'unknown' (a hand-assembled
+            # deploy directory is a legitimate state); a validator that threw is not.
+            Add-F (New-Finding -Check 'iisInstrumentation' -Severity 'warn' -Code 'CHECK_ERRORED' `
+                -Message "Test-IISInstrumentation failed, so NOTHING about IIS instrumentation was verified on this host: $($_.Exception.Message)")
         }
     }
 } else {
@@ -1043,8 +1093,9 @@ if (Use-Check 'nodeInstrumentation') {
                                                -ExpectedOtlpEndpoint $ExpectedOtlpEndpoint `
                                                -EffectiveConfig $EffectiveConfig)
         } catch {
-            Add-F (New-Finding -Check 'nodeInstrumentation' -Severity 'unknown' -Code 'CHECK_ERRORED' `
-                -Message "Test-NodeInstrumentation failed: $($_.Exception.Message)")
+            # See the iisInstrumentation twin above: a crashed validator must not grade exit=0.
+            Add-F (New-Finding -Check 'nodeInstrumentation' -Severity 'warn' -Code 'CHECK_ERRORED' `
+                -Message "Test-NodeInstrumentation failed, so NOTHING about Node instrumentation was verified on this host: $($_.Exception.Message)")
         }
     }
 } else {

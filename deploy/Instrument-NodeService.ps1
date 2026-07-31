@@ -56,7 +56,14 @@ param(
     [string]   $Package              = '@opentelemetry/auto-instrumentations-node',
     [hashtable] $ServiceNameOverrides = @{},
     [string]   $NssmPath             = $null,
-    [switch]   $Remove
+    [switch]   $Remove,
+    # Treat an UNDETERMINABLE Node version as a refusal even for a stopped service. Off by default
+    # because a stopped service cannot be probed and instrumenting one is the normal case; on for a
+    # fleet that would rather skip a service than assume its runtime is supported.
+    [switch]   $StrictRuntimeGate,
+    # Take over a service that already exports to an OFF-BOX OTLP endpoint. See the note on the same
+    # switch in Instrument-IIS.ps1.
+    [switch]   $ForceEndpoint
 )
 
 $ErrorActionPreference = 'Stop'
@@ -371,6 +378,17 @@ foreach ($name in $targets) {
         $m = [regex]::Match($launcher.Info.Path, '(?i)([A-Za-z]:\\[^"]*?\.(?:js|mjs|cjs))')
         if ($m.Success) { $entry = $m.Groups[1].Value }
     }
+    # N-3: the regexes above only find an entry that ENDS in .js/.mjs/.cjs, so an extensionless entry
+    # (`node bin/www`) resolved to nothing and the service was treated as CommonJS-with-unknown-entry.
+    # The argv walk handles it, and also refuses to mistake a `-r` preload or a loader URL for the entry.
+    if (-not $entry -and (Get-Command Get-CxNodeEntryScript -ErrorAction SilentlyContinue)) {
+        $cl = if ($launcher.Info) { [string]$launcher.Info.Path } else { '' }
+        $walk = Get-CxNodeEntryScript -CommandLine $cl
+        if ($walk.Entry) {
+            $entry = $walk.Entry
+            Write-Host "  entry resolved by argv walk: $entry$(if ($walk.Extensionless) { ' (extensionless)' })"
+        }
+    }
 
     $isEsm = $false
     if ($entry) {
@@ -384,6 +402,83 @@ foreach ($name in $targets) {
         continue
     }
 
+    # N-1 RUNTIME GATE. The node.exe a SERVICE runs is very often not the one on the deploying
+    # account's PATH - a wrapper points at a pinned install, or the service was created years ago
+    # against an older runtime. Below the SDK minimum, writing NODE_OPTIONS yields a service that
+    # starts cleanly and emits nothing forever, so refuse and say which runtime was found.
+    #
+    # Candidates most-authoritative first: the running process's exe, the launcher's own command
+    # line (which for a bare-SCM node service IS node.exe), the wrapper's configured executable.
+    # N-2: a service whose command line is a tool process or a debugger session is left alone. Rarer
+    # here than under PM2, but a "service" wrapping tsc --watch or a codegen step does exist, and naming
+    # it as a service in Coralogix is noise nobody asked for.
+    if (Get-Command Test-CxNodeProcessBlocked -ErrorAction SilentlyContinue) {
+        $svcCl = if ($launcher.Info) { [string]$launcher.Info.Path } else { [string]$launcher.Exe }
+        $blk = Test-CxNodeProcessBlocked -CommandLine $svcCl -Name $name `
+                 -ExtraPatterns $(if (Get-Command Get-CxNodeBlocklistPatterns -ErrorAction SilentlyContinue) { @(Get-CxNodeBlocklistPatterns) } else { @() })
+        if ($blk.Blocked) {
+            Write-Host "  $name : SKIPPED [$($blk.Rule)] $($blk.Reason)" -ForegroundColor Yellow
+            continue
+        }
+    }
+
+    # D-7: refuse to hijack another OpenTelemetry deployment's endpoint. The service's existing env was
+    # already read above ($existingEnv) so the wrapper is not re-parsed.
+    if (Get-Command Test-CxEndpointOverwriteAllowed -ErrorAction SilentlyContinue) {
+        $existingEp = if ($existingEnv.Contains('OTEL_EXPORTER_OTLP_ENDPOINT')) { [string]$existingEnv['OTEL_EXPORTER_OTLP_ENDPOINT'] } else { '' }
+        $epChk = Test-CxEndpointOverwriteAllowed -Existing $existingEp -Ours $OtlpEndpoint -Force:$ForceEndpoint
+        if (-not $epChk.Allowed) {
+            Write-Warning "[node-svc] $name REFUSED (OTLP_ENDPOINT_FOREIGN): $($epChk.Reason)"
+            $failed++
+            continue
+        }
+        if ($epChk.Foreign) { Write-Warning "[node-svc] $name : $($epChk.Reason)" }
+    }
+
+    # WRAPPER LAUNCHERS RUN NODE AS A CHILD. For winsw / node-windows / nssm the service process is the
+    # WRAPPER exe - not node - so probing the service's own executable (or the launcher's configured
+    # Exe) answers with the wrapper's version, or with nothing. Supplying only those would have refused
+    # every wrapper-hosted service as NODE_VERSION_UNKNOWN, which is a worse failure than the one this
+    # gate exists to fix. So the node.exe CHILD of the service process is the first candidate.
+    $svcExe = $null; $childNode = $null
+    try {
+        $svcProc = @(Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop | Select-Object -First 1)
+        if (@($svcProc).Count -gt 0 -and $svcProc[0].ProcessId) {
+            $svcPid = [int]$svcProc[0].ProcessId
+            $svcExe = (Get-Process -Id $svcPid -ErrorAction SilentlyContinue).Path
+            $kid = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$svcPid AND Name='node.exe'" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1)
+            if (@($kid).Count -gt 0) { $childNode = [string]$kid[0].ExecutablePath }
+        }
+    } catch { }
+    $extensionless = [bool]($entry -and -not ($entry -match '\.[cm]?js$'))
+    # Most-authoritative first. $svcExe is included because for a BARE-SCM node service the service
+    # process IS node.exe; for a wrapper it is skipped harmlessly (unparsable --version output).
+    $nodeVer = Get-CxNodeVersion -Candidates @($childNode, $svcExe, $(if ($launcher.Info) { $launcher.Info.Path }), $launcher.Exe)
+    $gate = Test-CxNodeRuntimeSupported -Version $nodeVer -IsEsm $isEsm -Extensionless $extensionless
+    if (-not $gate.Ok) {
+        # UNKNOWN IS NOT THE SAME AS UNSUPPORTED, and the difference is whether the service is running.
+        #
+        # A STOPPED service has no process and no node child, so its runtime is genuinely unknowable
+        # from here - and instrumenting a stopped service is the normal case (it gets restarted after).
+        # Refusing those would have refused nearly every wrapper-hosted service on a quiet host, which
+        # is a bigger failure than the one this gate closes. So: warn, proceed, and let the doctor
+        # re-check once it is up.
+        #
+        # A RUNNING service that still cannot be versioned is different: we probed a live process and
+        # its node child and got nothing, which is worth refusing over. -StrictRuntimeGate forces the
+        # refusal in both cases for a fleet that would rather skip than assume.
+        $isRunning = $false
+        try { $isRunning = ((Get-Service -Name $name -ErrorAction Stop).Status -eq 'Running') } catch { }
+        if ($gate.Code -eq 'NODE_VERSION_UNKNOWN' -and -not $isRunning -and -not $StrictRuntimeGate) {
+            Write-Warning "[node-svc] $name : Node version could not be determined and the service is STOPPED, so the runtime gate cannot decide. Proceeding on the assumption that it runs a supported Node (>= 18); re-run the doctor once it is started to confirm. Pass -StrictRuntimeGate to skip instead."
+        } else {
+            Write-Warning "[node-svc] $name REFUSED ($($gate.Code)): $($gate.Reason)"
+            $failed++
+            continue
+        }
+    }
+
     $bootstrap  = if ($isEsm) { $boot.NodeOptionsEsm } else { $boot.NodeOptionsCjs }
     # Both artifacts are declared as ours, not just the ones in this bootstrap: a service that
     # switches from ESM to CommonJS would otherwise keep our stale --experimental-loader.
@@ -394,6 +489,16 @@ foreach ($name in $targets) {
 
     $values = [ordered]@{
         NODE_OPTIONS                = $nodeOptions
+        OTEL_RESOURCE_ATTRIBUTES    = $(
+            # N-8: per-app attributes mirroring the reference agent's PGI inputs (NODEJS_SCRIPT_NAME,
+            # NODEJS_APP_BASE_DIR) plus a stable instance id. Without these a service is only a name.
+            $ra = @("service.instance.id=$name")
+            if ($entry) {
+                $ra += "node.script.path=$([string]$entry -replace '[,=]','_')"
+                try { $ra += "node.app.base.dir=$((Split-Path -Parent $entry) -replace '[,=]','_')" } catch { }
+            }
+            ($ra -join ',')
+        )
         OTEL_EXPORTER_OTLP_ENDPOINT = $OtlpEndpoint
         OTEL_EXPORTER_OTLP_PROTOCOL = 'http/protobuf'
         OTEL_SERVICE_NAME           = $serviceName

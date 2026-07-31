@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Read-only check that the zero-code .NET/IIS instrumentation was actually
   APPLIED on this host - the CLR profiler, the OTLP pool environment, and the
@@ -134,8 +134,9 @@ if (-not (Get-Command Get-CxRegisterPathFromNodeOptions -ErrorAction SilentlyCon
 }
 if (-not (Get-Command New-Finding -ErrorAction SilentlyContinue)) {
     function New-Finding {
-        param([string]$Check, [string]$Severity, [string]$Code = '', [string]$Message = '', [string]$Target = '', $Data = $null)
-        [pscustomobject]@{ check = $Check; severity = $Severity; code = $Code; target = $Target; message = $Message; data = $Data }
+        param([string]$Check, [string]$Severity, [string]$Code = '', [string]$Message = '', [string]$Target = '', $Data = $null,
+              [string]$Verified = 'none')
+        [pscustomobject]@{ check = $Check; severity = $Severity; code = $Code; target = $Target; message = $Message; data = $Data; verified = $Verified }
     }
 }
 if (-not (Get-Command Get-GradedExitCode -ErrorAction SilentlyContinue)) {
@@ -513,14 +514,14 @@ function Test-IISInstrumentation {
 
     # -- gate 0: elevation ---------------------------------------------------
     if (-not (Test-CxElevated)) {
-        Add-F (New-Finding -Check 'iisInstr' -Severity 'fail' -Code 'NOT_ELEVATED' `
+        Add-F (New-Finding -Verified 'config' -Check 'iisInstr' -Severity 'fail' -Code 'NOT_ELEVATED' `
             -Message 'not running as Administrator - applicationHost.config and the service registry are unreadable, so every result would be a false negative')
         return ,@($findings.ToArray())
     }
 
     # -- gate 1: is there any IIS here at all? -------------------------------
     if (-not (Test-CxIisPresent)) {
-        Add-F (New-Finding -Check 'iisInstr' -Severity 'skip' -Code 'IIS_ABSENT' `
+        Add-F (New-Finding -Verified 'config' -Check 'iisInstr' -Severity 'skip' -Code 'IIS_ABSENT' `
             -Message 'no IIS on this host - nothing to instrument')
         return ,@($findings.ToArray())
     }
@@ -528,7 +529,7 @@ function Test-IISInstrumentation {
     $model = Get-CxAppHostModel -Path $AppHostConfig
     if (-not $model.Ok) {
         $code = if ($model.Denied) { 'APPHOST_ACCESS_DENIED' } else { 'APPHOST_UNREADABLE' }
-        Add-F (New-Finding -Check 'iisInstr' -Severity 'unknown' -Code $code `
+        Add-F (New-Finding -Verified 'config' -Check 'iisInstr' -Severity 'unknown' -Code $code `
             -Message $model.Error -Target $AppHostConfig)
     }
 
@@ -538,7 +539,7 @@ function Test-IISInstrumentation {
     # A golden image with the role baked in and no sites yet is a legitimate
     # steady state. Telling it the profiler is missing would be noise.
     if ($model.Ok -and $appCount -eq 0) {
-        Add-F (New-Finding -Check 'iisInstr' -Severity 'skip' -Code 'IIS_NO_APPS' `
+        Add-F (New-Finding -Verified 'config' -Check 'iisInstr' -Severity 'skip' -Code 'IIS_NO_APPS' `
             -Message 'IIS is installed but hosts no applications - instrumentation is not expected' `
             -Data @{ appCount = 0 })
         return ,@($findings.ToArray())
@@ -559,11 +560,11 @@ function Test-IISInstrumentation {
         # strings"), so it outranks every other finding here.
         $emptyCount = @($entries | Where-Object { [string]::IsNullOrEmpty($_) }).Count
         if ($emptyCount -gt 0) {
-            Add-F (New-Finding -Check 'profilerReg' -Severity 'fail' -Code 'PROFILER_REGISTRY_MALFORMED' -Target $svc `
+            Add-F (New-Finding -Verified 'config' -Check 'profilerReg' -Severity 'fail' -Code 'PROFILER_REGISTRY_MALFORMED' -Target $svc `
                 -Message "$svc Environment REG_MULTI_SZ contains $emptyCount empty element(s) - this PREVENTS IIS FROM STARTING. Restore $svc.reg from the deploy backup dir (reg import) or remove the blank entry." `
                 -Data @{ entryCount = @($entries).Count; emptyCount = $emptyCount })
         } else {
-            Add-F (New-Finding -Check 'profilerReg' -Severity 'pass' -Target $svc `
+            Add-F (New-Finding -Verified 'config' -Check 'profilerReg' -Severity 'pass' -Target $svc `
                 -Message "$svc Environment is well-formed ($(@($entries).Count) entries)")
         }
 
@@ -600,23 +601,18 @@ function Test-IISInstrumentation {
                 # act on: it names the product and the tree to uninstall or exclude.
                 $paths = @('CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH','COR_PROFILER_PATH_64','COR_PROFILER_PATH' |
                             ForEach-Object { Get-CxEnvEntry -Entries $entries -Name $_ } | Where-Object { $_ } | Select-Object -Unique)
-                $vendor = switch -Regex ($paths -join ';') {
-                    'dynatrace|oneagent'   { 'Dynatrace OneAgent'; break }
-                    'newrelic'             { 'New Relic'; break }
-                    'appdynamics|appdynam' { 'AppDynamics'; break }
-                    'datadog|dd-trace'     { 'Datadog'; break }
-                    'elastic'              { 'Elastic APM'; break }
-                    'instana'              { 'Instana'; break }
-                    default                { 'an unidentified third-party agent' }
-                }
+                # Vendor label comes from the signature file, not from a switch here: one table, so a
+                # vendor added for the pre-flight probe is recognised by this finding too.
+                $vendor = Get-CxForeignApmVendorForModule -Module ($paths -join ';')
+                if (-not $vendor) { $vendor = 'an unidentified third-party agent' }
                 Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_FOREIGN_OWNER' -Target $svc `
                     -Message "$svc registers a CLR profiler that is NOT the OpenTelemetry one ($($foreign -join ', ')), and only one profiler can attach to a process - so .NET auto-instrumentation emits NOTHING for anything this service starts, however healthy the collector is. The DLL path points at $vendor$(if ($paths) { " ($($paths -join ', '))" }). Decide which agent owns .NET on this host: keep theirs and instrument these applications another way, or remove/exclude theirs and re-run the install." `
                     -Data @{ foreign = $foreign; expected = $otelClsid; paths = @($paths); vendorHint = $vendor })
             } else {
                 # REGISTERED is not LOADED, and the difference is the whole finding. MEASURED on a
-                # host running Dynatrace OneAgent in fullstack mode: W3SVC carried our CLSID and all
+                # host running a third-party full-stack APM agent in fullstack mode: W3SVC carried our CLSID and all
                 # four path variants, every value correct - and no process on the box had
-                # OpenTelemetry.AutoInstrumentation.Native.dll in it. OneAgent injects at process
+                # OpenTelemetry.AutoInstrumentation.Native.dll in it. The reference agent injects at process
                 # creation, into w3wp AND into the dotnet/apphost children of out-of-process apps, and
                 # only one CLR profiler can attach - so ours never did. This check graded that host a
                 # pass, which is the false green this tooling exists to prevent.
@@ -625,33 +621,205 @@ function Test-IISInstrumentation {
                 # Absence is only meaningful once a worker is actually up, so a host with no worker
                 # running is 'unknown', never a fail - an idle pool has nothing to load it into yet.
                 $ourDll  = 'OpenTelemetry.AutoInstrumentation.Native'
-                $workers = @()
-                try {
-                    $workers = @(Get-CimInstance Win32_Process -ErrorAction Stop |
-                        Where-Object { $_.Name -in @('w3wp.exe','dotnet.exe') -or ($_.CommandLine -and $_.CommandLine -match '\\aspnetcorev2') })
-                } catch { }
-                if (@($workers).Count -eq 0) {
-                    Add-F (New-Finding -Check 'profiler' -Severity 'unknown' -Code 'PROFILER_LOAD_UNVERIFIED' -Target $svc `
-                        -Message "$svc registers our profiler correctly, but no IIS worker process is running, so whether the profiler actually LOADS could not be verified. Send a request to an application and re-run - a registration that never loads is the failure mode this check exists for.")
+
+                # NO SILENT PATH THROUGH THIS CHECK. Three swallowed failures used to be able to end
+                # the profiler verdict without emitting anything an operator would notice, and on the
+                # one host where the whole point of the check was live (cx-e2e-c1, the reference agent owning the
+                # profiler) the run produced no profiler finding at all. Which of the three did it was
+                # never established, so all three now report:
+                #
+                #   1. Win32_Process enumeration throws  -> was `catch { }`, which produced an EMPTY
+                #      worker list and therefore the 'no worker is running' verdict. A WMI failure and
+                #      an idle host are not the same state and must not share a message.
+                #   2. Reading one process's modules throws -> was `catch { continue }`, which dropped
+                #      that process from both tallies. With every read failing the loop still fell
+                #      through to NOT_LOADED, i.e. it accused a possibly-healthy host on no evidence.
+                #   3. Nothing scanned successfully -> now its own finding, never a fail.
+                #
+                # 'unknown' is deliberately NOT used for a failed scan: it is counted but reads as
+                # "not applicable here", and this is a check that could not run - which is a warning.
+                $allProcs  = @()
+                $enumError = $null
+                try { $allProcs = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+                catch { $enumError = $_.Exception.Message }
+
+                if ($enumError) {
+                    Add-F (New-Finding -Check 'profiler' -Severity 'warn' -Code 'PROFILER_WORKER_ENUM_FAILED' -Target $svc `
+                        -Message "$svc registers our profiler correctly, but the running worker processes could not be enumerated ($enumError), so whether the profiler actually LOADS is UNKNOWN - not verified, and not disproved. Registration is not attachment; re-run elevated, or use the module-scan snippet in docs/exception-foreign-profiler.md." `
+                        -Data @{ error = $enumError })
                 } else {
-                    $withOurs = @(); $withForeign = @()
-                    foreach ($w in $workers) {
-                        $mods = @()
-                        try { $mods = @((Get-Process -Id $w.ProcessId -ErrorAction Stop).Modules | Select-Object -ExpandProperty ModuleName) } catch { continue }
-                        if ($mods -match $ourDll) { $withOurs += $w.ProcessId }
-                        # Any other vendor's CLR profiler in the same process explains WHY ours is not
-                        # there, and is the actionable half for the operator.
-                        $f = @($mods | Where-Object { $_ -match 'oneagent|newrelic|appdynamics|datadog|elastic.*profiler|instana' } | Select-Object -Unique)
-                        if (@($f).Count -gt 0) { $withForeign += "pid $($w.ProcessId): $($f -join ',')" }
-                    }
-                    if (@($withOurs).Count -gt 0) {
-                        Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
-                            -Message "profiler registered AND loaded - our native library is in $(@($withOurs).Count) of $(@($workers).Count) worker process(es) (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
-                            -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; loadedIn = @($withOurs) })
+                    # SCOPED TO IIS-OWNED PROCESSES, BY PARENTAGE. Taking every dotnet.exe on the host
+                    # put standalone worker services, console apps and scheduled tasks into the
+                    # denominator: a correctly instrumented IIS host read as "loaded in 1 of 4 worker
+                    # process(es)", and once the unrelated ones outnumbered the pool it graded a FAIL on
+                    # a host where IIS was fine.
+                    #
+                    # The test is "child of w3wp", NOT "named dotnet.exe". An out-of-process ASP.NET
+                    # Core app is launched by ANCM as the app's OWN apphost - on cx-e2e-c1 that was
+                    # coreweb.exe, and it was carrying the third-party agent's profiler DLL. Matching on the name
+                    # dotnet.exe would have skipped exactly the process that carried the evidence, so
+                    # every child of a worker is scanned whatever it is called. Children of w3wp are
+                    # IIS-owned by definition; nothing else needs to qualify them.
+                    $w3wpPids = @($allProcs | Where-Object { $_.Name -eq 'w3wp.exe' } | ForEach-Object { $_.ProcessId })
+                    $workers  = @($allProcs | Where-Object {
+                        $_.Name -eq 'w3wp.exe' -or
+                        ($w3wpPids -contains $_.ParentProcessId) -or
+                        ($_.CommandLine -and $_.CommandLine -match '\\aspnetcorev2')
+                    })
+
+                    if (@($workers).Count -eq 0) {
+                        Add-F (New-Finding -Check 'profiler' -Severity 'unknown' -Code 'PROFILER_LOAD_UNVERIFIED' -Target $svc `
+                            -Message "$svc registers our profiler correctly, but no IIS worker process is running, so whether the profiler actually LOADS could not be verified. Send a request to an application and re-run - a registration that never loads is the failure mode this check exists for.")
                     } else {
-                        Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_NOT_LOADED_IN_PROCESS' -Target $svc `
-                            -Message "$svc registers OUR profiler correctly, but our native library ($ourDll.dll) is loaded in NONE of the $(@($workers).Count) running worker process(es) - so .NET auto-instrumentation produces no spans while every variable reads as configured.$(if (@($withForeign).Count -gt 0) { " Another vendor's CLR profiler is in those processes instead ($($withForeign -join '; ')), and only ONE profiler can attach per process - it injects at process creation and wins over environment-based registration." } else { ' No other vendor profiler was found either, so check the profiler DLL path and that the worker restarted after the install.' }) Registration is not attachment: this is the state a check on the environment alone reports as healthy." `
-                            -Data @{ workers = @($workers | ForEach-Object { $_.ProcessId }); foreign = @($withForeign) })
+                        # WOW64 DOES NOT THROW - IT RETURNS AN EMPTY LIST. Measured on cx-e2e-c1:
+                        # reading a 64-bit w3wp's modules from 32-bit PowerShell gives count=0 with NO
+                        # exception, while the same read from 64-bit PowerShell gives 241 modules. So a
+                        # try/catch cannot detect this failure, and treating an empty list as evidence
+                        # produced PROFILER_NOT_LOADED_IN_PROCESS - a HARD FAIL - on a host where the
+                        # 64-bit run proved the profiler WAS loaded.
+                        #
+                        # An empty module list is therefore a FAILED READ, never an answer. Any live
+                        # process has ntdll.dll mapped, so its absence marks the list untrustworthy and
+                        # catches truncation as well as the empty case.
+                        $wow64 = (-not [Environment]::Is64BitProcess) -and [Environment]::Is64BitOperatingSystem
+                        $withOurs = @(); $withForeign = @(); $scanned = @(); $scanFailed = @(); $noClr = @()
+                        $foreignModulePattern = Get-CxForeignApmModulePattern
+                        foreach ($w in $workers) {
+                            $mods = @()
+                            try { $mods = @((Get-Process -Id $w.ProcessId -ErrorAction Stop).Modules | Select-Object -ExpandProperty ModuleName) }
+                            catch {
+                                # A worker that exited mid-scan or an access denial lands here, and
+                                # means this process contributed NO evidence either way.
+                                $scanFailed += "pid $($w.ProcessId) ($($w.Name)): $($_.Exception.Message)"
+                                continue
+                            }
+                            if (@($mods).Count -eq 0 -or -not ($mods -contains 'ntdll.dll')) {
+                                $scanFailed += ("pid $($w.ProcessId) ($($w.Name)): module list unusable (" +
+                                    "$(@($mods).Count) entries, no ntdll.dll)" +
+                                    $(if ($wow64) { ' - this doctor is a 32-BIT process on 64-bit Windows, which cannot read a 64-bit worker''s modules; re-run from %windir%\Sysnative\WindowsPowerShell\v1.0\powershell.exe or a 64-bit shell' } else { '' }))
+                                continue
+                            }
+                            # NO CLR, NO VERDICT. Scoping by parentage correctly catches the ANCM
+                            # apphost (coreweb.exe on cx-e2e-c1) but also catches conhost.exe, which
+                            # IIS spawns as a console host - measured, it appeared as a second "worker"
+                            # and turned a fully loaded host into "1 of 2 scanned". A process with no
+                            # CLR mapped cannot host a CLR profiler, so it belongs in NEITHER tally:
+                            # counting it understates coverage, and counting it as a miss would be a
+                            # false red the moment it were the only child.
+                            if (-not ($mods | Where-Object { $_ -match '^(coreclr|clr|mscorwks)\.dll$' })) {
+                                $noClr += "pid $($w.ProcessId) ($($w.Name))"
+                                continue
+                            }
+                            $scanned += $w.ProcessId
+                            if ($mods -match $ourDll) { $withOurs += $w.ProcessId }
+                            # Any other vendor's CLR profiler in the same process explains WHY ours is not
+                            # there, and is the actionable half for the operator. The pattern comes from
+                            # cx-foreign-apm.json - the same table the pre-flight probe uses - so this
+                            # cannot fall behind it. A missing/unparseable file yields $null, and $null
+                            # must NOT reach -match: `$x -match $null` matches everything and would report
+                            # every loaded module as a foreign profiler.
+                            if ($foreignModulePattern) {
+                                $f = @($mods | Where-Object { $_ -match $foreignModulePattern } | Select-Object -Unique)
+                                if (@($f).Count -gt 0) { $withForeign += "pid $($w.ProcessId): $($f -join ',')" }
+                            }
+                        }
+
+                        # D-1 - PENDING_RESTART. A process that STARTED BEFORE the environment it was
+                        # supposed to inherit was written cannot be carrying it: Windows freezes a
+                        # child's environment at CreateProcess, so the only way in is a restart. This is
+                        # the single most likely explanation for "every variable is correct and no data
+                        # arrives", and until now it graded green.
+                        #
+                        # The reference agent models the same thing as RESTART_REQUIRED and decides it exactly this
+                        # way - process creation time vs the time the agent was installed
+                        # (reference-agent study doc 11 s3). Two of its suppressions are copied here because they
+                        # are the difference between a useful finding and noise:
+                        #   * a process that ALREADY has our profiler loaded needs nothing, whatever the
+                        #     timestamps say - it evidently got the environment.
+                        #   * a process with no CLR has nothing to attach and is not waiting on us.
+                        # applicationHost.config's mtime is the reference point. It is where the pool
+                        # environment lives, so any per-app or per-pool instrumentation write touches it.
+                        #
+                        # The W3SVC/WAS service `Environment` value (where the PROFILER variables live)
+                        # is deliberately NOT used: a registry key's LastWriteTime needs RegQueryInfoKey
+                        # via P/Invoke, and adding that for a timestamp is not worth the surface. The
+                        # consequence is stated rather than hidden - a host where ONLY the profiler
+                        # registration changed and no pool env was touched will not raise this finding.
+                        $envWrittenUtc = $null
+                        try {
+                            if ($AppHostConfig -and (Test-Path -LiteralPath $AppHostConfig)) {
+                                $envWrittenUtc = (Get-Item -LiteralPath $AppHostConfig).LastWriteTimeUtc
+                            }
+                        } catch { }
+
+                        if ($envWrittenUtc) {
+                            foreach ($w in $workers) {
+                                $pidNum = $w.ProcessId
+                                if ($withOurs -contains $pidNum) { continue }   # it got the env; nothing pending
+                                if (@($noClr | Where-Object { $_ -match "pid $pidNum " }).Count -gt 0) { continue }
+                                $startUtc = $null
+                                try { $startUtc = (Get-Process -Id $pidNum -ErrorAction Stop).StartTime.ToUniversalTime() } catch { }
+                                if (-not $startUtc) { continue }
+                                if ($startUtc -lt $envWrittenUtc) {
+                                    $age = [int]([datetime]::UtcNow - $startUtc).TotalMinutes
+                                    Add-F (New-Finding -Verified 'runtime' -Check 'pendingRestart' -Severity 'warn' -Code 'PENDING_RESTART' -Target "$svc/pid$pidNum" `
+                                        -Message ("$($w.Name) pid=$pidNum started $($startUtc.ToString('u')) ($age min ago), BEFORE the instrumentation environment was last written ($($envWrittenUtc.ToString('u'))). A process's environment is frozen at creation, so this worker cannot be carrying it however correct the configuration reads - it must be restarted. Remedy: Restart-WebAppPool for its pool (or iisreset for all of them).") `
+                                        -Data @{ pid = $pidNum; startedUtc = $startUtc; envWrittenUtc = $envWrittenUtc; ageMinutes = $age })
+                                }
+                            }
+                        }
+
+                        # P0.3 - PER-PROCESS STATUS, one row per IIS-owned process. The reference agent reports an
+                        # injection decision per process; the aggregate verdicts above answer "is this
+                        # service healthy", which is not the same question as "what happened to each
+                        # worker". Emitted as info findings so they are greppable per pid.
+                        #
+                        # Only the statuses this build can actually determine are emitted. PENDING_RESTART
+                        # (P1.3), UNCOVERED (P1.2) and EXCLUDED (P2.4) are not implemented yet, and
+                        # printing them as absent would imply they had been checked.
+                        foreach ($w in $workers) {
+                            $pidNum = $w.ProcessId
+                            $status =
+                                if ($withOurs -contains $pidNum)                                    { 'INJECTED' }
+                                elseif (@($withForeign | Where-Object { $_ -match "pid $pidNum`:" }).Count -gt 0) { 'FOREIGN_PROFILER' }
+                                elseif (@($scanFailed | Where-Object { $_ -match "pid $pidNum " }).Count -gt 0)   { 'SCAN_FAILED' }
+                                elseif (@($noClr | Where-Object { $_ -match "pid $pidNum " }).Count -gt 0)        { 'NO_CLR' }
+                                elseif ($scanned -contains $pidNum)                                 { 'NOT_INJECTED' }
+                                else                                                                { 'UNKNOWN' }
+                            Add-F (New-Finding -Verified $(if ($status -in @('INJECTED','FOREIGN_PROFILER','NO_CLR','NOT_INJECTED')) { 'runtime' } else { 'none' }) `
+                                -Check 'processStatus' -Severity 'info' -Target "$svc/pid$pidNum" `
+                                -Message "$($w.Name) pid=$pidNum -> $status" `
+                                -Data @{ pid = $pidNum; name = $w.Name; parent = $w.ParentProcessId; status = $status })
+                        }
+
+                        if (@($scanFailed).Count -gt 0) {
+                            Add-F (New-Finding -Check 'profiler' -Severity 'warn' -Code 'PROFILER_MODULE_SCAN_FAILED' -Target $svc `
+                                -Message "the loaded modules of $(@($scanFailed).Count) of $(@($workers).Count) worker process(es) could not be read, so those processes prove nothing about whether the profiler attached: $($scanFailed -join '; '). $(if (@($scanned).Count -gt 0) { "The verdict below rests on the $(@($scanned).Count) process(es) that were readable." } else { 'No process was readable at all.' })" `
+                                -Data @{ failed = @($scanFailed); scanned = @($scanned); workers = @($workers).Count })
+                        }
+
+                        if (@($withOurs).Count -gt 0) {
+                            Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
+                                -Message "profiler registered AND loaded - our native library is in $(@($withOurs).Count) of $(@($scanned).Count) CLR-hosting worker process(es) (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)$(if (@($noClr).Count -gt 0) { "; $(@($noClr).Count) non-CLR child process(es) ignored" })" `
+                                -Verified 'runtime' -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; loadedIn = @($withOurs); scanned = @($scanned); noClr = @($noClr) })
+                        } elseif (@($scanned).Count -eq 0 -and @($scanFailed).Count -eq 0) {
+                            # Readable, but nothing is hosting a CLR - an idle pool, or every pool on
+                            # No Managed Code with no request served yet. Nothing to attach to, so this
+                            # is not a miss.
+                            Add-F (New-Finding -Check 'profiler' -Severity 'unknown' -Code 'PROFILER_LOAD_UNVERIFIED' -Target $svc `
+                                -Message "$svc registers our profiler correctly, and $(@($workers).Count) IIS-owned process(es) are running, but NONE of them has a CLR loaded$(if (@($noClr).Count -gt 0) { " ($($noClr -join ', '))" }) - so there is nothing for a CLR profiler to attach to yet and whether it loads could not be verified. Send a request to a .NET application and re-run." `
+                                -Data @{ noClr = @($noClr); workers = @($workers | ForEach-Object { $_.ProcessId }) })
+                        } elseif (@($scanned).Count -eq 0) {
+                            # Absence of evidence. Grading this a fail would accuse a host that may be
+                            # perfectly instrumented, which is the mirror image of the false green.
+                            Add-F (New-Finding -Check 'profiler' -Severity 'warn' -Code 'PROFILER_LOAD_UNVERIFIED_SCAN_FAILED' -Target $svc `
+                                -Message "$svc registers our profiler correctly and $(@($workers).Count) worker process(es) are running, but NONE of them could be scanned for loaded modules, so whether the profiler attached is unknown. This is not a pass and not a fail - see the PROFILER_MODULE_SCAN_FAILED finding for the per-process reasons, and use the snippet in docs/exception-foreign-profiler.md from an elevated 64-bit shell." `
+                                -Data @{ workers = @($workers | ForEach-Object { $_.ProcessId }) })
+                        } else {
+                            Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_NOT_LOADED_IN_PROCESS' -Target $svc `
+                                -Message "$svc registers OUR profiler correctly, but our native library ($ourDll.dll) is loaded in NONE of the $(@($scanned).Count) CLR-hosting worker process(es) that could be scanned - so .NET auto-instrumentation produces no spans while every variable reads as configured.$(if (@($withForeign).Count -gt 0) { " Another vendor's CLR profiler is in those processes instead ($($withForeign -join '; ')), and only ONE profiler can attach per process - it injects at process creation and wins over environment-based registration." } else { ' No other vendor profiler was found either, so check the profiler DLL path and that the worker restarted after the install.' }) Registration is not attachment: this is the state a check on the environment alone reports as healthy." `
+                                -Verified 'runtime' -Data @{ workers = @($workers | ForEach-Object { $_.ProcessId }); scanned = @($scanned); foreign = @($withForeign) })
+                        }
                     }
                 }
             }
@@ -660,15 +828,27 @@ function Test-IISInstrumentation {
             # loads that DLL, asks it for our CLSID, gets nothing, and attaches no profiler. It
             # happens when a bitness-specific path from another agent outranks the unsuffixed one.
             if (@($foreign).Count -eq 0) {
-                $home = Get-CxEnvEntry -Entries $entries -Name 'OTEL_DOTNET_AUTO_HOME'
+                # NOT $home. MEASURED on cx-e2e-c1: `$HOME` is a PowerShell automatic variable with
+                # options ReadOnly + AllScope, so `$home = ...` inside a function does not create a
+                # local - AllScope makes it target the same variable, ReadOnly makes the write fail -
+                # and the name keeps its original value, the user profile path. Every comparison below
+                # then ran against 'C:\Users\Administrator', so a correctly instrumented host produced
+                # PROFILER_PATH_FOREIGN for all six path names on both services and graded exit=1.
+                #
+                # A FALSE RED, and it hid until now for a precise reason: this block only runs when
+                # `$foreign` is empty, and on the reference agent host `$foreign` was NOT empty, so
+                # PROFILER_FOREIGN_OWNER fired and this code never executed. Removing the reference agent is what
+                # exposed it. Resolve-NodeServiceNames.ps1:564 already carries this warning - the trap
+                # was learned once and not applied here.
+                $autoHome = Get-CxEnvEntry -Entries $entries -Name 'OTEL_DOTNET_AUTO_HOME'
                 foreach ($pn in @('CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32','CORECLR_PROFILER_PATH',
                                   'COR_PROFILER_PATH_64','COR_PROFILER_PATH_32','COR_PROFILER_PATH')) {
                     $dll = Get-CxEnvEntry -Entries $entries -Name $pn
-                    if (-not $dll -or -not $home) { continue }
-                    if ($dll -notlike "$home*") {
+                    if (-not $dll -or -not $autoHome) { continue }
+                    if ($dll -notlike "$autoHome*") {
                         Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_PATH_FOREIGN' -Target "$svc/$pn" `
-                            -Message "$pn points outside OTEL_DOTNET_AUTO_HOME while CORECLR_PROFILER is ours: '$dll' is not under '$home'. The CLR loads that library, asks it for our CLSID and gets nothing, so no profiler attaches and no spans are produced - with every variable reading as configured. The CLR prefers the *_PATH_64 name over the unsuffixed one, so this is what a leftover from another agent looks like." `
-                            -Data @{ path = $dll; home = $home; name = $pn })
+                            -Message "$pn points outside OTEL_DOTNET_AUTO_HOME while CORECLR_PROFILER is ours: '$dll' is not under '$autoHome'. The CLR loads that library, asks it for our CLSID and gets nothing, so no profiler attaches and no spans are produced - with every variable reading as configured. The CLR prefers the *_PATH_64 name over the unsuffixed one, so this is what a leftover from another agent looks like." `
+                            -Data @{ path = $dll; home = $autoHome; name = $pn })
                     }
                 }
             }
@@ -684,16 +864,16 @@ function Test-IISInstrumentation {
             if (-not $dll) { continue }
             $checked++
             if (Test-Path -LiteralPath $dll -ErrorAction SilentlyContinue) {
-                Add-F (New-Finding -Check 'profilerPath' -Severity 'pass' -Target "$svc/$pn" `
+                Add-F (New-Finding -Verified 'config' -Check 'profilerPath' -Severity 'pass' -Target "$svc/$pn" `
                     -Message "profiler DLL present" -Data @{ path = $dll })
             } else {
-                Add-F (New-Finding -Check 'profilerPath' -Severity 'warn' -Code 'PROFILER_PATH_MISSING' -Target "$svc/$pn" `
+                Add-F (New-Finding -Verified 'config' -Check 'profilerPath' -Severity 'warn' -Code 'PROFILER_PATH_MISSING' -Target "$svc/$pn" `
                     -Message "$pn points at a file that does not exist - IIS starts but emits no telemetry: $dll" `
                     -Data @{ path = $dll })
             }
         }
         if ($checked -eq 0 -and ($clrGuid -or $fwGuid)) {
-            Add-F (New-Finding -Check 'profilerPath' -Severity 'warn' -Code 'PROFILER_PATH_MISSING' -Target $svc `
+            Add-F (New-Finding -Verified 'config' -Check 'profilerPath' -Severity 'warn' -Code 'PROFILER_PATH_MISSING' -Target $svc `
                 -Message "$svc declares a profiler GUID but no *_PROFILER_PATH* entry - the CLR cannot load the profiler")
         }
     }
@@ -703,14 +883,14 @@ function Test-IISInstrumentation {
     $autoHome = Get-CxEnvEntry -Entries $w3 -Name 'OTEL_DOTNET_AUTO_HOME'
     if (-not $autoHome) {
         if ($w3) {
-            Add-F (New-Finding -Check 'autoHome' -Severity 'warn' -Code 'AUTO_HOME_MISSING' `
+            Add-F (New-Finding -Verified 'config' -Check 'autoHome' -Severity 'warn' -Code 'AUTO_HOME_MISSING' `
                 -Message 'OTEL_DOTNET_AUTO_HOME is not set on W3SVC - Install-OpenTelemetryCore did not complete')
         }
     } elseif (-not (Test-Path -LiteralPath $autoHome -ErrorAction SilentlyContinue)) {
-        Add-F (New-Finding -Check 'autoHome' -Severity 'warn' -Code 'AUTO_HOME_MISSING' `
+        Add-F (New-Finding -Verified 'config' -Check 'autoHome' -Severity 'warn' -Code 'AUTO_HOME_MISSING' `
             -Message "OTEL_DOTNET_AUTO_HOME points at a missing directory: $autoHome" -Data @{ path = $autoHome })
     } else {
-        Add-F (New-Finding -Check 'autoHome' -Severity 'pass' `
+        Add-F (New-Finding -Verified 'config' -Check 'autoHome' -Severity 'pass' `
             -Message "auto-instrumentation home present" -Data @{ path = $autoHome })
     }
 
@@ -727,11 +907,11 @@ function Test-IISInstrumentation {
     } catch { }
 
     if ($manifestVersion) {
-        Add-F (New-Finding -Check 'autoHome' -Severity 'info' `
+        Add-F (New-Finding -Verified 'config' -Check 'autoHome' -Severity 'info' `
             -Message "deploy manifest records instrumentation version $manifestVersion" `
             -Data @{ instrumentVersion = $manifestVersion })
     } elseif ($autoHome) {
-        Add-F (New-Finding -Check 'autoHome' -Severity 'info' -Code 'INSTRUMENTATION_VERSION_UNKNOWN' `
+        Add-F (New-Finding -Verified 'config' -Check 'autoHome' -Severity 'info' -Code 'INSTRUMENTATION_VERSION_UNKNOWN' `
             -Message 'no deploy manifest found, so the installed instrumentation version cannot be confirmed')
     }
 
@@ -743,14 +923,14 @@ function Test-IISInstrumentation {
 
     $defEndpoint = $model.Defaults['OTEL_EXPORTER_OTLP_ENDPOINT']
     if (-not $defEndpoint) {
-        Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target 'applicationPoolDefaults' `
+        Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target 'applicationPoolDefaults' `
             -Message 'OTEL_EXPORTER_OTLP_ENDPOINT is not set on applicationPoolDefaults - pools that do not set it themselves have no exporter target')
     }
 
     foreach ($poolName in $usedPools) {
         $pool = $model.Pools[$poolName]
         if (-not $pool) {
-            Add-F (New-Finding -Check 'poolOtlp' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $poolName `
+            Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $poolName `
                 -Message 'an application references a pool that is not declared in applicationHost.config')
             continue
         }
@@ -761,11 +941,11 @@ function Test-IISInstrumentation {
         if (-not $endpoint) {
             if ($pool.HasOwnEnvBlock -and $defEndpoint) {
                 # The trap, caught: defaults look fine, this pool silently opted out.
-                Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_LOST_INHERITANCE' -Target $poolName `
+                Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_LOST_INHERITANCE' -Target $poolName `
                     -Message "pool declares its own <environmentVariables>, which REPLACES applicationPoolDefaults - it has no OTEL_EXPORTER_OTLP_ENDPOINT even though the defaults do. Usually a pool that owned a block before the agent was installed. Re-run Instrument-IIS.ps1 and recycle the pool: it writes the OTLP vars straight onto pools that own a block." `
                     -Data @{ defaultsEndpoint = $defEndpoint; poolEnvKeys = @($pool.Env.Keys) })
             } else {
-                Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target $poolName `
+                Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'warn' -Code 'IIS_OTLP_DEFAULTS_MISSING' -Target $poolName `
                     -Message 'no effective OTEL_EXPORTER_OTLP_ENDPOINT for this pool')
             }
             continue
@@ -776,27 +956,27 @@ function Test-IISInstrumentation {
             # deploy (Instrument-IIS.ps1 defaults to 127.0.0.1 and rewrites a
             # `localhost` value), so a hit here came from a hand edit, a pool block
             # that predates the agent, or an install from before that change.
-            Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'OTLP_ENDPOINT_LOCALHOST' -Target $poolName `
+            Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'warn' -Code 'OTLP_ENDPOINT_LOCALHOST' -Target $poolName `
                 -Message "endpoint uses 'localhost' ($endpoint). On a dual-stack host that resolves to ::1 first and OTLP export is silently dropped. Use $ExpectedOtlpEndpoint." `
                 -Data @{ endpoint = $endpoint; expected = $ExpectedOtlpEndpoint })
         } elseif ($endpoint -ne $ExpectedOtlpEndpoint) {
-            Add-F (New-Finding -Check 'poolOtlp' -Severity 'info' -Target $poolName `
+            Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'info' -Target $poolName `
                 -Message "endpoint '$endpoint' differs from the expected '$ExpectedOtlpEndpoint' (intentional if this host exports elsewhere)" `
                 -Data @{ endpoint = $endpoint; expected = $ExpectedOtlpEndpoint })
         } else {
-            Add-F (New-Finding -Check 'poolOtlp' -Severity 'pass' -Target $poolName `
+            Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'pass' -Target $poolName `
                 -Message "endpoint $endpoint" -Data @{ endpoint = $endpoint; inherited = (-not $pool.HasOwnEnvBlock) })
         }
 
         if (-not $eff['OTEL_EXPORTER_OTLP_PROTOCOL']) {
-            Add-F (New-Finding -Check 'poolOtlp' -Severity 'info' -Target $poolName `
+            Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'info' -Target $poolName `
                 -Message 'OTEL_EXPORTER_OTLP_PROTOCOL is not set; the SDK default applies')
         }
 
         # Stale snapshot: this pool's own block disagrees with the current
         # defaults, so a later central fix never reached it.
         foreach ($d in (Get-CxPoolEnvDrift -Pool $pool -Defaults $model.Defaults)) {
-            Add-F (New-Finding -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_ENV_STALE' -Target "$poolName/$($d.Name)" `
+            Add-F (New-Finding -Verified 'config' -Check 'poolOtlp' -Severity 'warn' -Code 'POOL_ENV_STALE' -Target "$poolName/$($d.Name)" `
                 -Message "pool has '$($d.Pool)' but applicationPoolDefaults now says '$($d.Default)'. A pool's own <environmentVariables> block replaces the defaults and is only a snapshot taken when the pool was first written, so this pool never picked up the change. Re-run Instrument-IIS.ps1 and recycle the pool." `
                 -Data @{ name = $d.Name; pool = $d.Pool; default = $d.Default })
         }
@@ -810,7 +990,7 @@ function Test-IISInstrumentation {
     # Classify the app first, then judge the pairing. Policy lives in Resolve-IISAppRuntime.ps1
     # so the installer skips exactly the apps this reports as not instrumentable.
     if (-not (Get-Command Resolve-IISAppRuntime -ErrorAction SilentlyContinue)) {
-        Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'HELPER_MISSING' `
+        Add-F (New-Finding -Verified 'config' -Check 'poolRuntime' -Severity 'unknown' -Code 'HELPER_MISSING' `
             -Message "Resolve-IISAppRuntime.ps1 was not found next to this script, so application runtimes could not be classified. Deferring rather than guessing: a guess here would report apps as correctly instrumented that the installer skipped.")
     } else {
         # Same JSON-file-first, hashtable-on-top precedence as every other override pair in
@@ -822,12 +1002,12 @@ function Test-IISInstrumentation {
         try {
             $rtOverrides = Resolve-IISRuntimeOverrides -Table $RuntimeOverrides -JsonPath $RuntimeOverridesJson
         } catch {
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'fail' -Code 'BAD_ARGUMENT' `
+            Add-F (New-Finding -Verified 'config' -Check 'poolRuntime' -Severity 'fail' -Code 'BAD_ARGUMENT' `
                 -Message "-RuntimeOverrides could not be parsed: $($_.Exception.Message)")
         }
 
         foreach ($k in (Get-IISUnmatchedRuntimeOverrideKeys -Overrides $rtOverrides -Apps $model.Apps)) {
-            Add-F (New-Finding -Check 'poolRuntime' -Severity 'warn' -Code 'RUNTIME_OVERRIDE_UNMATCHED' -Target $k `
+            Add-F (New-Finding -Verified 'config' -Check 'poolRuntime' -Severity 'warn' -Code 'RUNTIME_OVERRIDE_UNMATCHED' -Target $k `
                 -Message "-RuntimeOverrides has an entry for '$k' but no such IIS application exists on this host, so that classification is not in force. Usual causes: the key was copied from -ServiceNameOverrides (a different key space - runtime keys are '<Site><virtual path>' with root apps ending in '/'), a typo, or a decommissioned site.")
         }
 
@@ -871,7 +1051,7 @@ function Test-IISInstrumentation {
             # FILE, where the classification below describes the APPLICATION.
             $wc = $wcCache[$label]
             if ($wc.State -eq 'unreadable' -or $wc.State -eq 'nopath') {
-                Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
+                Add-F (New-Finding -Verified 'config' -Check 'poolRuntime' -Severity 'unknown' -Code 'WEBCONFIG_UNREADABLE' -Target $label `
                     -Message "$($wc.Error) - so this application's runtime cannot be determined" `
                     -Data @{ physicalPath = $app.PhysicalPath; error = $wc.Error })
                 continue
@@ -879,7 +1059,7 @@ function Test-IISInstrumentation {
 
             $pool = $model.Pools[$app.Pool]
             if (-not $pool) {
-                Add-F (New-Finding -Check 'poolRuntime' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $label `
+                Add-F (New-Finding -Verified 'config' -Check 'poolRuntime' -Severity 'unknown' -Code 'POOL_NOT_FOUND' -Target $label `
                     -Message "pool '$($app.Pool)' is not declared in applicationHost.config, so its CLR setting cannot be checked")
                 continue
             }
@@ -903,12 +1083,12 @@ function Test-IISInstrumentation {
                 } else {
                     "no web.config at '$($app.PhysicalPath)' - ASP.NET Core in IIS is wired by <aspNetCore> in web.config and classic ASP.NET by <system.web>, so neither is configured here. Normal for the stock Default Web Site."
                 }
-                Add-F (New-Finding -Check 'poolRuntime' -Severity 'info' -Code 'WEBCONFIG_ABSENT' -Target $label `
+                Add-F (New-Finding -Verified 'config' -Check 'poolRuntime' -Severity 'info' -Code 'WEBCONFIG_ABSENT' -Target $label `
                     -Message $msg -Data @{ physicalPath = $app.PhysicalPath; dirMissing = [bool]$wc.DirMissing })
             }
 
             if ($ov) {
-                Add-F (New-Finding -Check 'poolRuntime' -Severity 'info' -Code 'RUNTIME_OVERRIDE_APPLIED' -Target $label `
+                Add-F (New-Finding -Verified 'config' -Check 'poolRuntime' -Severity 'info' -Code 'RUNTIME_OVERRIDE_APPLIED' -Target $label `
                     -Message "runtime forced to $ov by -RuntimeOverrides; detection was not consulted. The install must be given the same override or the two will disagree about what is instrumented." `
                     -Data @{ override = $ov })
             }
@@ -1039,14 +1219,14 @@ function Test-CxIisLogCoverage {
     function Add-L { param($f) [void]$out.Add($f) }
 
     if (-not (Get-Command Get-IISLogConfig -ErrorAction SilentlyContinue)) {
-        Add-L (New-Finding -Check 'iisLogs' -Severity 'unknown' -Code 'HELPER_MISSING' `
+        Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'unknown' -Code 'HELPER_MISSING' `
             -Message 'Resolve-IISLogPaths.ps1 is not present, so IIS log coverage could not be checked')
         return ,@($out.ToArray())
     }
 
     $cfg = Get-IISLogConfig -AppHostConfig $AppHostConfig
     if (-not $cfg.Ok) {
-        Add-L (New-Finding -Check 'iisLogs' -Severity 'unknown' -Code 'IIS_LOGCONFIG_UNREADABLE' `
+        Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'unknown' -Code 'IIS_LOGCONFIG_UNREADABLE' `
             -Message $cfg.Error)
         return ,@($out.ToArray())
     }
@@ -1062,7 +1242,7 @@ function Test-CxIisLogCoverage {
     if ($cfg.CentralMode -ne 'Site') {
         # One file for the whole host: per-site attribution is gone before the data
         # ever reaches us. Informational, not a fault - it is a valid IIS setup.
-        Add-L (New-Finding -Check 'iisLogs' -Severity 'info' -Code 'IIS_CENTRAL_LOGGING' -Target $cfg.CentralDir `
+        Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'info' -Code 'IIS_CENTRAL_LOGGING' -Target $cfg.CentralDir `
             -Message "centralLogFileMode=$($cfg.CentralMode): all sites write one log under '$($cfg.CentralDir)', so per-site attribution is not available" `
             -Data @{ mode = $cfg.CentralMode; directory = $cfg.CentralDir })
     }
@@ -1072,7 +1252,7 @@ function Test-CxIisLogCoverage {
         if (-not $site.Enabled) {
             # Absence of logs here is intended. Saying nothing would leave an
             # operator hunting for a collector fault that does not exist.
-            Add-L (New-Finding -Check 'iisLogs' -Severity 'info' -Code 'IIS_LOGGING_DISABLED' -Target $site.Name `
+            Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'info' -Code 'IIS_LOGGING_DISABLED' -Target $site.Name `
                 -Message "logging is turned off for site '$($site.Name)' - no access logs are expected from it")
             continue
         }
@@ -1080,7 +1260,7 @@ function Test-CxIisLogCoverage {
         if ($site.Format -ne 'W3C') {
             # The receiver's csv_parser keys off a '#Fields:' header line, which only
             # W3C emits. IIS/NCSA/Custom files still tail, but arrive unparsed.
-            Add-L (New-Finding -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOG_FORMAT_UNSUPPORTED' -Target $site.Name `
+            Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOG_FORMAT_UNSUPPORTED' -Target $site.Name `
                 -Message "site '$($site.Name)' logs in $($site.Format) format - the collector's csv_parser needs the W3C '#Fields:' header, so these lines arrive unparsed" `
                 -Data @{ format = $site.Format })
         }
@@ -1089,11 +1269,11 @@ function Test-CxIisLogCoverage {
         $hit = $false
         foreach ($g in $globs) { if (Test-IISLogDirCovered -Directory $root -Glob $g) { $hit = $true; break } }
         if ($hit) {
-            Add-L (New-Finding -Check 'iisLogs' -Severity 'pass' -Target $site.Name `
+            Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'pass' -Target $site.Name `
                 -Message "access logs at '$root' are covered by a collector include")
         } else {
             $uncovered[$site.Directory] = $true
-            Add-L (New-Finding -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOGDIR_NOT_COVERED' -Target $site.Name `
+            Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOGDIR_NOT_COVERED' -Target $site.Name `
                 -Message "site '$($site.Name)' writes access logs to '$root', which no collector include matches - these logs never reach Coralogix. Re-run Instrument-IIS.ps1 to publish CX_IIS_LOG_DIR_n, then restart the collector." `
                 -Data @{ logRoot = $root; directory = $site.Directory; globs = $globs })
         }
@@ -1103,7 +1283,7 @@ function Test-CxIisLogCoverage {
     # because ${env:VAR} cannot expand into multiple include list entries.
     $needed = @($uncovered.Keys).Count + @($slotVals).Count
     if ($needed -gt $script:CxLogDirSlotCount) {
-        Add-L (New-Finding -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOGDIR_SLOTS_EXCEEDED' `
+        Add-L (New-Finding -Verified 'config' -Check 'iisLogs' -Severity 'warn' -Code 'IIS_LOGDIR_SLOTS_EXCEEDED' `
             -Message "this host needs $needed distinct log directories but the collector config declares only $($script:CxLogDirSlotCount) CX_IIS_LOG_DIR_n slots - add slots to the config template or consolidate the log directories" `
             -Data @{ needed = $needed; slots = $script:CxLogDirSlotCount })
     }

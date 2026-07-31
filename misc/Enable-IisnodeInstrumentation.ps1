@@ -123,6 +123,9 @@
 [CmdletBinding()]
 param(
     [switch]    $Apply,
+    # Take over an app pool that already exports to an OFF-BOX OTLP endpoint. Off by default: that
+    # endpoint belongs to another OpenTelemetry deployment.
+    [switch]    $ForceEndpoint,
     [bool]      $Recycle              = $true,
     [bool]      $RefreshServiceLabels = $true,
     [string[]]  $Pools,
@@ -812,8 +815,49 @@ foreach ($r in $selected) {
     # "instrumented" for an application that cannot serve a request.
     if ($r.IsEsm) {
         Write-Step WARN "$label is an ES module$(if ($r.Entry) { " ($($r.Entry))" }) and iisnode cannot host ES modules - its interceptor.js require()s the entry point, so the app returns HTTP 500 (ERR_REQUIRE_ESM) whether or not it is instrumented. Left alone: there is no working process here to instrument." `
-            -Fix 'application-side, unrelated to telemetry: give it a CommonJS entry point that dynamic-import()s the ESM app, or host it under PM2 / a Windows service instead of iisnode'
+            -Fix @'
+application-side, unrelated to telemetry. Point <iisnode> at a CommonJS entry that loads our bootstrap and then import()s the ESM app:
+
+    // server.cjs
+    require('C:/cx/otel-node/node_modules/@opentelemetry/auto-instrumentations-node/build/src/register.js');
+    import('./server.mjs').catch(e => { console.error(e); process.exit(1); });
+
+then set the iisnode handler path to server.cjs. (import() works from CommonJS; require() does not.) Or host the app under PM2 / a Windows service instead of iisnode. Worked example: docs/nodejs-pm2.md, "The CommonJS shim".
+'@
         continue
+    }
+    # N-1 RUNTIME GATE for iisnode. The node.exe here is whatever iisnode is configured to launch
+    # (<iisnode nodeProcessCommandLine>, else node.exe from PATH as the app-pool identity sees it),
+    # and on a brownfield IIS host that is frequently an old pinned install. Below the SDK minimum,
+    # writing NODE_OPTIONS onto the pool produces an app that serves normally and emits nothing.
+    #
+    # Candidates: the running node.exe child of this pool's w3wp (most authoritative), then the exe
+    # out of nodeProcessCommandLine if one is set.
+    if (Get-Command Get-CxNodeVersion -ErrorAction SilentlyContinue) {
+        $nodeChild = $null
+        try {
+            $poolPids = @(Get-CimInstance Win32_Process -Filter "Name='w3wp.exe'" -ErrorAction SilentlyContinue |
+                          Where-Object { "$($_.CommandLine)" -match [regex]::Escape($r.Pool) } | ForEach-Object { $_.ProcessId })
+            foreach ($pp in $poolPids) {
+                $kid = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$pp AND Name='node.exe'" -ErrorAction SilentlyContinue | Select-Object -First 1)
+                if (@($kid).Count -gt 0) { $nodeChild = [string]$kid[0].ExecutablePath; break }
+            }
+        } catch { }
+        $cmdLineExe = if ($r.CustomCmdLine) { [string]$r.CustomCmdLine } else { $null }
+        $nodeVer = Get-CxNodeVersion -Candidates @($nodeChild, $cmdLineExe)
+        # Nothing running and no explicit command line means the version is unknowable from here. Warn
+        # rather than refuse: an idle pool is the normal state of a host being provisioned, and refusing
+        # every idle iisnode app would be a worse failure than the one this gate closes. A KNOWN-bad
+        # version is refused.
+        $gate = Test-CxNodeRuntimeSupported -Version $nodeVer -IsEsm $false -Extensionless $false
+        if (-not $gate.Ok -and $gate.Code -ne 'NODE_VERSION_UNKNOWN') {
+            Write-Step WARN "$label REFUSED ($($gate.Code)): $($gate.Reason)" `
+                -Fix 'upgrade the Node runtime this application pool launches, then re-run'
+            continue
+        }
+        if ($gate.Code -eq 'NODE_VERSION_UNKNOWN') {
+            Write-Step INFO "$label - no node.exe is running for pool '$($r.Pool)' and no explicit nodeProcessCommandLine, so the Node version could not be verified. Proceeding; re-run the doctor once the app has served a request."
+        }
     }
     if ($r.CustomCmdLine) {
         Write-Step INFO "$label sets <iisnode nodeProcessCommandLine>, which replaces the node.exe invocation. Pool NODE_OPTIONS still applies, but check that command line does not already preload an OTel bootstrap - two SDKs in one process is its own failure mode."
@@ -850,6 +894,17 @@ foreach ($r in $selected) {
     # and Windows resolves the first entry), so writing both would make the appSettings name inert.
     $vars = [ordered]@{ NODE_OPTIONS = $merged }
     if ($decision.Mode -eq 'pool') { $vars['OTEL_SERVICE_NAME'] = $r.ServiceName }
+    # D-7: refuse to hijack another OpenTelemetry deployment's endpoint on this pool.
+    if (Get-Command Test-CxEndpointOverwriteAllowed -ErrorAction SilentlyContinue) {
+        $poolEp = Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT'
+        $epChk  = Test-CxEndpointOverwriteAllowed -Existing $poolEp -Ours $OtlpEndpoint -Force:$ForceEndpoint
+        if (-not $epChk.Allowed) {
+            Write-Step WARN "$label REFUSED (OTLP_ENDPOINT_FOREIGN): $($epChk.Reason)" `
+                -Fix "re-run with -ForceEndpoint to take pool '$($r.Pool)' over, or leave it to the deployment that owns it"
+            continue
+        }
+        if ($epChk.Foreign) { Write-Step INFO "$label - $($epChk.Reason)" }
+    }
     $vars['OTEL_EXPORTER_OTLP_ENDPOINT'] = $OtlpEndpoint
     $vars['OTEL_EXPORTER_OTLP_PROTOCOL'] = 'http/protobuf'
     $vars['OTEL_TRACES_EXPORTER']        = 'otlp'

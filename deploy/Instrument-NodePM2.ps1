@@ -90,6 +90,12 @@ param(
     [string]    $OverridesJson,
     [switch]    $NoRestart,
     [switch]    $SkipInstall,
+    # Take over an app that already exports to an OFF-BOX OTLP endpoint. Off by default - that endpoint
+    # belongs to another OpenTelemetry deployment and repointing it silently moves their telemetry here.
+    [switch]    $ForceEndpoint,
+    # X-6: trace sample ratio. 1.0 (default) writes parentbased_always_on, which is what an app with no
+    # sampler configured already does - so the default changes nothing and the knob now exists.
+    [ValidateRange(0.0, 1.0)][double] $SampleRatio = 1.0,
     [string[]]  $Apps,
     [string[]]  $ExcludeApps,
     # Only needed when the PM2 daemon is owned by an ORDINARY account. The built-in service
@@ -275,14 +281,91 @@ if ($Session) {
 }
 
 Write-Host "[node-instr] instrumenting $(@($svcMap).Count) PM2 app(s) (source: $(@($svcMap)[0].Source)):"
+
+# N-1: the node.exe the PM2 DAEMON runs, as the fallback interpreter for apps that declare none.
+# The daemon itself IS a node process, so its ExecutablePath is the most reliable host-level answer -
+# and it is the one PM2 uses to fork workers. Resolved once; per-app interpreters still win.
+$daemonNode = $null
+try {
+    $daemonProc = @(Get-CxPm2Processes | Where-Object { $_.Kind -eq 'daemon' } | Select-Object -First 1)
+    if (@($daemonProc).Count -gt 0 -and $daemonProc[0].Pid) {
+        $daemonNode = (Get-Process -Id $daemonProc[0].Pid -ErrorAction SilentlyContinue).Path
+    }
+} catch { }
+
 $failed = @()
+$refused = @()
+# N-2: extra blocklist patterns an operator added, read once.
+$blocklistExtra = @()
+if (Get-Command Get-CxNodeBlocklistPatterns -ErrorAction SilentlyContinue) { $blocklistExtra = @(Get-CxNodeBlocklistPatterns) }
+
 foreach ($r in $svcMap) {
+    # N-2: never instrument a tool process or a process under the debugger. PM2 can be managing a build
+    # watcher or a codegen script alongside real applications; naming those as services pollutes the
+    # service list in Coralogix and they are not applications anybody wants traces for.
+    if (Get-Command Test-CxNodeProcessBlocked -ErrorAction SilentlyContinue) {
+        $blockProbe = "$($r.Interpreter) $($r.Script) $($r.NodeOptions)"
+        $blk = Test-CxNodeProcessBlocked -CommandLine $blockProbe -Name $r.Name -ExtraPatterns $blocklistExtra
+        if ($blk.Blocked) {
+            Write-Host "  $($r.Name): SKIPPED [$($blk.Rule)] $($blk.Reason)" -ForegroundColor Yellow
+            $failed  += $r.Name
+            $refused += [pscustomobject]@{ Name = $r.Name; Code = "BLOCKED_$($blk.Rule.ToUpperInvariant())"; Version = $null }
+            continue
+        }
+    }
+
+    # N-1 RUNTIME GATE, before anything is written. An app on a Node below the SDK minimum is the one
+    # silent failure this deployment could still create by itself: NODE_OPTIONS is accepted, the app
+    # starts normally, and it emits NOTHING - forever, with no error and a doctor that used to call the
+    # host healthy. Refusing is the same rule that governs CX_IIS_SERVICES: a claimed service that never
+    # reports is worse than no service.
+    #
+    # Candidates most-authoritative first: the app's own interpreter, the RUNNING worker's exe, the
+    # daemon's node. Never PATH - see Get-CxNodeVersion for why that fallback is deliberately disabled
+    # once candidates exist.
+    # D-7: an app already exporting off-box belongs to another OpenTelemetry deployment. Repointing it
+    # silently moves their telemetry to us. Per-app rather than a whole-run refusal, because PM2 hosts
+    # unrelated apps side by side and one customer-wired app must not block the rest.
+    if (Get-Command Test-CxEndpointOverwriteAllowed -ErrorAction SilentlyContinue) {
+        $epChk = Test-CxEndpointOverwriteAllowed -Existing $r.OtlpEndpoint -Ours $OtlpEndpoint -Force:$ForceEndpoint
+        if (-not $epChk.Allowed) {
+            Write-Warning "[node-instr] $($r.Name) REFUSED (OTLP_ENDPOINT_FOREIGN): $($epChk.Reason)"
+            $failed  += $r.Name
+            $refused += [pscustomobject]@{ Name = $r.Name; Code = 'OTLP_ENDPOINT_FOREIGN'; Version = $null }
+            continue
+        }
+        if ($epChk.Foreign) { Write-Warning "[node-instr] $($r.Name): $($epChk.Reason)" }
+    }
+
+    $workerExe = $null
+    if ($r.Pid) { try { $workerExe = (Get-Process -Id $r.Pid -ErrorAction SilentlyContinue).Path } catch { } }
+    $nodeVer = Get-CxNodeVersion -Candidates @($r.Interpreter, $workerExe, $daemonNode)
+    $gate = Test-CxNodeRuntimeSupported -Version $nodeVer -IsEsm ([bool]$r.IsEsm) -Extensionless ([bool]$r.Extensionless)
+    if (-not $gate.Ok) {
+        Write-Warning "[node-instr] $($r.Name) REFUSED ($($gate.Code)): $($gate.Reason)"
+        $failed  += $r.Name
+        $refused += [pscustomobject]@{ Name = $r.Name; Code = $gate.Code; Version = $nodeVer }
+        continue
+    }
+
     # ESM entry points additionally need the loader hook; everything else just --require. See the
     # note above the $nodeOptionsEsm assignment for what was measured and why.
     $appNodeOptions = $nodeOptions
     if ($r.IsEsm) {
         if ($esmSupported) {
             $appNodeOptions = $nodeOptionsEsm
+            # N-5: on a Node that supports module.register(), use the shim instead of the deprecated
+            # --experimental-loader. Measured equivalent (3 spans vs 3) on Node 20.11; falls back silently
+            # to the old pair when the shim cannot be written, because a working deprecated form beats a
+            # broken modern one.
+            if ((Get-Command Get-CxNodeEsmBootstrapForm -ErrorAction SilentlyContinue) -and
+                (Get-CxNodeEsmBootstrapForm -Version $nodeVer) -eq 'register') {
+                $shimUrl = New-CxEsmRegisterShim -InstallPrefix $InstallPrefix -RegisterPath $registerPath -HookUrl $hookUrl
+                if ($shimUrl) {
+                    $appNodeOptions = "--import $shimUrl"
+                    Write-Host "      ESM via module.register() shim (Node $nodeVer); --experimental-loader is deprecated from 20.6"
+                }
+            }
         } else {
             Write-Warning "[node-instr] $($r.Name) is an ES module but the ESM loader hook is not available - instrumenting it would start the SDK and produce no telemetry, so it is left alone."
             $failed += $r.Name
@@ -295,7 +378,9 @@ foreach ($r in $svcMap) {
     # Both artifacts are declared as ours so a re-run cannot leave a stale hook behind: an app that
     # switches from ESM to CommonJS produces a bootstrap mentioning only register.js, and the ESM
     # loader would otherwise survive every future re-deploy.
-    $ownedTargets = @($registerPath, $(if ($esmSupported) { $hookUrl })) | Where-Object { $_ }
+    # The shim is declared as ours too, so switching an app between forms (or ESM->CommonJS) strips the
+    # previous bootstrap instead of accumulating two.
+    $ownedTargets = @($registerPath, $(if ($esmSupported) { $hookUrl }), (Join-Path $InstallPrefix 'cx-esm-register.mjs')) | Where-Object { $_ }
     $appNodeOptions = Merge-CxNodeOptions -Existing $r.NodeOptions -Bootstrap $appNodeOptions -OwnedTargets $ownedTargets
     $flag = if ($r.IsEsm) { 'esm+hook' } else { '--require' }
     Write-Host ("  {0,-24} mode={1,-13} instances={2} {3,-9} -> OTEL_SERVICE_NAME={4}" -f `
@@ -314,6 +399,24 @@ foreach ($r in $svcMap) {
         OTEL_METRICS_EXPORTER       = 'otlp'
         OTEL_LOGS_EXPORTER          = 'otlp'
     }
+    # X-6: sampling as a stated decision. Default 1.0 writes parentbased_always_on, which is what these
+    # apps already do implicitly - the difference is that it is now visible and adjustable.
+    if (Get-Command Get-CxTelemetryPolicyVars -ErrorAction SilentlyContinue) {
+        foreach ($kv in (Get-CxTelemetryPolicyVars -SampleRatio $SampleRatio -Runtime 'node').GetEnumerator()) {
+            $appEnv[$kv.Key] = $kv.Value
+        }
+    }
+    # N-8: per-app resource attributes mirroring the reference agent's PGI inputs (NODEJS_SCRIPT_NAME,
+    # NODEJS_APP_BASE_DIR) plus a per-INSTANCE id. Cluster workers share one service name, so without
+    # service.instance.id there is no way to tell four workers apart in the backend.
+    $resAttrs = @()
+    if ($r.Script) { $resAttrs += "node.script.path=$([string]$r.Script -replace '[,=]','_')" }
+    if ($r.Cwd)    { $resAttrs += "node.app.base.dir=$([string]$r.Cwd -replace '[,=]','_')" }
+    # N-4: the instance id comes from InstanceKey (name + pid) so cluster workers are distinguishable,
+    # and the identity that survives a rename travels as its own attribute.
+    $resAttrs += "service.instance.id=$(if ($r.InstanceKey) { $r.InstanceKey } else { $r.Name })"
+    if ($r.Identity) { $resAttrs += "cx.node.identity=$([string]$r.Identity -replace '[,=]','_')" }
+    if (@($resAttrs).Count -gt 0) { $appEnv['OTEL_RESOURCE_ATTRIBUTES'] = ($resAttrs -join ',') }
 
     if ($NoRestart) {
         # SetEnvironmentVariable, not Set-Item: Set-Item refuses an EMPTY value and, silenced, that
@@ -370,6 +473,17 @@ if ($NoRestart) {
 if ($failed.Count -gt 0) {
     Write-Warning "[node-instr] NOT instrumented: $($failed -join ', ')"
 }
+# Refusals are reported SEPARATELY from failures, because they are a different thing: nothing was
+# attempted and nothing is broken - the runtime simply cannot carry the instrumentation, and writing
+# NODE_OPTIONS anyway would have produced an app that emits nothing while looking healthy. Grouped by
+# code so a fleet run shows "11 apps on Node 16" as one line rather than eleven warnings.
+if (@($refused).Count -gt 0) {
+    Write-Host "[node-instr] refused by the runtime gate (nothing written, not claimed as services):" -ForegroundColor Yellow
+    foreach ($g in ($refused | Group-Object Code)) {
+        $vers = @($g.Group | ForEach-Object { if ($_.Version) { "$($_.Version)" } else { 'unknown' } } | Select-Object -Unique) -join ', '
+        Write-Host ("    {0,-32} {1} app(s) [Node {2}]: {3}" -f $g.Name, $g.Count, $vers, (@($g.Group | ForEach-Object { $_.Name }) -join ', ')) -ForegroundColor Yellow
+    }
+}
 
 # ---- 3. Machine env var CX_NODE_SERVICES --------------------------------------
 # Comma-joined distinct Node service name(s), built from the SAME $svcMap whose .ServiceName
@@ -418,6 +532,10 @@ if ($Session) {
     $Session.Manifest.nodeInstrumented        = (@($instrumented).Count -gt 0)
     $Session.Manifest.nodeInstrumentedApps    = @($instrumented | ForEach-Object { $_.Name })
     $Session.Manifest.nodeInstrumentFailedApps = @($failed)
+    # Recorded so the doctor can tell "refused by the gate" apart from "we tried and it broke", and so
+    # a later re-run on an upgraded runtime can see what changed.
+    $Session.Manifest.nodeRefusedApps = @($refused | ForEach-Object {
+        [ordered]@{ name = $_.Name; code = $_.Code; nodeVersion = "$($_.Version)" } })
 }
 
 Write-Host ""
