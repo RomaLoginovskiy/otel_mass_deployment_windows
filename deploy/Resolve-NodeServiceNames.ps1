@@ -347,6 +347,323 @@ function Test-CxNodeAppIsEsm {
     return $false
 }
 
+function Get-CxNodeVersion {
+    <#
+      The Node version of a SPECIFIC target, not of the host.
+
+      Deliberately not `node --version` on PATH: the node.exe a service or a PM2 app actually runs
+      is frequently not the one on the deploying account's PATH. A host can carry several (an old
+      C:\nodejs alongside a current C:\Program Files\nodejs, or a version manager's shim), and
+      instrumenting against the wrong one is how a version gate passes and the app still emits
+      nothing. Candidates are tried in the order the caller gives them, which should be
+      most-authoritative first: the launcher's configured exe, then the running process's
+      ExecutablePath, then PATH as a last resort.
+
+      Returns [version] or $null. $null means "could not determine" and must be treated as a
+      REFUSAL by the caller, never as "probably fine" - see Test-CxNodeRuntimeSupported.
+    #>
+    [CmdletBinding()]
+    param([string[]] $Candidates = @())
+
+    $tried = @()
+    $supplied = @($Candidates | Where-Object { $_ })
+    foreach ($c in $supplied) {
+        # A command line, not a bare path: take the leading token. NOT limited to a literal
+        # 'node.exe' - a launcher may run a shim, a versioned exe or a wrapper, and a regex that only
+        # recognised node.exe silently fell through to PATH instead. Caught by
+        # test\Test-NodeRuntimeGate.ps1, which got the HOST's Node version back for a fixture path.
+        $exe = $c
+        if ($exe -match '^\s*"([^"]+)"') { $exe = $matches[1] }
+        elseif ($exe -match '^\s*(\S+)') { $exe = $matches[1] }
+        if (-not (Test-Path -LiteralPath $exe -ErrorAction SilentlyContinue)) { $tried += "$exe (absent)"; continue }
+        try {
+            $raw = (& $exe --version 2>$null | Select-Object -First 1)
+            if ($raw -match 'v?(\d+)\.(\d+)\.(\d+)') {
+                return [version]("{0}.{1}.{2}" -f $matches[1], $matches[2], $matches[3])
+            }
+            $tried += "$exe (unparsable: $raw)"
+        } catch { $tried += "$exe ($($_.Exception.Message))" }
+    }
+
+    # PATH is a fallback ONLY when the caller had nothing to offer. If candidates WERE supplied and
+    # none answered, the PATH version answers a DIFFERENT question - it is the deploying account's
+    # node, not the target's - and that is exactly the wrong-node.exe mix-up this function exists to
+    # prevent. $null makes the caller refuse instead of instrumenting against a version it guessed.
+    if (@($supplied).Count -gt 0) {
+        Write-Verbose "Get-CxNodeVersion: candidates supplied and none answered --version ($($tried -join '; ')); NOT falling back to PATH"
+        return $null
+    }
+    try {
+        $cmd = Get-Command node -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) {
+            $raw = (& $cmd.Source --version 2>$null | Select-Object -First 1)
+            if ($raw -match 'v?(\d+)\.(\d+)\.(\d+)') {
+                return [version]("{0}.{1}.{2}" -f $matches[1], $matches[2], $matches[3])
+            }
+        }
+    } catch { }
+    Write-Verbose 'Get-CxNodeVersion: no candidates supplied and PATH has no usable node'
+    return $null
+}
+
+function Test-CxNodeRuntimeSupported {
+    <#
+      Can this Node runtime carry our instrumentation AT ALL, and can it carry the form this app
+      needs? Three separate thresholds, and conflating them is why the answer used to be "yes"
+      for every host:
+
+        SDK minimum        < 18.0            the OTel SDK does not support it. Writing NODE_OPTIONS
+                                             produces an app that starts perfectly and emits nothing,
+                                             forever, with no error anywhere.
+        ESM bootstrap      < 18.19 / < 20.6  the loader/--import forms an ES module app needs did not
+                                             exist yet. A CommonJS app on the same runtime is fine.
+        Extensionless      < 18.19 / < 20.10 an entry point with no file extension cannot be resolved
+                                             by the bootstrap. The reference agent gates on exactly these two
+                                             thresholds (see reference-agent study doc 11 s1.2).
+
+      Node 19 is intentionally NOT treated as supported for ESM: --import landed in 18.19 and 20.6,
+      so the 19.x line never received it, and 19 is long EOL.
+
+      Returns Ok plus a Code/Reason. A $null version is a REFUSAL (NODE_VERSION_UNKNOWN): claiming a
+      service that never reports is worse than claiming nothing, which is the same rule that governs
+      CX_IIS_SERVICES.
+    #>
+    [CmdletBinding()]
+    param(
+        [version] $Version,
+        [bool]    $IsEsm         = $false,
+        [bool]    $Extensionless = $false
+    )
+
+    $mk = { param($ok, $code, $reason) [pscustomobject]@{ Ok = $ok; Code = $code; Reason = $reason; Version = $Version } }
+
+    if (-not $Version) {
+        return & $mk $false 'NODE_VERSION_UNKNOWN' 'the Node version of this target could not be determined, so whether our instrumentation can work here is unknown - nothing was written rather than writing a bootstrap that may silently emit nothing'
+    }
+    if ($Version -lt [version]'18.0.0') {
+        return & $mk $false 'NODE_RUNTIME_BELOW_MINIMUM' "Node $Version is below the OpenTelemetry SDK minimum of 18.0. Setting NODE_OPTIONS here produces an app that starts normally and emits NO telemetry, with no error to show for it - so nothing was written and this app is not claimed as a service"
+    }
+    $hasImport = ($Version -ge [version]'20.6.0') -or ($Version -ge [version]'18.19.0' -and $Version -lt [version]'19.0.0')
+    if ($IsEsm -and -not $hasImport) {
+        return & $mk $false 'NODE_ESM_RUNTIME_UNSUPPORTED' "this is an ES module application and Node $Version predates the ESM bootstrap forms (needs >= 18.19 or >= 20.6). --require cannot patch an ESM import graph, so instrumenting it would load the SDK and emit nothing"
+    }
+    $hasExtensionless = ($Version -ge [version]'20.10.0') -or ($Version -ge [version]'18.19.0' -and $Version -lt [version]'19.0.0')
+    if ($Extensionless -and -not $hasExtensionless) {
+        return & $mk $false 'NODE_EXTENSIONLESS_UNSUPPORTED' "the entry point has no file extension and Node $Version cannot resolve one for a preloaded bootstrap (needs >= 18.19 or >= 20.10)"
+    }
+    return & $mk $true '' "Node $Version supports the required bootstrap"
+}
+
+function New-CxEsmRegisterShim {
+    <#
+      N-5: write the ESM bootstrap shim and return its file:// URL.
+
+      Replaces `--experimental-loader`, which Node itself now warns about - measured on the VM, Node 20.11
+      prints "`--experimental-loader` may be removed in the future; instead use `register()`" - with the
+      supported `module.register()` API. This is what one third-party agent's ESM loader does
+      (`module.register?.(import.meta.url)`, reference-agent study doc 09 s2.3).
+
+      MEASURED EQUIVALENT, not assumed: an ESM app instrumented with this shim produced 3 spans, and the
+      same app with the deprecated loader pair produced 3 spans, on Node 20.11 against the same collector.
+      That measurement is the only reason this ships - the previous attempt at "a better ESM form"
+      (`--import …/register.mjs`) was inferred, and register.mjs does not exist in this package version.
+
+      The paths are baked in rather than resolved at runtime: the shim runs before the app, in the app's
+      process, where our node_modules is not on any resolution path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string] $InstallPrefix,
+        [Parameter(Mandatory)][string] $RegisterPath,
+        [Parameter(Mandatory)][string] $HookUrl
+    )
+    $shimPath = Join-Path $InstallPrefix 'cx-esm-register.mjs'
+    # Forward slashes: this string is embedded in JS, where a backslash is an escape.
+    $regFwd = ($RegisterPath -replace '\\','/')
+    $content = @"
+// Generated by Resolve-NodeServiceNames.ps1 (N-5). Do not edit - re-created on every instrument run.
+//
+// Registers the OpenTelemetry ESM loader hook through module.register(), the supported replacement for
+// --experimental-loader (which Node 20.6+ warns is going away), then loads the CommonJS register
+// bootstrap. Both are needed: the hook patches the ESM import graph, the register starts the SDK.
+import { register } from 'node:module';
+import { createRequire } from 'node:module';
+
+register('$HookUrl', import.meta.url);
+createRequire(import.meta.url)('$regFwd');
+"@
+    try {
+        if (-not (Test-Path -LiteralPath $InstallPrefix)) { New-Item -ItemType Directory -Path $InstallPrefix -Force | Out-Null }
+        Set-Content -LiteralPath $shimPath -Value $content -Encoding UTF8
+    } catch {
+        Write-Warning "[node] could not write the ESM shim to $shimPath ($($_.Exception.Message)); the deprecated --experimental-loader form will be used instead."
+        return $null
+    }
+    return ('file:///' + ($shimPath -replace '\\','/'))
+}
+
+function Get-CxNodeEsmBootstrapForm {
+    <#
+      N-5: which ESM bootstrap form applies to this Node version?
+
+      'register' - --import a module.register() shim. Node >= 20.6, or >= 18.19 and < 19. The supported
+                   form, and measured equivalent to the old one.
+      'loader'   - --experimental-loader + --require. Everything else that can do ESM at all, i.e.
+                   20.0-20.5. Deprecated but working, and the only option there.
+      'none'     - below 18.19 (outside the 18.19-19 window): no ESM bootstrap exists. The runtime gate
+                   refuses these separately; this is here so the answer is never silently 'loader'.
+    #>
+    [CmdletBinding()]
+    param([version] $Version)
+    if (-not $Version) { return 'loader' }   # unknown version: the form that works on the widest range
+    if ($Version -ge [version]'20.6.0') { return 'register' }
+    if ($Version -ge [version]'18.19.0' -and $Version -lt [version]'19.0.0') { return 'register' }
+    if ($Version -ge [version]'20.0.0') { return 'loader' }
+    return 'none'
+}
+
+function Get-CxNodeEntryScript {
+    <#
+      N-3: which script is this node process actually running?
+
+      Mirrors the reference agent's argv walk (reference-agent study doc 11 s1.2-1.3): skip option tokens and the VALUES that
+      belong to them, then take the first positional argument. Getting this wrong is not cosmetic - the
+      entry script decides the ESM answer, the extensionless answer and the app's identity, and a naive
+      "first thing ending in .js" picks up `-r ts-node/register` or a --experimental-loader URL instead.
+
+      Returns an object: Entry, IsRepl (no script at all: -e / --eval / -p / --print / -i), and
+      Extensionless. Entry is $null when there is nothing to instrument, which is an ANSWER, not a
+      failure - a REPL or `node -e` has no entry point and never will.
+    #>
+    [CmdletBinding()]
+    param([string] $CommandLine, [string] $Cwd)
+
+    $mk = { param($entry, $repl, $extless)
+            [pscustomobject]@{ Entry = $entry; IsRepl = $repl; Extensionless = $extless } }
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return & $mk $null $false $false }
+
+    # Tokenise respecting quotes. -split on whitespace would break every path with a space in it, which
+    # on Windows is most of them.
+    $tokens = @()
+    foreach ($m in [regex]::Matches($CommandLine, '"([^"]*)"|(\S+)')) {
+        $tokens += $(if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value })
+    }
+    if (@($tokens).Count -eq 0) { return & $mk $null $false $false }
+
+    # Drop the interpreter itself.
+    $i = 0
+    if ($tokens[0] -match '(?i)node(\.exe)?$' -or $tokens[0] -match '(?i)\.(exe|cmd|bat)$') { $i = 1 }
+
+    # Node options that CONSUME the next token. Skipping the option but not its value is how a loader URL
+    # ends up mistaken for the entry script.
+    $valueOpts = @('-r','--require','--import','--loader','--experimental-loader','--conditions','-C',
+                   '--env-file','--inspect-port','--max-old-space-size','--stack-size','--title',
+                   '--redirect-warnings','--diagnostic-dir','--heapsnapshot-signal','--cpu-prof-dir',
+                   '--dns-result-order','--icu-data-dir','--openssl-config','--tls-cipher-list',
+                   '--use-largepages','--unhandled-rejections','--report-directory','--report-filename')
+    # Options that mean there is NO script: the code is on the command line or typed in.
+    $replOpts  = @('-e','--eval','-p','--print','-i','--interactive')
+
+    while ($i -lt @($tokens).Count) {
+        $t = $tokens[$i]
+        if ($replOpts -contains $t) { return & $mk $null $true $false }
+        if ($t -match '^--?[A-Za-z]') {
+            # --opt=value carries its value inline, so it consumes nothing extra.
+            if ($t -match '=') { $i++; continue }
+            if ($valueOpts -contains $t) { $i += 2; continue }
+            $i++; continue
+        }
+        # First positional token: the entry script.
+        $entry = $t
+        if ($Cwd -and -not ($entry -match '^[A-Za-z]:\\' -or $entry -match '^\\\\')) {
+            try { $entry = [System.IO.Path]::Combine($Cwd, $entry) } catch { }
+        }
+        $extless = -not ($t -match '\.[cm]?js$')
+        return & $mk $entry $false $extless
+    }
+    return & $mk $null $false $false
+}
+
+function Test-CxNodeProcessBlocked {
+    <#
+      N-2: should this node process be left alone entirely?
+
+      The reference agent keeps a blocklist in a CONFIG section (agentproc.conf [blocklist], with app and exe
+      filters) rather than in code, and gates separately on a debug flag ("Nodejs has a debug option
+      set"). Both are copied, and the shape matters: an operator will need to add to this list, so it
+      lives in a file.
+
+      Three reasons to skip, all of them things that would otherwise become junk "services" reporting
+      into Coralogix, or a debugging session we broke:
+
+        toolProcess   package managers, build tools, the PM2 daemon itself, service wrappers. These are
+                      not applications and naming them as services pollutes the service list.
+        debugFlag     --inspect / --inspect-brk / --inspect-port. Attaching a preload to a process
+                      somebody is actively debugging is rude and can change the behaviour being debugged.
+        repl          -e / --eval / -p / --print / -i: no entry script exists, so there is nothing to
+                      instrument and never will be.
+
+      Returns Blocked plus Reason and Rule so a skip is always attributable to a named rule.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]   $CommandLine,
+        [string]   $Name,
+        [string[]] $ExtraPatterns = @()
+    )
+
+    $mk = { param($b, $rule, $reason) [pscustomobject]@{ Blocked = $b; Rule = $rule; Reason = $reason } }
+    $cl = [string]$CommandLine
+
+    if ($cl -match '(?i)(^|\s)--inspect(-brk|-port)?(=|\s|$)') {
+        return & $mk $true 'debugFlag' 'the process is running under the V8 inspector (--inspect); instrumenting a process somebody is actively debugging can change what they are debugging'
+    }
+    $entry = Get-CxNodeEntryScript -CommandLine $cl
+    if ($entry.IsRepl) {
+        return & $mk $true 'repl' 'the code is supplied on the command line (-e/--eval/-p/--print) or typed interactively, so there is no entry script to instrument'
+    }
+
+    # Default tool patterns. Deliberately anchored to path separators or word edges so that an
+    # application legitimately called "my-npm-dashboard" is not blocked by the substring "npm".
+    $defaults = @(
+        '[\\/]npm(-cli)?\.js\b', '[\\/]npx-cli\.js\b', '[\\/]corepack\b',
+        '[\\/]pm2[\\/]bin[\\/]pm2\b', '[\\/]pm2[\\/]lib[\\/]Daemon\.js\b', 'God\.js\b',
+        '[\\/]node-windows[\\/]lib[\\/]wrapper\.js\b',
+        '[\\/]typescript[\\/]bin[\\/]tsc\b', '[\\/]\.bin[\\/]tsc\b',
+        '[\\/]webpack([\\/]|\.js\b)', '[\\/]jest([\\/]|\.js\b)', '[\\/]eslint([\\/]|\.js\b)',
+        '[\\/]nodemon([\\/]|\.js\b)', '[\\/]yarn\.js\b', '[\\/]pnpm\.cjs\b'
+    )
+    foreach ($p in @($defaults + @($ExtraPatterns | Where-Object { $_ }))) {
+        if ($cl -match $p -or ($Name -and $Name -match $p)) {
+            return & $mk $true 'toolProcess' "matches the tool-process rule '$p' - a package manager, build tool, process manager or service wrapper rather than an application"
+        }
+    }
+    return & $mk $false '' 'not blocked'
+}
+
+function Get-CxNodeBlocklistPatterns {
+    <#
+      Extra blocklist patterns from a config file, so an operator can extend the list without editing a
+      script. One regex per line; # comments and blanks ignored. Missing file = no extra patterns, which
+      is the normal case.
+    #>
+    [CmdletBinding()]
+    param([string] $Path)
+    if (-not $Path) {
+        $here = if ($PSScriptRoot) { $PSScriptRoot } else { '.' }
+        $Path = Join-Path $here 'cx-node-blocklist.txt'
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    try {
+        return @(Get-Content -LiteralPath $Path -ErrorAction Stop |
+                 ForEach-Object { $_.Trim() } |
+                 Where-Object { $_ -and -not $_.StartsWith('#') })
+    } catch {
+        Write-Warning "[node] could not read the blocklist at $Path : $($_.Exception.Message)"
+        return @()
+    }
+}
+
 function Get-CxPm2CommandPath {
     <#
       Absolute path of a LAUNCHABLE pm2 CLI, or $null.
@@ -1146,8 +1463,17 @@ function Get-PM2ProcessList {
             # The app's CURRENT NODE_OPTIONS, so instrumenting can preserve its own flags rather
             # than replacing them (Merge-CxNodeOptions).
             $nopt = if ($chunk -match '"NODE_OPTIONS":"((?:[^"\\]|\\.)*)"')  { Convert-CxJsonEscapes $matches[1] } else { '' }
+            # The interpreter PM2 will actually launch. Needed for the runtime version gate: an app can
+            # carry its own `interpreter`, and the node.exe that runs it is frequently NOT the one on the
+            # deploying account's PATH. Empty is normal (PM2 then uses its own node), and the caller
+            # falls back to the daemon's node - it must never fall back to PATH silently.
+            $interp = if ($chunk -match '"exec_interpreter":"((?:[^"\\]|\\.)*)"') { Convert-CxJsonEscapes $matches[1] } else { '' }
+            # The endpoint the app is ALREADY exporting to, so the writer can refuse to hijack another
+            # deployment's pipeline instead of silently repointing it (D-7).
+            $oep = if ($chunk -match '"OTEL_EXPORTER_OTLP_ENDPOINT":"((?:[^"\\]|\\.)*)"') { Convert-CxJsonEscapes $matches[1] } else { '' }
             [pscustomobject]@{ Name = $name; Pid = $ppid; ExecMode = $mode; Status = $stat; Source = 'jlist'
-                               Script = $scr; Cwd = $cwd; NodeOptions = $nopt }
+                               Script = $scr; Cwd = $cwd; NodeOptions = $nopt; Interpreter = $interp
+                               OtlpEndpoint = $oep }
         }
         if (@($out).Count -gt 0) { return @($out) }
     }
@@ -1216,6 +1542,8 @@ function Get-PM2ServiceMap {
         $script = if ($p.PSObject.Properties['Script'])      { [string]$p.Script }      else { '' }
         $cwd    = if ($p.PSObject.Properties['Cwd'])         { [string]$p.Cwd }         else { '' }
         $nopt   = if ($p.PSObject.Properties['NodeOptions']) { [string]$p.NodeOptions } else { '' }
+        $interp = if ($p.PSObject.Properties['Interpreter']) { [string]$p.Interpreter } else { '' }
+        $ppid   = if ($p.PSObject.Properties['Pid'])         { $p.Pid }                 else { $null }
         $byName[$name] = [pscustomobject]@{
             Name        = $name
             ServiceName = $name
@@ -1228,6 +1556,26 @@ function Get-PM2ServiceMap {
             Script      = $script
             Cwd         = $cwd
             NodeOptions = $nopt
+            # For the runtime version gate. Interpreter is what PM2 will launch (empty = PM2's own
+            # node); Pid lets the caller read the RUNNING worker's ExecutablePath, which is the most
+            # authoritative answer available for an app that is already up.
+            Interpreter = $interp
+            Pid         = $ppid
+            # For the D-7 endpoint guard: what this app already exports to, if anything.
+            OtlpEndpoint = $(if ($p.PSObject.Properties['OtlpEndpoint']) { [string]$p.OtlpEndpoint } else { '' })
+            # N-4: IDENTITY is the executed script path; the pm2 NAME is only a label.
+            #
+            # The reference agent keys the process group on pm_exec_path (PG_ID_CALC_INPUT_KEY_NODEJS_SCRIPT_NAME),
+            # not on the display name, and the difference shows up in three real situations: an app renamed
+            # in pm2 keeps its script and should keep its identity; two apps with the SAME name under
+            # different PM2_HOMEs are different applications; and cluster workers share a name but are
+            # distinct instances. The label stays the pm2 name because that is what an operator expects to
+            # see in Coralogix - so Identity and ServiceName are deliberately separate fields.
+            Identity     = $(if ($script) { $script } else { "pm2:$name" })
+            InstanceKey  = $(if ($ppid) { "$name-$ppid" } else { $name })
+            # An entry point with no extension needs a newer Node than one with. Kept next to IsEsm
+            # because both are runtime-gate inputs derived from the same script path.
+            Extensionless = [bool]($script -and -not ($script -match '\.[cm]?js$'))
             IsEsm       = [bool](Test-CxNodeAppIsEsm -Script $script -Cwd $cwd)
         }
     }

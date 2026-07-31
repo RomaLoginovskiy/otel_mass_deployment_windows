@@ -280,6 +280,59 @@ that `import()`s the ESM app, or host it under PM2 / a Windows service instead.
 
 iisnode 0.2.26 (2015) is the last release, so this will not change upstream.
 
+#### On the PM2 path, the ESM bootstrap now uses `module.register()`
+
+Node 20.6+ warns that `--experimental-loader` "may be removed in the future; instead use `register()`" —
+observed verbatim on the VM. So on Node ≥ 20.6 (or ≥ 18.19 and < 19) the instrumenter writes a generated
+shim instead:
+
+```
+NODE_OPTIONS=--import file:///C:/cx/otel-node/cx-esm-register.mjs
+```
+
+The shim calls `module.register('<hook.mjs>', import.meta.url)` and then requires the CommonJS
+`register.js`. **Measured equivalent before shipping**: the same ESM app produced **3 spans** with the
+shim and **3 spans** with the old `--experimental-loader` + `--require` pair, on Node 20.11 against the
+same collector. Nodes 20.0–20.5 keep the old pair, which is the only form they have. Below 18.19 (and all
+of 19.x, which never received `--import`) there is no ESM bootstrap and the runtime gate refuses the app
+rather than instrumenting it into silence.
+
+Note what this is *not*: `--import` pointed at the CommonJS `register.js` yields **zero spans**, and
+`--import` with a bare `C:\…` path crashes the app (`ERR_UNSUPPORTED_ESM_URL_SCHEME`). `register.mjs` does
+not exist in `@opentelemetry/auto-instrumentations-node@0.79.0` — the exports are `.` and `./register`
+only. The shim exists because those three dead ends were measured.
+
+#### The CommonJS shim, if the app must stay on iisnode
+
+The fix is application-side and small, so it is written out here rather than left as "give it a
+CommonJS entry point". Point `<iisnode>` at a **CommonJS** file that loads our bootstrap and then
+dynamically imports the real ESM app — `import()` works from CommonJS, `require()` does not:
+
+```js
+// server.cjs  —  the iisnode entry point. CommonJS, so interceptor.js can require() it.
+// 1. our bootstrap first, so instrumentation is in place before any app module loads
+require('C:/cx/otel-node/node_modules/@opentelemetry/auto-instrumentations-node/build/src/register.js');
+
+// 2. then the real ESM application. import() returns a promise; failing loudly beats a silent 500.
+import('./server.mjs').catch(err => { console.error('failed to start ESM app', err); process.exit(1); });
+```
+
+```xml
+<!-- web.config -->
+<handlers>
+  <add name="iisnode" path="server.cjs" verb="*" modules="iisnode" />
+</handlers>
+```
+
+Automation deliberately does **not** write this: it changes the application's entry point, which is the
+app owner's decision and not something a telemetry deploy should do behind their back. Both writers keep
+refusing, and the refusal message now carries this recipe.
+
+Two things to keep in mind: the `require` path must be the **staged** register.js (`-InstallPrefix`,
+default `C:\cx\otel-node`), because the app's own `node_modules` will not contain it; and the app pool
+identity needs read access to that directory, which the installer grants when it writes the pool
+environment.
+
 > **Another APM agent on the host?** The Node side is additive, but the CLR loads exactly **one**
 > `ICorProfiler`. If something else already occupies that slot in `w3wp`, attaching the OTel .NET
 > profiler to those pools is a conflict, not double telemetry. `misc\Enable-IisnodeInstrumentation.ps1`

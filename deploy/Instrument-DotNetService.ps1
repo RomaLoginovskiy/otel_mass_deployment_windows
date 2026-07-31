@@ -50,7 +50,14 @@ param(
     [string]   $OtlpEndpoint          = 'http://127.0.0.1:4318',
     [string]   $AutoHome              = $null,
     [hashtable] $ServiceNameOverrides = @{},
-    [switch]   $Remove
+    [switch]   $Remove,
+    # Take over a service that already exports to an OFF-BOX OTLP endpoint. See the note on the same
+    # switch in Instrument-IIS.ps1.
+    [switch]   $ForceEndpoint,
+    # D-3b: write the MANAGED half only - startup hook, no CLR profiler - for a host where another agent
+    # owns the profiler slot. .NET Core only; Framework is refused because it has no startup hooks.
+    # Partial coverage by design: see docs/exception-foreign-profiler.md.
+    [switch]   $NoProfiler
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,13 +146,23 @@ function Get-CxProfilerTemplate {
     param([string] $AutoHomeOverride)
 
     $w3 = (Get-CxServiceEnvMap -Name 'W3SVC').Map
-    $home = if ($AutoHomeOverride) { $AutoHomeOverride } elseif ($w3.Contains('OTEL_DOTNET_AUTO_HOME')) { [string]$w3['OTEL_DOTNET_AUTO_HOME'] } else { $null }
-    if (-not $home) {
+    # $autoHome, NEVER $home. MEASURED on cx-e2e-c1: `$HOME` is a PowerShell automatic variable with
+    # options ReadOnly + AllScope. AllScope means an assignment inside a function does not create a
+    # local, it targets the same variable; ReadOnly makes the write fail. So `$home = <auto home>`
+    # left the name holding the USER PROFILE PATH, and everything derived from it was wrong.
+    #
+    # Here that was a WRITER bug, not just a reporting one: with no explicit *_PROFILER_PATH_* on
+    # W3SVC, the defaults below became 'C:\Users\<who>\win-x64\OpenTelemetry.AutoInstrumentation.Native.dll'
+    # and OTEL_DOTNET_AUTO_HOME was written as the profile directory - so the service got a profiler
+    # path that does not exist, attached nothing, and reported no spans while the install said OK.
+    # Test-Path on the profile directory SUCCEEDS, so the guard below could not catch it either.
+    $autoHome = if ($AutoHomeOverride) { $AutoHomeOverride } elseif ($w3.Contains('OTEL_DOTNET_AUTO_HOME')) { [string]$w3['OTEL_DOTNET_AUTO_HOME'] } else { $null }
+    if (-not $autoHome) {
         return [pscustomobject]@{ Ok = $false
             Reason = 'no OTEL_DOTNET_AUTO_HOME on W3SVC and no -AutoHome given - install the .NET auto-instrumentation first (Install-OpenTelemetryCore), or pass -AutoHome' }
     }
-    if (-not (Test-Path -LiteralPath $home)) {
-        return [pscustomobject]@{ Ok = $false; Reason = "OTEL_DOTNET_AUTO_HOME does not exist on disk: $home" }
+    if (-not (Test-Path -LiteralPath $autoHome)) {
+        return [pscustomobject]@{ Ok = $false; Reason = "OTEL_DOTNET_AUTO_HOME does not exist on disk: $autoHome" }
     }
 
     # Prefer the exact values already on W3SVC; fall back to the vendor's documented layout under
@@ -159,7 +176,7 @@ function Get-CxProfilerTemplate {
     $coreGuid = if ($w3.Contains('CORECLR_PROFILER')) { [string]$w3['CORECLR_PROFILER'] } else { $script:CxOtelProfilerClsid }
     $fwGuid   = if ($w3.Contains('COR_PROFILER'))     { [string]$w3['COR_PROFILER'] }     else { $coreGuid }
     $corePath = Get-CxFirstEnvValue -Map $w3 -Names 'CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH' `
-                                    -Default (Join-Path $home 'win-x64\OpenTelemetry.AutoInstrumentation.Native.dll')
+                                    -Default (Join-Path $autoHome 'win-x64\OpenTelemetry.AutoInstrumentation.Native.dll')
     $fwPath   = Get-CxFirstEnvValue -Map $w3 -Names 'COR_PROFILER_PATH_64','COR_PROFILER_PATH' -Default $corePath
 
     # A GUID that is not ours means another CLR profiler owns IIS on this host. Copying it onto a
@@ -180,7 +197,7 @@ function Get-CxProfilerTemplate {
         }
     }
 
-    $common = [ordered]@{ OTEL_DOTNET_AUTO_HOME = $home }
+    $common = [ordered]@{ OTEL_DOTNET_AUTO_HOME = $autoHome }
     # Anything else the module put on W3SVC that a service also needs (additional deps / store
     # paths vary by version) is carried over verbatim rather than second-guessed.
     foreach ($k in @('DOTNET_ADDITIONAL_DEPS','DOTNET_SHARED_STORE','DOTNET_STARTUP_HOOKS','OTEL_DOTNET_AUTO_PLUGINS')) {
@@ -197,13 +214,13 @@ function Get-CxProfilerTemplate {
                         CORECLR_PROFILER_PATH    = $corePath; CORECLR_PROFILER_PATH_64 = $corePath }
     $fw   = [ordered]@{ COR_ENABLE_PROFILING     = '1'; COR_PROFILER     = $fwGuid
                         COR_PROFILER_PATH        = $fwPath;   COR_PROFILER_PATH_64     = $fwPath }
-    $core32 = Get-CxFirstEnvValue -Map $w3 -Names 'CORECLR_PROFILER_PATH_32' -Default (Join-Path $home 'win-x86\OpenTelemetry.AutoInstrumentation.Native.dll')
+    $core32 = Get-CxFirstEnvValue -Map $w3 -Names 'CORECLR_PROFILER_PATH_32' -Default (Join-Path $autoHome 'win-x86\OpenTelemetry.AutoInstrumentation.Native.dll')
     if ($core32 -and (Test-Path -LiteralPath $core32)) {
         $core['CORECLR_PROFILER_PATH_32'] = $core32
         $fw['COR_PROFILER_PATH_32']       = Get-CxFirstEnvValue -Map $w3 -Names 'COR_PROFILER_PATH_32' -Default $core32
     }
 
-    return [pscustomobject]@{ Ok = $true; Home = $home; Common = $common; Core = $core; Framework = $fw
+    return [pscustomobject]@{ Ok = $true; Home = $autoHome; Common = $common; Core = $core; Framework = $fw
                               FromW3svc = [bool]$w3.Contains('CORECLR_PROFILER'); Reason = $null }
 }
 
@@ -352,6 +369,65 @@ foreach ($name in $Services) {
     # The opposite pair is removed, so a service that changes runtime cannot keep a stale attach.
     $otherPair = if ($runtime -eq 'core') { $template.Framework } else { $template.Core }
     foreach ($k in $otherPair.Keys) { if ($map.Contains($k)) { $map.Remove($k) } }
+
+    # D-6: PROTECTED PROCESSES. The reference agent has SUPPRESSION_REASON_PROTECTED_PROCESS; narrowed here to what
+    # a script-only deployment can honour - never attach a CLR profiler to a Windows-owned service.
+    #
+    # -Services has no default enumeration precisely so that this cannot happen by accident, but a
+    # careless `-Services (Get-Service | ...)` would hand us svchost, WinDefend or the SCM itself, and a
+    # profiler in one of those is a host-level incident rather than a telemetry mistake. Cheap to refuse.
+    $svcImage = ''
+    try {
+        $sq = @(Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop | Select-Object -First 1)
+        if (@($sq).Count -gt 0) { $svcImage = [string]$sq[0].PathName }
+    } catch { }
+    $winDir = [regex]::Escape($env:windir)
+    if ($svcImage -match "(?i)^`"?$winDir\\(System32|SysWOW64)\\") {
+        Write-Warning "[dotnet-svc] $name REFUSED (PROTECTED_PROCESS): its image lives under $env:windir\System32 (`"$svcImage`"), so this is a Windows-owned service. Attaching a CLR profiler to one is a host-level risk, not a telemetry decision, and no deploy script should do it automatically."
+        $failed++
+        continue
+    }
+
+    # D-7: refuse to hijack another OpenTelemetry deployment's endpoint. $map started as the service's
+    # OWN existing environment, so the pre-existing value is still in it at this point.
+    if (Get-Command Test-CxEndpointOverwriteAllowed -ErrorAction SilentlyContinue) {
+        $existingEp = if ($map.Contains('OTEL_EXPORTER_OTLP_ENDPOINT')) { [string]$map['OTEL_EXPORTER_OTLP_ENDPOINT'] } else { '' }
+        $epChk = Test-CxEndpointOverwriteAllowed -Existing $existingEp -Ours $OtlpEndpoint -Force:$ForceEndpoint
+        if (-not $epChk.Allowed) {
+            Write-Warning "[dotnet-svc] $name REFUSED (OTLP_ENDPOINT_FOREIGN): $($epChk.Reason)"
+            $failed++
+            continue
+        }
+        if ($epChk.Foreign) { Write-Warning "[dotnet-svc] $name : $($epChk.Reason)" }
+    }
+
+    # D-3b: DEGRADED MODE. On a host where another agent owns the single ICorProfilerCallback slot, our
+    # profiler attaches to nothing - so write the MANAGED half only and say exactly what that buys.
+    #
+    # Measured on cx-e2e-c1 with the vendor's own variable set: HttpClient spans are produced with
+    # CORECLR_ENABLE_PROFILING=0 (a GET span appeared in both configurations). ASP.NET Core request spans
+    # likewise, via ASPNETCORE_HOSTINGSTARTUPASSEMBLIES. What was NOT established is the bytecode-rewritten
+    # set - the probe's SqlClient connect failed before any command ran, so it produced no span with the
+    # profiler either and proves nothing about SqlClient/Redis/Mongo.
+    #
+    # Framework is refused outright: .NET Framework has no startup hooks, so removing the profiler leaves
+    # literally nothing.
+    if ($NoProfiler) {
+        if ($runtime -ne 'core') {
+            Write-Warning "[dotnet-svc] $name REFUSED (-NoProfiler): this is a .NET FRAMEWORK service, and Framework has no startup-hook mechanism - without the profiler there is no instrumentation at all. Use option 1, 2 or 3 in docs/exception-foreign-profiler.md instead."
+            $failed++
+            continue
+        }
+        foreach ($k in @('CORECLR_PROFILER','CORECLR_PROFILER_PATH','CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32',
+                         'COR_ENABLE_PROFILING','COR_PROFILER','COR_PROFILER_PATH','COR_PROFILER_PATH_64','COR_PROFILER_PATH_32')) {
+            if ($map.Contains($k)) { $map.Remove($k) }
+        }
+        $map['CORECLR_ENABLE_PROFILING'] = '0'
+        # DOTNET_ADDITIONAL_DEPS / DOTNET_SHARED_STORE are deliberately NOT set: measured on
+        # v1.16.0-beta.1, neither directory exists in the install, and pointing them at missing paths
+        # broke assembly resolution in the probe. The vendor module does not set them either.
+        Write-Host "  -NoProfiler: writing the MANAGED half only (startup hook, no CLR profiler). Expect ASP.NET Core and HttpClient spans; SqlClient/Redis/Mongo are bytecode-instrumented and are NOT expected - that part is unmeasured, so treat it as unknown rather than absent." -ForegroundColor Yellow
+    }
 
     $map['OTEL_EXPORTER_OTLP_ENDPOINT'] = $OtlpEndpoint
     $map['OTEL_EXPORTER_OTLP_PROTOCOL'] = 'http/protobuf'

@@ -1,0 +1,53 @@
+{
+  "//": "X-2/X-3 instrumentation rules. Copy to cx-instrument-rules.json next to the deploy scripts.",
+  "//hostDisabled": "true turns auto-injection off for this WHOLE host, whatever the rules say. The equivalent of the reference agent's deployment.conf AutoInjectionDisabled - one switch, distinct from per-app exclusion.",
+  "hostDisabled": false,
+
+  "//rules": [
+    "Ordered. FIRST MATCH WINS, so put narrow includes ABOVE broad excludes.",
+    "type:    exclude | include | set     ('set' supplies a name/runtime and does NOT decide inclusion)",
+    "field:   any target property - site, pool, appPath, serviceName, exePath, cmdline, name -",
+    "         or env:NAME to match an environment variable the process already carries.",
+    "op:      equals notEquals starts notStarts ends notEnds contains notContains all",
+    "reason:  free text, printed when the rule fires. Write why, not what - the what is already visible."
+  ],
+  "rules": [
+    {
+      "type": "include",
+      "field": "pool",
+      "op": "equals",
+      "value": "wallet-api",
+      "reason": "wanted even though the broad exclude below would otherwise catch it"
+    },
+    {
+      "type": "exclude",
+      "field": "env:ASPNETCORE_ENVIRONMENT",
+      "op": "equals",
+      "value": "Development",
+      "reason": "dev-mode apps on this host are not worth span volume"
+    },
+    {
+      "type": "exclude",
+      "field": "site",
+      "op": "starts",
+      "value": "test-",
+      "reason": "scratch sites, recreated constantly, would churn the service list"
+    },
+    {
+      "type": "set",
+      "field": "serviceName",
+      "op": "equals",
+      "value": "Wallet/api",
+      "serviceName": "wallet-api",
+      "reason": "match the name this service already has in APM, rather than the IIS-derived one"
+    },
+    {
+      "type": "set",
+      "field": "appPath",
+      "op": "equals",
+      "value": "/legacy",
+      "runtime": "AspNetFramework",
+      "reason": "classification cannot decide this one; it is Framework - a rule survives a rename, unlike the old -RuntimeOverrides key"
+    }
+  ]
+}

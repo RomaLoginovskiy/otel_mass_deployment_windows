@@ -280,6 +280,50 @@ Assert-Case -Name 'stale profiler DLL path is caught' -Result $r -ExpectExit 2 -
     'PROFILER_PATH_MISSING', 'AUTO_HOME_MISSING'
 ) -Reject @('PROFILER_REGISTRY_MALFORMED')
 
+# D7. ANOTHER VENDOR owns the one CLR profiler slot. Measured on cx-e2e-c1 with a third-party
+# full-stack agent installed: our registration was perfect and our library was in no process at all.
+# Only the REGISTRATION half is reproducible here (loading a foreign profiler would mean shipping a
+# working ICorProfiler), so this asserts the registration verdict and the vendor hint.
+#
+# The expected hint is read from the signature file, so this test cannot pass while the doctor and the
+# table disagree about what a vendor is called.
+$expectVendorHint = @((Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\..\deploy\cx-foreign-apm.json') -Raw |
+                        ConvertFrom-Json).vendors | Where-Object { $_.installDir })[0].name
+$null = Invoke-Break -Case 'profilerForeign'
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+Assert-Case -Name "a foreign profiler CLSID is a HARD fail, vendor named" -Result $r -ExpectExit 1 -Expect @(
+    'PROFILER_FOREIGN_OWNER', $expectVendorHint
+) -Reject @('PROFILER_NOT_REGISTERED')
+
+# D8. Our CLSID with somebody else's library - the silent shape. The CLR loads that DLL, asks
+# for our CLSID, gets nothing, attaches nothing, and every variable still reads as configured.
+$null = Invoke-Break -Case 'profilerPathHijack'
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+Assert-Case -Name 'our CLSID + foreign library is caught' -Result $r -ExpectExit 1 -Expect @(
+    'PROFILER_PATH_FOREIGN'
+) -Reject @('PROFILER_FOREIGN_OWNER')
+
+# D9. THE REGRESSION GUARD FOR THE FALSE GREEN. With a correct, ours-only registration the check
+# must reach exactly one load verdict and SAY SO - whether the answer is loaded, not loaded, no
+# worker running, or could-not-scan. On cx-e2e-c1 it produced no profiler load finding at all,
+# which is the one outcome that must be impossible. Asserted as "one of these, at least one",
+# because which one is legitimately environment-dependent: an idle container has no worker, a
+# loaded host has our library. Any of them is a pass; silence is the failure.
+$null = Invoke-Break -Case 'profilerRestore'
+$r = Invoke-Doctor -ScriptFile 'Test-IISInstrumentation.ps1'
+$verdicts = @('PROFILER_LOAD_UNVERIFIED', 'PROFILER_LOAD_UNVERIFIED_SCAN_FAILED',
+              'PROFILER_MODULE_SCAN_FAILED', 'PROFILER_WORKER_ENUM_FAILED',
+              'PROFILER_NOT_LOADED_IN_PROCESS', 'registered AND loaded')
+$seen = @($verdicts | Where-Object { $r.Out -match [regex]::Escape($_) })
+if (@($seen).Count -gt 0) {
+    Write-Host ("  [PASS] profiler load verdict is never silent  (reported: {0})" -f ($seen -join ', ')) -ForegroundColor Green
+    $script:Pass++
+} else {
+    Write-Host "  [FAIL] profiler load verdict is never silent  -> registration is ours and correct, but the check emitted NO load verdict at all. This is the cx-e2e-c1 false green." -ForegroundColor Red
+    $script:Fail++
+    Write-Host ($r.Out -split "`r?`n" | Select-Object -First 40 | ForEach-Object { "        $_" }) -ForegroundColor DarkGray
+}
+
 Write-Host ''
 Write-Host '== E. IIS access-log coverage ==' -ForegroundColor Cyan
 

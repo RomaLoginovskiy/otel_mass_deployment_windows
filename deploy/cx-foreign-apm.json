@@ -1,0 +1,74 @@
+{
+  "//": "Signatures for OTHER APM agents that may already own this host. DATA, not code: the vendor list",
+  "//2": "changes independently of the logic, an operator may need to add to it, and keeping product names",
+  "//3": "out of the scripts keeps the implementation vendor-neutral.",
+  "//why": "Only ONE ICorProfilerCallback can attach to a .NET process. If one of these agents holds that",
+  "//why2": "slot, our .NET auto-instrumentation attaches to nothing - so the install needs to know BEFORE",
+  "//why3": "it writes anything. Node agents are listed too: several hook the same http module we do.",
+  "//fields": {
+    "name": "human label used in findings",
+    "pathPattern": "regex matched against registered CLR profiler paths (case-insensitive)",
+    "modulePattern": "regex matched against module names loaded in a running process",
+    "servicePattern": "regex matched against Windows service name + display name",
+    "installDir": "optional absolute path whose existence is a signal; null to skip"
+  },
+
+  "vendors": [
+    {
+      "name": "a full-stack .NET + Node APM agent",
+      "pathPattern": "the reference agent|the reference agent",
+      "modulePattern": "the reference agent",
+      "servicePattern": "the reference agent|the reference agent",
+      "installDir": "C:\\Program Files\\the reference agent\\the reference agent"
+    },
+    {
+      "name": "a .NET + Node APM agent (managed+native)",
+      "pathPattern": "newrelic",
+      "modulePattern": "newrelic",
+      "servicePattern": "newrelic",
+      "installDir": "C:\\Program Files\\New Relic"
+    },
+    {
+      "name": "a .NET + Node APM agent (bytecode)",
+      "pathPattern": "appdynamics|appdynam",
+      "modulePattern": "appdynamics|appdynam",
+      "servicePattern": "appdynamics",
+      "installDir": "C:\\Program Files\\AppDynamics"
+    },
+    {
+      "name": "a .NET + Node APM agent (tracing SaaS)",
+      "pathPattern": "appneta|tracelytics",
+      "modulePattern": "appneta",
+      "servicePattern": "appneta",
+      "installDir": null
+    },
+    {
+      "name": "a .NET APM agent (APAC vendor)",
+      "pathPattern": "tingyun",
+      "modulePattern": "tingyun",
+      "servicePattern": "tingyun",
+      "installDir": null
+    },
+    {
+      "name": "a .NET tracer",
+      "pathPattern": "datadog|dd-trace|dd_trace",
+      "modulePattern": "datadog",
+      "servicePattern": "datadog",
+      "installDir": "C:\\Program Files\\Datadog"
+    },
+    {
+      "name": "an APM agent (auto-trace)",
+      "pathPattern": "instana",
+      "modulePattern": "instana",
+      "servicePattern": "instana",
+      "installDir": null
+    },
+    {
+      "name": "an APM profiler (search vendor)",
+      "pathPattern": "elastic.*profiler",
+      "modulePattern": "elastic.*profiler",
+      "servicePattern": "elastic.*apm",
+      "installDir": null
+    }
+  ]
+}

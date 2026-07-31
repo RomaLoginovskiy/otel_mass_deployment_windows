@@ -69,6 +69,13 @@ $script:CxDetectHere = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -P
 $backupHelper = Join-Path $PSScriptRoot 'Backup-Config.ps1'
 if (Test-Path $backupHelper) { . $backupHelper }
 
+# Shared helpers, for Get-CxForeignApmSignature (D-4). Guarded like the rest: this file must stay usable
+# in a hand-assembled deploy directory. If it IS missing the foreign-APM probe cannot run, and that is
+# reported below rather than silently skipped - a host with another agent looking identical to a clean
+# one is the whole failure this probe exists to prevent.
+$logHelper = Join-Path $PSScriptRoot 'Write-DeployLog.ps1'
+if (Test-Path $logHelper) { . $logHelper }
+
 # PM2 topology + app-list probes (Get-CxPm2Topology / Get-PM2ProcessList). Optional on purpose:
 # this file has to stay usable in a hand-assembled deploy directory, so a missing helper degrades
 # Get-PM2Info to its original PATH-only probe rather than breaking detection outright.
@@ -418,6 +425,31 @@ if ($roles.PM2 -and $roles.PM2Hosting -and $roles.PM2Hosting -ne 'none') { $attr
 # but guard rather than trust, since a bad value silently truncates the whole attribute string.
 if ($roles.PM2 -and $roles.PM2Owner -and $roles.PM2Owner -notmatch '[,=]') { $attrMap['workload.pm2.owner'] = $roles.PM2Owner }
 if ($roles.PM2 -and $roles.PM2Home  -and $roles.PM2Home  -notmatch '[,=]') { $attrMap['workload.pm2.home']  = $roles.PM2Home }
+
+# ---- D-4: another APM agent on this host, decided BEFORE anything is installed ----
+# Only one CLR profiler can attach to a process, so a host that already runs a full-stack agent cannot
+# also take our .NET instrumentation - measured on cx-e2e-c1 with a third-party full-stack APM agent, where our
+# registration was perfect and our library was in no process at all. Discovering that AFTER the install
+# means the host has already claimed service names that will never report.
+#
+# Published as a Fleet-selectable attribute so a whole group of such hosts can be handled deliberately,
+# and printed so the operator sees it during the deploy rather than in a doctor run days later.
+$foreignApm = @()
+if (Get-Command Get-CxForeignApmSignature -ErrorAction SilentlyContinue) {
+    try { $foreignApm = @(Get-CxForeignApmSignature) }
+    catch { Write-Warning "[detect] the foreign-APM probe failed ($($_.Exception.Message)) - another agent on this host would NOT have been noticed." }
+} else {
+    Write-Warning '[detect] Write-DeployLog.ps1 is not present next to this script, so the foreign-APM probe did not run. A host already running another APM agent will look identical to a clean one.'
+}
+$roles['ForeignApm'] = @($foreignApm | ForEach-Object { $_.Vendor })
+if (@($foreignApm).Count -gt 0) {
+    # Vendor names cannot contain ',' or '=' (they would truncate the attribute string); join with '+'.
+    $attrMap['workload.foreign_apm'] = (@($foreignApm | ForEach-Object { ($_.Vendor -replace '[ ,=]', '-') }) -join '+')
+    Write-Host ''
+    Write-Warning "[detect] ANOTHER APM AGENT IS PRESENT ON THIS HOST:"
+    foreach ($f in $foreignApm) { Write-Warning "[detect]   $($f.Reason)" }
+    Write-Warning "[detect] Only ONE CLR profiler can attach to a process. If that agent has .NET deep monitoring active, our .NET auto-instrumentation will attach to NOTHING - see docs/exception-foreign-profiler.md for the three ways out and the measured startup-hooks-only fallback. Node.js instrumentation is unaffected."
+}
 
 foreach ($k in $ExtraAttributes.Keys) { $attrMap[$k] = $ExtraAttributes[$k] }
 

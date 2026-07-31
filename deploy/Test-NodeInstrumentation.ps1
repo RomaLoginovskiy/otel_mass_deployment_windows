@@ -393,7 +393,7 @@ function Test-NodeInstrumentation {
     $ownerMismatch    = [bool]($topo -and $topo.OwnerMismatch -and $topo.Owner)
 
     if ($topo -and $topo.Hosting -eq 'service') {
-        Add-F (New-Finding -Check 'nodeInstr' -Severity 'info' -Code 'NODE_PM2_SERVICE_HOSTED' -Target $topo.ServiceName `
+        Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'info' -Code 'NODE_PM2_SERVICE_HOSTED' -Target $topo.ServiceName `
             -Message "PM2 runs as a Windows service owned by $($topo.Owner) (PM2_HOME=$($topo.Home), $($topo.WorkerCount) worker process(es)). Its apps only answer to that account - instrument/uninstall have to run pm2 as it." `
             -Data @{ hosting = $topo.Hosting; owner = $topo.Owner; home = $topo.Home
                      service = $topo.ServiceName; workers = $topo.WorkerCount; identity = $topo.Identity })
@@ -406,12 +406,12 @@ function Test-NodeInstrumentation {
         param([string] $Detail)
         if ($appsAreProvable -and $ownerMismatch) {
             $names = if ($provableAppNames.Count -gt 0) { " apps: $($provableAppNames -join ', ')." } else { '' }
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'fail' -Code 'NODE_PM2_DAEMON_OWNER_MISMATCH' -Target $topo.Owner `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'fail' -Code 'NODE_PM2_DAEMON_OWNER_MISMATCH' -Target $topo.Owner `
                 -Message ("$Detail The PM2 daemon belongs to $($topo.Owner) but this check runs as $($topo.Identity), so its IPC pipe is unreachable from here - pm2 answers for an empty daemon of our own and every write is a silent no-op. $($topo.WorkerCount) worker process(es) are running.$names Instrument with Instrument-NodePM2.ps1, which routes pm2 through that account.") `
                 -Data @{ owner = $topo.Owner; identity = $topo.Identity; home = $topo.Home
                          workers = $topo.WorkerCount; provableApps = $provableAppNames })
         } else {
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'unknown' -Code 'NODE_PM2_DAEMON_NOT_VISIBLE' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'unknown' -Code 'NODE_PM2_DAEMON_NOT_VISIBLE' `
                 -Message ("$Detail PM2 is per-user on Windows: an elevated run often sees a DIFFERENT daemon than the one owning the apps. Re-run as the account that owns them."))
         }
     }
@@ -423,15 +423,15 @@ function Test-NodeInstrumentation {
             # pm2-installer layout (CLI in C:\ProgramData\npm) - not an absence.
             & $addOwnershipFinding 'pm2 is not on this account''s PATH, but a PM2 daemon is running on this host.'
         } elseif (Test-CxNodeWorkloadPresent) {
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'unknown' -Code 'NODE_PM2_NOT_ON_PATH' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'unknown' -Code 'NODE_PM2_NOT_ON_PATH' `
                 -Message 'node processes are running but pm2 is not on this account PATH - cannot determine whether they are instrumented')
         } else {
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'skip' -Code 'NO_PM2' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'skip' -Code 'NO_PM2' `
                 -Message 'PM2 is not installed on this host - nothing to instrument')
         }
         # A leftover machine var with no PM2 is still worth flagging.
         if ($cxNodeServices -and -not ($topo -and $topo.Hosting -ne 'none')) {
-            Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' `
                 -Message "CX_NODE_SERVICES is set to '$cxNodeServices' but PM2 is not present - this is a stale value from a prior deploy" `
                 -Data @{ cxNodeServices = $cxNodeServices })
         }
@@ -457,17 +457,17 @@ function Test-NodeInstrumentation {
             # node.exe, so "node processes are running" was true and the doctor reported
             # NODE_PM2_DAEMON_NOT_VISIBLE - "you are probably querying the wrong daemon" - about
             # the very daemon it had just successfully queried.
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'skip' -Code 'NO_PM2_APPS' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'skip' -Code 'NO_PM2_APPS' `
                 -Message 'PM2 is installed and its daemon is reachable, but no app is managed and no PM2 worker process exists on this host - nothing to instrument')
         } elseif (Test-CxNodeWorkloadPresent) {
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'unknown' -Code 'NODE_PM2_DAEMON_NOT_VISIBLE' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'unknown' -Code 'NODE_PM2_DAEMON_NOT_VISIBLE' `
                 -Message 'this account''s pm2 daemon manages no apps, yet node processes are running - they are almost certainly owned by another user''s daemon. Re-run as that account.')
         } else {
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'skip' -Code 'NO_PM2_APPS' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'skip' -Code 'NO_PM2_APPS' `
                 -Message 'PM2 is installed but manages no apps - nothing to instrument')
         }
         if ($cxNodeServices -and -not $appsAreProvable) {
-            Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' `
                 -Message "CX_NODE_SERVICES is set to '$cxNodeServices' but PM2 manages no apps - stale value from a prior deploy" `
                 -Data @{ cxNodeServices = $cxNodeServices })
         }
@@ -480,7 +480,7 @@ function Test-NodeInstrumentation {
         $live    = @($apps | ForEach-Object { $_.Name } | Where-Object { $_ } | Select-Object -Unique)
         $missing = @($provableAppNames | Where-Object { $live -notcontains $_ })
         if ($missing.Count -gt 0) {
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'info' -Code 'NODE_PM2_APPS_FROM_DUMP' -Target $topo.Home `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'info' -Code 'NODE_PM2_APPS_FROM_DUMP' -Target $topo.Home `
                 -Message "dump.pm2 lists $($missing.Count) app(s) the live daemon did not: $($missing -join ', '). Either they are stopped, or a second daemon owns them." `
                 -Data @{ dumpApps = $provableAppNames; liveApps = $live; missing = $missing })
         }
@@ -512,9 +512,38 @@ function Test-NodeInstrumentation {
         $label = $app.Name
 
         if ($app.Status -and $app.Status -ne 'online') {
-            Add-F (New-Finding -Check 'nodeInstr' -Severity 'info' -Target $label `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeInstr' -Severity 'info' -Target $label `
                 -Message "app status is '$($app.Status)' - its env may not reflect the last instrument run" `
                 -Data @{ status = $app.Status })
+        }
+
+        # N-1: THE RUNTIME GATE, FROM THE OTHER SIDE. An app instrumented by an older build of this
+        # tooling - which had no version gate at all - can be sitting on a Node the SDK does not
+        # support. Its NODE_OPTIONS is correct, the app runs, and it emits nothing. Re-checking here is
+        # the only way that host ever gets told: the installer will not revisit an app it already wrote.
+        if ((Get-Command Get-CxNodeVersion -ErrorAction SilentlyContinue) -and
+            (Get-Command Test-CxNodeRuntimeSupported -ErrorAction SilentlyContinue)) {
+            $appNodeExe = $null
+            if ($app.PSObject.Properties['Pid'] -and $app.Pid) {
+                try { $appNodeExe = (Get-Process -Id $app.Pid -ErrorAction SilentlyContinue).Path } catch { }
+            }
+            $appInterp = if ($app.PSObject.Properties['Interpreter']) { [string]$app.Interpreter } else { '' }
+            $appVer = Get-CxNodeVersion -Candidates @($appInterp, $appNodeExe)
+            if ($appVer) {
+                $isEsmApp = $false
+                if (Get-Command Test-CxNodeAppIsEsm -ErrorAction SilentlyContinue) {
+                    try { $isEsmApp = [bool](Test-CxNodeAppIsEsm -Script $app.Script -Cwd $app.Cwd) } catch { }
+                }
+                $g = Test-CxNodeRuntimeSupported -Version $appVer -IsEsm $isEsmApp -Extensionless $false
+                if (-not $g.Ok) {
+                    Add-F (New-Finding -Verified 'runtime' -Check 'nodeRuntime' -Severity 'warn' -Code $g.Code -Target $label `
+                        -Message "$($g.Reason). This app IS carrying instrumentation env, so it looks configured while producing nothing - the installer that wrote it had no version gate." `
+                        -Data @{ nodeVersion = "$appVer"; isEsm = $isEsmApp })
+                } else {
+                    Add-F (New-Finding -Verified 'runtime' -Check 'nodeRuntime' -Severity 'pass' -Target $label `
+                        -Message "Node $appVer supports the required bootstrap")
+                }
+            }
         }
 
         # (b) NODE_OPTIONS
@@ -558,11 +587,11 @@ function Test-NodeInstrumentation {
 
         # (c) OTEL_SERVICE_NAME
         if (-not $app.ServiceName) {
-            Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_MISSING' -Target $label `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_MISSING' -Target $label `
                 -Message 'no OTEL_SERVICE_NAME on this app - its spans land under a default service name')
         } else {
             $seenServiceNames += $app.ServiceName
-            Add-F (New-Finding -Check 'nodeService' -Severity 'pass' -Target $label `
+            Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'pass' -Target $label `
                 -Message "OTEL_SERVICE_NAME=$($app.ServiceName)" -Data @{ serviceName = $app.ServiceName })
         }
 
@@ -581,7 +610,7 @@ function Test-NodeInstrumentation {
     # ("re-run Instrument-NodePM2.ps1") that cannot clear it.
     $iisnodeNames = @(Get-CxIisnodePoolServiceNames)
     if (@($iisnodeNames).Count -gt 0) {
-        Add-F (New-Finding -Check 'nodeService' -Severity 'info' -Code 'IISNODE_SERVICES_INCLUDED' -Target 'CX_NODE_SERVICES' `
+        Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'info' -Code 'IISNODE_SERVICES_INCLUDED' -Target 'CX_NODE_SERVICES' `
             -Message "$(@($iisnodeNames).Count) iisnode application(s) also publish into CX_NODE_SERVICES (Node hosted by IIS, bootstrap on the app pool): $($iisnodeNames -join ', '). Test-IISInstrumentation.ps1 grades those." `
             -Data @{ iisnodeServices = @($iisnodeNames) })
     }
@@ -594,7 +623,7 @@ function Test-NodeInstrumentation {
     if ($expected.Count -eq 0) {
         # already reported per app
     } elseif ($actual.Count -eq 0) {
-        Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_MISSING' -Target 'CX_NODE_SERVICES' `
+        Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_MISSING' -Target 'CX_NODE_SERVICES' `
             -Message "machine CX_NODE_SERVICES is not set, but $($expected.Count) Node service name(s) exist on this host (PM2 apps and/or iisnode pools) - host Service-ownership will be blank" `
             -Data @{ expected = $expected })
     } elseif (Compare-Object $expected $actual -CaseSensitive) {
@@ -606,11 +635,11 @@ function Test-NodeInstrumentation {
         # survive as two entries and then compare equal, so a casing mismatch between the published
         # label and the app's own service name was reported as a pass. The collector stamps the literal
         # string, so the casing has to match for host<->APM correlation to resolve.
-        Add-F (New-Finding -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' -Target 'CX_NODE_SERVICES' `
+        Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'warn' -Code 'NODE_SERVICE_NAME_DRIFT' -Target 'CX_NODE_SERVICES' `
             -Message "CX_NODE_SERVICES does not match this host's Node services. var=[$($actual -join ', ')] apps=[$($expected -join ', ')] - re-run Instrument-NodePM2.ps1 (PM2 apps) and/or Instrument-IIS.ps1 (iisnode pools), whichever the missing names belong to" `
             -Data @{ cxNodeServices = $actual; appServiceNames = $expected })
     } else {
-        Add-F (New-Finding -Check 'nodeService' -Severity 'pass' -Target 'CX_NODE_SERVICES' `
+        Add-F (New-Finding -Verified 'config' -Check 'nodeService' -Severity 'pass' -Target 'CX_NODE_SERVICES' `
             -Message "matches the running apps: $($actual -join ', ')" -Data @{ cxNodeServices = $actual })
     }
 

@@ -37,12 +37,16 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 
 ## Severity summary
 
-| Severity | Count | Effect on exit code |
+Counts are **distinct `-Code` values actually emitted** by `Test-Agent.ps1`,
+`Test-IISInstrumentation.ps1` and `Test-NodeInstrumentation.ps1` — not documented rows — so they can be
+re-derived from the scripts rather than trusted. `pass` and most `info` findings carry no code.
+
+| Severity | Codes | Effect on exit code |
 | --- | --- | --- |
-| `fail` | 11 | Sets `1` |
-| `warn` | 36 | Sets `2` unless a `fail` is also present |
-| `pass` | 2 | None |
-| `info` | 8 | None |
+| `fail` | 14 | Sets `1` |
+| `warn` | 41 | Sets `2` unless a `fail` is also present |
+| `pass` | 0 (uncoded) | None |
+| `info` | 10 | None |
 | `skip` | 5 | None |
 | `unknown` | 14 | None |
 
@@ -59,11 +63,20 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `HEALTH_UNREACHABLE` | No response from the health endpoint after the configured retries. | Confirm the process is up and nothing else owns port 13133. |
 | `HEALTH_UNHEALTHY` | The endpoint answered with a non-200 (commonly 503 during a crash-loop). | Same as above; the event log carries the reason. |
 | `PROFILER_REGISTRY_MALFORMED` | An empty element in the W3SVC/WAS `Environment` REG_MULTI_SZ. **Prevents IIS from starting** — act-now severity, which is why it outranks every other instrumentation finding. | Repair the REG_MULTI_SZ, or restore it from the install backup. |
+| `PROFILER_FOREIGN_OWNER` | The service registers a CLR profiler CLSID that is **not** the OpenTelemetry one, so another APM agent (the reference agent, New Relic, AppDynamics, AppNeta, TingYun, Datadog, …) owns .NET on this host. Only **one** CLR profiler can attach to a process, so our .NET auto-instrumentation emits nothing for anything that service starts — however healthy the collector is. Decided by comparing against our CLSID, not by recognising a vendor, so an unknown agent fails it too. | Decide which agent owns .NET here: keep theirs and instrument those applications another way, or remove/exclude theirs and re-run the install. See [../exception-foreign-profiler.md](../exception-foreign-profiler.md). |
+| `PROFILER_PATH_FOREIGN` | Our CLSID with **somebody else's library**: a `*_PROFILER_PATH*` entry points outside `OTEL_DOTNET_AUTO_HOME`. The CLR loads that DLL, asks it for our CLSID, gets nothing, and attaches no profiler — silently, with every variable reading as configured. The CLR prefers `*_PATH_64` over the unsuffixed name, so this is the shape a leftover from another agent takes. | Re-run the install (it writes the bitness-specific names too), or remove the foreign `*_PATH_64` / `*_PATH_32` value. |
+| `PROFILER_NOT_LOADED_IN_PROCESS` | Registration is ours and correct, **and our native library is in none of the worker processes that could be scanned** — so .NET auto-instrumentation produces no spans while every variable reads as configured. Registration is not attachment. Measured on a host running the reference agent fullstack: W3SVC carried our CLSID and all four bitness paths, and `OpenTelemetry.AutoInstrumentation.Native.dll` was absent from every process. Only raised when at least one process was successfully scanned — see `PROFILER_LOAD_UNVERIFIED_SCAN_FAILED` for the no-evidence case. | If a foreign profiler is named in the message, see [../exception-foreign-profiler.md](../exception-foreign-profiler.md). Otherwise check the profiler DLL path and that the worker restarted after the install. |
 | `NODE_PM2_DAEMON_OWNER_MISMATCH` | The PM2 daemon is owned by another account (typically `NT AUTHORITY\LOCAL SERVICE`, PM2 installed as a Windows service) and its apps have been **proven** to exist. Nothing this account does with `pm2` can reach them: `pm2` answers for an empty daemon of its own and exits 0. | Run `pm2` as the owning account — `Instrument-NodePM2.ps1` does this automatically; see [../nodejs-pm2.md](../nodejs-pm2.md). |
 | `NODE_ESM_REQUIRE_MISMATCH` | The app is an ES module but `NODE_OPTIONS` carries no `--experimental-loader` hook, so nothing patches its import graph. The app starts normally and emits nothing, with no error anywhere. | Re-run the Node instrumenter: it adds the loader hook for ESM apps. Note `--import` alone is **not** the fix — measured against a real ESM app, both `--require` and `--import` yield zero spans; only `--experimental-loader=file:///…/hook.mjs` plus `--require` produces telemetry. |
 | `IISNODE_ESM_NOT_HOSTABLE` | **warn, not fail.** An **iisnode** app that is an ES module. iisnode's `interceptor.js` does a CommonJS `require()` of the entry point, so an ESM app fails with `ERR_REQUIRE_ESM` and returns HTTP 500 on **every** request — measured on iisnode 0.2.26 / Node 20, with and without instrumentation, for both an `.mjs` entry and a `"type":"module"` package.json. Not instrumented and not claimed: there is no working process to instrument. The loader hook cannot help here (unlike the PM2 path) because the app never gets far enough to load one. | Application-side and unrelated to telemetry: give it a CommonJS entry point that `import()`s the ESM app, or host it under PM2 / a Windows service instead of iisnode. |
 
 ## `warn` — exit 2
+
+### The check itself could not run
+
+| Code | Meaning | Fix |
+| --- | --- | --- |
+| `CHECK_ERRORED` | A delegated validator threw; the message carries the exception. **Graded `warn`, not `unknown`**: `unknown` does not move the exit code, so a validator that crashed outright used to grade the host `exit=0` — a green doctor that checked nothing. A check that could not run is not a pass. | Read the exception. `HELPER_MISSING` stays `unknown` because a hand-assembled deploy directory is a legitimate state; a validator that threw is not. |
 
 ### Environment and identity
 
@@ -97,8 +110,9 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `PROFILER_NOT_REGISTERED` | No `CORECLR_PROFILER`/`COR_PROFILER` in the service `Environment` — `Register-OpenTelemetryForIIS` never ran. No .NET app on the host is instrumented. | Re-run `Instrument-IIS.ps1`. |
 | `PROFILER_NOT_ENABLED` | The profiler GUID is registered but `CORECLR_ENABLE_PROFILING` is not `1` — registered and switched off. | Re-run the instrumenter. |
 | `PROFILER_PATH_MISSING` | The profiler DLL the registry points at does not exist (or there is no `*_PROFILER_PATH*` entry). IIS starts and emits nothing. | Re-run the instrumenter to reinstall the module. |
-| `PROFILER_FOREIGN_OWNER` | The service registers a CLR profiler CLSID that is **not** the OpenTelemetry one, so another APM agent (the reference agent, New Relic, AppDynamics, Datadog, …) owns .NET on this host. Only **one** CLR profiler can attach to a process, so our .NET auto-instrumentation emits nothing for anything that service starts — however healthy the collector is. Decided by comparing against our CLSID, not by recognising a vendor, so an unknown agent fails it too. | Decide which agent owns .NET here: keep theirs and instrument those applications another way, or remove/exclude theirs and re-run the install. |
-| `PROFILER_PATH_FOREIGN` | Our CLSID with **somebody else's library**: a `*_PROFILER_PATH*` entry points outside `OTEL_DOTNET_AUTO_HOME`. The CLR loads that DLL, asks it for our CLSID, gets nothing, and attaches no profiler — silently, with every variable reading as configured. The CLR prefers `*_PATH_64` over the unsuffixed name, so this is the shape a leftover from another agent takes. | Re-run the install (it now writes the bitness-specific names too), or remove the foreign `*_PATH_64` / `*_PATH_32` value. |
+| `PROFILER_WORKER_ENUM_FAILED` | The registration is ours and correct, but `Win32_Process` could not be enumerated, so whether the profiler **loads** is unknown — not verified and not disproved. Previously this failure was swallowed and reported as "no worker process is running", which conflates a WMI failure with an idle host. | Re-run elevated. If it persists, use the module-scan snippet in [exception-foreign-profiler.md](../exception-foreign-profiler.md). |
+| `PROFILER_MODULE_SCAN_FAILED` | The loaded modules of one or more worker processes could not be read, so those processes contribute no evidence either way. Names each pid and reason. A 64-bit `w3wp` read from a 32-bit host process, a worker that exited mid-scan, and an access denial all land here. The accompanying verdict rests only on the processes that *were* readable. | Re-run from an elevated 64-bit shell. Companion to the verdict finding, not a verdict itself. |
+| `PROFILER_LOAD_UNVERIFIED_SCAN_FAILED` | Registration is ours, workers are running, but **none** could be scanned — so attachment is unknown. Deliberately not a `fail`: grading it one would accuse a host that may be perfectly instrumented, which is the mirror image of the false green. | Read the `PROFILER_MODULE_SCAN_FAILED` reasons, then re-scan elevated. |
 | `AUTO_HOME_MISSING` | `OTEL_DOTNET_AUTO_HOME` unset or pointing at a missing directory — `Install-OpenTelemetryCore` did not complete. | Re-run the instrumenter. |
 | `POOL_NOT_NO_MANAGED_CODE` | An ASP.NET **Core** app on a pool whose `managedRuntimeVersion` is not `""`. The app still runs and still reports; the pool merely loads a desktop CLR nothing uses. Stays instrumented and stays in `CX_IIS_SERVICES`. | Optional hygiene: set the pool to No Managed Code. |
 | `FRAMEWORK_POOL_NO_MANAGED_CLR` | An ASP.NET **Framework** app on a No-Managed-Code pool. Its managed handlers cannot load, so **IIS fails every request** with 500.21 — the app is down, independently of telemetry. Graded `warn` because the agent neither caused it nor is blocked by it. | Set the pool back to `v4.0`. |
@@ -151,6 +165,35 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `ASPNETCORE_NO_MANAGED_CODE_OK` | An ASP.NET Core app on a No-Managed-Code pool. |
 | `FRAMEWORK_POOL_OK` | An ASP.NET Framework app on a CLR-loading pool. |
 
+## `processStatus` — one row per IIS-owned process
+
+Emitted as `info`, one finding per discovered process, so a per-pid answer is greppable independently of
+the per-service verdict. Modelled on the reference agent's per-process injection decision.
+
+| Status | Meaning |
+| --- | --- |
+| `INJECTED` | our native library is loaded in this process — runtime-verified |
+| `FOREIGN_PROFILER` | another vendor's profiler module is in this process, which is why ours is not |
+| `NOT_INJECTED` | readable, hosting a CLR, and our library is absent |
+| `NO_CLR` | readable but no `coreclr`/`clr`/`mscorwks` mapped, so no CLR profiler can attach. Counts in **neither** tally — `conhost.exe`, which IIS spawns as a console host, lands here |
+| `SCAN_FAILED` | the module list could not be read (commonly a 32-bit doctor against a 64-bit worker) — proves nothing either way |
+| `UNKNOWN` | none of the above could be established |
+
+`PENDING_RESTART`, `UNCOVERED` and `EXCLUDED` are **not** emitted yet — those checks do not exist in
+this build, and printing them as absent would imply they had been evaluated.
+
+## Evidence: config-verified vs runtime-verified
+
+Every finding carries a `verified` field — `config`, `runtime` or `none` — and the summary prints
+`evidence: N runtime-verified, M config-verified`. A `pass` backed only by configuration means "set up
+correctly", **not** "telemetry is arriving": registration is not attachment. When nothing is
+runtime-verified the summary says so explicitly.
+
+Node is `config`-only by nature — its SDK loads no distinctive module, so a host-side check cannot
+observe it in-process. A measured example from `cx-e2e-c1`: the IIS validator reports
+`2 runtime-verified, 50 config-verified`, while the Node validator reports `0 runtime-verified` plus the
+explicit note. Only a Coralogix query closes that gap.
+
 ## `info` — context, not a verdict
 
 | Code | Meaning |
@@ -188,9 +231,9 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | Code | Meaning |
 | --- | --- |
 | `HELPER_MISSING` | A required script is not present next to this one; the check could not run. Rebuild the package. |
-| `CHECK_ERRORED` | A delegated validator threw; the message carries the exception. |
 | `WEBADMINISTRATION_MISSING` | The IIS PowerShell module was unavailable, so expected names were derived from `applicationHost.config` instead. |
 | `WEBCONFIG_UNREADABLE` | An app's `web.config` exists but could not be opened or parsed (ACL, lock, malformed XML), or the app has no `physicalPath`. Distinct from `WEBCONFIG_ABSENT`. |
+| `PROFILER_LOAD_UNVERIFIED` | Registration is ours and correct, but **no IIS worker process is running**, so whether the profiler loads could not be verified. An idle pool has nothing to load it into yet, which is why this is never a failure. Distinct from `PROFILER_WORKER_ENUM_FAILED` (enumeration broke) and `PROFILER_LOAD_UNVERIFIED_SCAN_FAILED` (workers present but unreadable). |
 | `POOL_NOT_FOUND` | An application references a pool not declared in `applicationHost.config`. |
 | `RUNTIME_UNKNOWN_NEEDS_OVERRIDE` | The application's runtime could not be determined. Nothing was written and nothing was claimed, rather than guessed. Decide it with `-RuntimeOverrides`. |
 | `APPHOST_ACCESS_DENIED` | `applicationHost.config` could not be read because of permissions. Run elevated. |

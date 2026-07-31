@@ -111,9 +111,27 @@ param(
     [string]    $NodeInstallPrefix     = 'C:\cx\otel-node',
     # Leave iisnode applications alone. Classification and findings still report them; only the
     # writing is suppressed. For a host where something else already instruments node.exe (a
-    # the reference agent Node module, say), where two agents on the same http hooks is the
+    # a third-party full-stack APM agent Node module, say), where two agents on the same http hooks is the
     # bigger risk.
     [switch]    $NoIisnode,
+    # Take over an app pool that already exports to an OFF-BOX OTLP endpoint. Off by default: that
+    # endpoint belongs to another OpenTelemetry deployment, and silently repointing it moves somebody
+    # else's telemetry to our collector - a change that surfaces to someone who cannot see this host.
+    # Loopback endpoints on other ports are ours by definition and never need this.
+    [switch]    $ForceEndpoint,
+    # Skip the post-write sanity check (X-5). The check recycles nothing extra - it asks whether each
+    # pool we wrote to is Started and can still answer a request, and reverts + latches the ones that
+    # cannot. Off-switch exists for a host where the applications are deliberately down during the
+    # deploy, which would otherwise look like breakage we caused.
+    [switch]    $SkipSanityCheck,
+    # X-3: path to the instrumentation rule file (exclusions, host kill switch, name/runtime sets).
+    # Defaults to cx-instrument-rules.json next to these scripts; absent means no rules, which behaves
+    # exactly as before. See cx-instrument-rules.json.example.
+    [string]    $RulesJson,
+    # D-3b: degraded mode for a host where another APM agent owns the single CLR profiler slot. Writes the
+    # managed half only (startup hook + ASP.NET Core hosting startup) and switches CLR profiling off, so
+    # ASP.NET Core and HttpClient still report. .NET Framework pools gain nothing - see the warnings.
+    [switch]    $NoProfiler,
     # Optional backup/manifest session (from Backup-Config.ps1, created by the
     # orchestrator). When supplied, mutated configs are backed up and recorded so
     # Uninstall-Agent.ps1 can reverse only the installer's own changes.
@@ -497,8 +515,94 @@ function Grant-PoolReadAccess {
     return $true
 }
 
+# ---- X-3: instrumentation rules (exclusions, host kill switch, name/runtime sets) ----
+# Loaded once. A malformed rule file THROWS rather than degrading to "no rules": treating it as empty
+# would instrument targets the operator believed were excluded, and that mistake is invisible.
+$instrRules = $null
+if (Get-Command Get-CxInstrumentRules -ErrorAction SilentlyContinue) {
+    $instrRules = Get-CxInstrumentRules -Path $RulesJson
+    if ($instrRules.Source) { Write-Host "[iis-instr] instrumentation rules: $(@($instrRules.Rules).Count) rule(s) from $($instrRules.Source)$(if ($instrRules.HostDisabled) { ' (hostDisabled=TRUE)' })" }
+    if ($instrRules.HostDisabled) {
+        Write-Warning '[iis-instr] auto-injection is DISABLED for this whole host by the rule file (hostDisabled=true). Nothing will be instrumented. Remove or flip that flag to re-enable.'
+    }
+}
+
+# ---- X-5: honour the disablement latch ----------------------------------------
+# A pool that a previous run had to REVERT is latched off. Re-applying the same environment that broke
+# it is exactly what the latch exists to prevent, so those pools are skipped here - before any write -
+# and named, so the operator can see why they are being left out and clear the latch deliberately.
+$latchedPools = @()
+if (Get-Command Test-CxTargetLatched -ErrorAction SilentlyContinue) {
+    try {
+        [xml]$phcL = Get-Content -LiteralPath $appHostConfig -Raw -ErrorAction Stop
+        foreach ($pn in @($phcL.SelectNodes('/configuration/system.applicationHost/applicationPools/add'))) {
+            $nm = [string]$pn.GetAttribute('name')
+            $entry = Test-CxTargetLatched -Target $nm
+            if ($entry) { $latchedPools += $nm
+                Write-Warning "[iis-instr] pool '$nm' is LATCHED OFF (reason=$($entry.reason), since $($entry.whenUtc)): $($entry.detail). It will be SKIPPED. Clear it deliberately with: Clear-CxTargetLatch -Target '$nm'" }
+        }
+    } catch { }
+}
+
+# ---- D-7: do not silently hijack another deployment's OTLP endpoint -----------
+# PRE-FLIGHT, before a single write. A pool already exporting off-box means another OpenTelemetry
+# deployment owns those applications - the customer's own SDK wiring, a second agent, a sidecar - and
+# repointing it at us silently moves their telemetry. That surfaces to somebody who cannot see this
+# host and has no way to connect it to an IIS deploy that ran here.
+#
+# Loopback on another port is NOT treated as foreign: that is a collector on this host, almost always an
+# earlier install of ours, and refusing it would block every re-deploy that changed the port.
+if (Get-Command Test-CxEndpointOverwriteAllowed -ErrorAction SilentlyContinue) {
+    $foreignPools = @()
+    $defaultsExisting = $null
+    try {
+        [xml]$phc = Get-Content -LiteralPath $appHostConfig -Raw -ErrorAction Stop
+        $poolsNode = $phc.SelectSingleNode('/configuration/system.applicationHost/applicationPools')
+        if ($poolsNode) {
+            $dNode = $poolsNode.SelectSingleNode("applicationPoolDefaults/environmentVariables/add[@name='OTEL_EXPORTER_OTLP_ENDPOINT']")
+            if ($dNode) { $defaultsExisting = [string]$dNode.GetAttribute('value') }
+            foreach ($pn in @($poolsNode.SelectNodes('add'))) {
+                $e = $pn.SelectSingleNode("environmentVariables/add[@name='OTEL_EXPORTER_OTLP_ENDPOINT']")
+                if (-not $e) { continue }
+                $chk = Test-CxEndpointOverwriteAllowed -Existing ([string]$e.GetAttribute('value')) -Ours $OtlpEndpoint -Force:$ForceEndpoint
+                if (-not $chk.Allowed) { $foreignPools += [pscustomobject]@{ Pool = [string]$pn.GetAttribute('name'); Existing = $chk.Existing; Reason = $chk.Reason } }
+            }
+        }
+    } catch {
+        Write-Warning "[iis-instr] could not pre-read applicationHost.config for foreign OTLP endpoints ($($_.Exception.Message)) - continuing, but a foreign endpoint would not have been noticed."
+    }
+    $defaultsChk = Test-CxEndpointOverwriteAllowed -Existing $defaultsExisting -Ours $OtlpEndpoint -Force:$ForceEndpoint
+    if (-not $defaultsChk.Allowed) {
+        throw "applicationPoolDefaults already exports to '$($defaultsChk.Existing)'. $($defaultsChk.Reason)"
+    }
+    if (@($foreignPools).Count -gt 0) {
+        foreach ($fp in $foreignPools) {
+            Write-Warning "[iis-instr] pool '$($fp.Pool)': $($fp.Reason)"
+        }
+        throw ("$(@($foreignPools).Count) application pool(s) already export to an off-box OTLP endpoint that is not ours ($((@($foreignPools) | ForEach-Object { "$($_.Pool)=$($_.Existing)" }) -join ', ')). Nothing was written. Re-run with -ForceEndpoint to take them over, or exclude them.")
+    }
+    if ($defaultsChk.Foreign) { Write-Warning "[iis-instr] $($defaultsChk.Reason)" }
+}
+
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
 Set-PoolDefaultEnv -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+
+# ---- D-3b: degraded mode where another agent owns the profiler slot ------------
+# Only ONE ICorProfilerCallback attaches per process, so on a host running a full-stack agent our
+# profiler reaches nothing - measured on cx-e2e-c1 with a third-party full-stack APM agent. The managed half does not
+# need the slot: ASP.NET Core comes in through ASPNETCORE_HOSTINGSTARTUPASSEMBLIES and HttpClient through
+# the startup hook (both measured working with CORECLR_ENABLE_PROFILING=0).
+#
+# Applied at applicationPoolDefaults so every pool inherits it, because this is a host-level decision:
+# the profiler slot is owned host-wide, not per pool.
+if ($NoProfiler) {
+    Set-PoolDefaultEnv -Name 'CORECLR_ENABLE_PROFILING' -Value '0'
+    Set-PoolDefaultEnv -Name 'COR_ENABLE_PROFILING'     -Value '0'
+    Write-Warning '[iis-instr] -NoProfiler: CLR profiling is switched OFF for all pools; only the MANAGED half is active.'
+    Write-Warning '[iis-instr]   EXPECTED to work: ASP.NET Core request spans, HttpClient spans (both measured).'
+    Write-Warning '[iis-instr]   NOT expected: SqlClient / Redis / MongoDB / WCF / System.Web - those are bytecode-rewritten by the profiler. That half is UNMEASURED, so treat it as unknown rather than proven absent.'
+    Write-Warning '[iis-instr]   .NET FRAMEWORK applications gain NOTHING from this mode (no startup hooks exist) - they stay dark. See docs/exception-foreign-profiler.md.'
+}
 
 # ---- 2b. Per-app OTEL_SERVICE_NAME (auto-discovered) --------------------------
 # Merge overrides: JSON file first, then the -ServiceNameOverrides hashtable on top.
@@ -617,10 +721,79 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             -Message "no IIS application matches this -RuntimeOverrides key, so the forced classification is not applied")
     }
 
+    # ---- X-5 baseline, captured BEFORE any write ------------------------------------
+    # The sanity check at the end must be able to tell "we broke this" from "this was already broken".
+    # Measured on the e2e VM: three of its fixture sites already return HTTP 500 for reasons that
+    # predate any deploy (a static site with a web.config IIS rejects, an ASP.NET Core Module failure).
+    # A checker that only looks at the after-state would revert and latch all three, blaming our write
+    # for somebody else's breakage - which is worse than the problem it was added to solve.
+    # X-3: applications a rule excluded. Kept so they can be left out of CX_IIS_SERVICES - an excluded
+    # app must not be claimed as a service it will never report for.
+    $ruleExcluded = @()
+    $script:CxPoolBaseline = @{}
+    try {
+        $siteBindingsPre = @{}
+        foreach ($line in @(& $appcmd list site 2>$null)) {
+            if ($line -notmatch '^SITE\s+"([^"]+)"') { continue }
+            $sn = $matches[1]
+            if ($line -match 'bindings:([^,\)]+)') {
+                foreach ($b in ($matches[1] -split ',')) {
+                    if ($b -match '^http/[^:]*:(\d+):') { $siteBindingsPre[$sn] = [int]$matches[1]; break }
+                }
+            }
+        }
+        foreach ($r in @($svcMap)) {
+            if (-not $r.Pool -or $script:CxPoolBaseline.ContainsKey($r.Pool)) { continue }
+            if (-not $siteBindingsPre.ContainsKey([string]$r.Site)) { continue }
+            $p = [string]$r.AppPath; if (-not $p) { $p = '/' }
+            $u = "http://127.0.0.1:$($siteBindingsPre[[string]$r.Site])$p"
+            $code = $null
+            try { $code = [int](Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop).StatusCode }
+            catch { try { $code = [int]$_.Exception.Response.StatusCode } catch { $code = -1 } }
+            $script:CxPoolBaseline[$r.Pool] = [pscustomobject]@{ Url = $u; Code = $code; WasOk = ($code -ge 200 -and $code -lt 500) }
+        }
+        $preBad = @($script:CxPoolBaseline.GetEnumerator() | Where-Object { -not $_.Value.WasOk })
+        if (@($preBad).Count -gt 0) {
+            Write-Host ("[iis-instr] baseline: {0} pool(s) were ALREADY failing before this run and will not be judged by the sanity check: {1}" -f `
+                @($preBad).Count, (@($preBad | ForEach-Object { "$($_.Key)=$(if ($_.Value.Code -ge 0) { "HTTP $($_.Value.Code)" } else { 'unreachable' })" }) -join ', ')) -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Warning "[iis-instr] could not capture a pre-write baseline ($($_.Exception.Message)); the sanity check will only verify that pools are Started."
+    }
+
     foreach ($r in $svcMap) {
         $appKey = Get-IISAppKey -Site $r.Site -AppPath $r.AppPath
         Write-Host ("  {0,-20} {1,-10} pool={2,-20} -> {3} [{4}] {5}/{6}{7}" -f $r.Site, $r.AppPath, $r.Pool, $r.ServiceName, $r.Scope, $r.DotNetRuntime, $r.Instrumentability, $(if ($r.NodeHosting -eq 'iisnode') { ' +iisnode' } else { '' }))
         Add-RF (New-IISRuntimeFinding -Record $r -Target $appKey)
+
+        # X-5: a pool a previous run had to revert is latched off. Skipping here is what makes the latch
+        # real - re-applying the environment that broke it is precisely what it exists to prevent.
+        if ($latchedPools -contains $r.Pool) {
+            Write-Host "      SKIPPED: pool '$($r.Pool)' is latched off after an earlier sanity-check revert" -ForegroundColor Yellow
+            continue
+        }
+
+        # X-3/X-2: rules decide inclusion, and may supply a name or a runtime. Evaluated per application
+        # so an exclusion can be as narrow as one app on a shared pool.
+        if ($instrRules -and (Get-Command Resolve-CxInstrumentDecision -ErrorAction SilentlyContinue)) {
+            $ruleTarget = [pscustomobject]@{ site = $r.Site; pool = $r.Pool; appPath = $r.AppPath
+                                             serviceName = $r.ServiceName; name = $appKey; Env = @{} }
+            $dec = Resolve-CxInstrumentDecision -Target $ruleTarget -Rules $instrRules.Rules -HostDisabled:$instrRules.HostDisabled
+            $why = if ($dec.SetReason) { $dec.SetReason } else { $dec.Reason }
+            if ($dec.ServiceName) {
+                Write-Host "      rule sets the service name: $($r.ServiceName) -> $($dec.ServiceName) ($why)"
+                $r.ServiceName = $dec.ServiceName
+            }
+            if ($dec.Runtime -and $dec.Runtime -ne $r.DotNetRuntime) {
+                Write-Host "      rule sets the runtime: $($r.DotNetRuntime) -> $($dec.Runtime) ($why)"
+                $r.DotNetRuntime = $dec.Runtime
+            }
+            if (-not $dec.Instrument) {
+                Write-Host "      SKIPPED by rule: $($dec.Reason)" -ForegroundColor Yellow
+                $ruleExcluded += $appKey
+                continue
+            }
+        }
 
         # -- iisnode ---------------------------------------------------------------------
         # BEFORE the .NET skip below, not after: a pure Node app under iisnode classifies as
@@ -769,6 +942,13 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'           -Value $r.ServiceName
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
             Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+            # N-8: the IIS analogue of the reference agent's PGI inputs - IIS_APP_POOL and IIS_ROLE_NAME become
+            # iis.app.pool / iis.site.name, so a span can be tied back to the pool and site that produced
+            # it instead of only to a service name string. Pool scope only: a shared pool's env reaches
+            # every app in it, and stamping one app's site name onto its co-tenants would be worse than
+            # having no attribute at all.
+            Set-PoolEnv -Pool $r.Pool -Name 'OTEL_RESOURCE_ATTRIBUTES' `
+                -Value ("iis.site.name=$([string]$r.Site -replace '[,=]','_'),iis.app.path=$([string]$r.AppPath -replace '[,=]','_'),iis.app.pool=$([string]$r.Pool -replace '[,=]','_'),service.instance.id=$([string]$r.Pool -replace '[,=]','_')")
             [void]$namedApps.Add($r)
         } else {
             # Shared pool: the per-app NAME can only go in web.config (one pool, many
@@ -977,6 +1157,131 @@ if ($NoReset) {
     & iisreset.exe | Out-String | Write-Host
 }
 
+# ---- X-5: post-write sanity check, revert, latch -------------------------------
+# The write is done and IIS has been recycled, so this is the first moment the question can be asked
+# honestly: did what we just wrote leave these applications able to serve?
+#
+# A pool that cannot start, or that now 5xxes every request, is OUR doing and must be put back - the
+# operator should not have to discover it. And a target that had to be reverted is LATCHED, so the next
+# deploy does not cheerfully re-apply the same broken environment. That last part is the whole point:
+# a safety valve the next run reopens is not a safety valve.
+#
+# Skipped when -NoReset was passed: nothing has been recycled yet, so a pool still running the OLD
+# environment would be judged on a change it has not picked up.
+if (-not $NoReset -and -not $SkipSanityCheck -and (Get-Command Test-CxIisPoolHealthy -ErrorAction SilentlyContinue)) {
+    Write-Host ''
+    Write-Host '[iis-instr] sanity check: confirming the pools we wrote to can still serve ...'
+
+    # One URL per pool, taken from the site bindings we already resolved, so the check exercises a real
+    # request rather than only asking IIS whether the pool is 'Started'.
+    # The service map carries no URL, so bindings are read from IIS. Without this the check degrades to
+    # "is the pool Started", which a pool that 5xxes every request also satisfies - the exact state this
+    # is meant to catch. Only http bindings on localhost are used: an https binding would drag
+    # certificate trust into a health check, and a host-header binding is not reachable as 127.0.0.1.
+    $poolUrls = @{}
+    try {
+        $siteBindings = @{}
+        foreach ($line in @(& $appcmd list site 2>$null)) {
+            if ($line -notmatch '^SITE\s+"([^"]+)"') { continue }
+            $siteName = $matches[1]
+            if ($line -match 'bindings:([^,\)]+)') {
+                foreach ($b in ($matches[1] -split ',')) {
+                    if ($b -match '^http/\*?:(\d+):\s*$' -or $b -match '^http/[^:]*:(\d+):$') {
+                        $siteBindings[$siteName] = [int]$matches[1]; break
+                    }
+                }
+            }
+        }
+        foreach ($r in @($svcMap)) {
+            if (-not $r.Pool -or $poolUrls.ContainsKey($r.Pool)) { continue }
+            if (-not $siteBindings.ContainsKey([string]$r.Site)) { continue }
+            $port = $siteBindings[[string]$r.Site]
+            $path = [string]$r.AppPath
+            if (-not $path -or $path -eq '/') { $path = '/' }
+            $poolUrls[$r.Pool] = "http://127.0.0.1:$port$path"
+        }
+    } catch {
+        Write-Warning "[iis-instr] could not resolve site bindings for the sanity check ($($_.Exception.Message)); pool state will be checked but serving will not be."
+    }
+
+    # WHICH POOLS TO VERIFY - not "which did the manifest record".
+    #
+    # Measured: run standalone (no orchestrator $Session) the manifest is empty, so deriving the list
+    # from it verified NOTHING while printing a reassuring line. Verification must not depend on the
+    # backup session; it uses the pools this run actually targeted. The manifest is still what a REVERT
+    # needs, so a broken pool with no manifest is reported loudly instead of half-reverted.
+    $canRevert = [bool]($Session -and $Session.Manifest -and $Session.Manifest.poolEnv)
+    $writtenPools = @()
+    if ($canRevert) {
+        $writtenPools = @($Session.Manifest.poolEnv | ForEach-Object { $_.pool } | Where-Object { $_ -and $_ -ne 'applicationPoolDefaults' } | Select-Object -Unique)
+    }
+    if (@($writtenPools).Count -eq 0) {
+        $writtenPools = @($svcMap | Where-Object { $_.Pool } | ForEach-Object { $_.Pool } | Select-Object -Unique)
+        if (@($writtenPools).Count -gt 0 -and -not $canRevert) {
+            Write-Host "[iis-instr] sanity check: no backup session, so a broken pool can be REPORTED but not auto-reverted. Verifying $(@($writtenPools).Count) pool(s) this run targeted."
+        }
+    }
+    $reverted = @()
+    foreach ($pool in $writtenPools) {
+        # WAS IT WORKING BEFORE? A pool that was already failing is not evidence that we broke anything,
+        # and reverting it would undo instrumentation over a pre-existing fault - then latch the pool so
+        # nobody could instrument it again. Reported, never acted on.
+        $base = $null
+        if ($script:CxPoolBaseline -and $script:CxPoolBaseline.ContainsKey($pool)) { $base = $script:CxPoolBaseline[$pool] }
+        if ($base -and -not $base.WasOk) {
+            Write-Host ("  [was-broken] {0} - already failing before this run ({1}), so the sanity check cannot attribute it to us. Left instrumented and NOT latched." -f `
+                $pool, $(if ($base.Code -ge 0) { "HTTP $($base.Code)" } else { 'unreachable' })) -ForegroundColor Yellow
+            continue
+        }
+
+        $h = Test-CxIisPoolHealthy -Pool $pool -Url $poolUrls[$pool] -SettleSec 2
+        if ($h.Healthy) {
+            Write-Host "  [ok]     $pool - $($h.Reason)"
+            continue
+        }
+        Write-Warning "  [BROKEN] $pool - $($h.Reason)$(if ($base) { " (it answered HTTP $($base.Code) before this run)" })"
+
+        # No manifest means no safe revert. Latching here would leave OUR environment in place AND block
+        # every future run against this pool - the worst of both. So: report it as loudly as possible and
+        # leave the decision with the operator.
+        if (-not $canRevert) {
+            Write-Warning ("  [ACT NOW] {0} was working before this run and is broken after it, but there is no backup session to revert from - so nothing was undone. Remove our environment from this pool by hand, or re-run the full installer (deploy.bat) which takes a backup session first." -f $pool)
+            $reverted += [pscustomobject]@{ Pool = $pool; Before = $h.Reason; After = 'not reverted (no backup session)'; Undone = 0 }
+            continue
+        }
+        $undone = 0
+        try {
+            $undone = Restore-CxPoolEnvFromManifest -Session $Session -Pool $pool `
+                        -SetVar    { param($p,$n,$v) Set-PoolEnv    -Pool $p -Name $n -Value $v } `
+                        -RemoveVar { param($p,$n)    Remove-PoolEnv -Pool $p -Name $n }
+        } catch {
+            Write-Warning "  [revert] FAILED for $pool : $($_.Exception.Message). The pool is left as-is and NOT latched, because a half-revert is worse than a recorded failure - fix it by hand."
+            continue
+        }
+        try { Restart-WebAppPool -Name $pool -ErrorAction Stop } catch { }
+        $after = Test-CxIisPoolHealthy -Pool $pool -Url $poolUrls[$pool] -SettleSec 2
+        if (Get-Command Set-CxTargetLatched -ErrorAction SilentlyContinue) {
+            $null = Set-CxTargetLatched -Target $pool -Kind 'iisPool' -Reason 'sanitycheck' `
+                      -Detail "$($h.Reason); $undone environment change(s) reverted; after revert: $($after.Reason)"
+        }
+        $reverted += [pscustomobject]@{ Pool = $pool; Before = $h.Reason; After = $after.Reason; Undone = $undone }
+    }
+
+    if (@($reverted).Count -gt 0) {
+        Write-Host ''
+        Write-Warning ("[iis-instr] {0} pool(s) were REVERTED and LATCHED after the sanity check: {1}. They are not instrumented, and a re-run will SKIP them until the latch is cleared (Clear-CxTargetLatch -Target '<pool>')." -f `
+            @($reverted).Count, (@($reverted | ForEach-Object { $_.Pool }) -join ', '))
+        foreach ($rv in $reverted) {
+            if (-not $rv.After -or $rv.After -notmatch 'Started') {
+                Write-Warning ("[iis-instr] {0} is STILL not healthy after the revert ({1}) - the breakage may not be ours. Investigate before re-running." -f $rv.Pool, $rv.After)
+            }
+        }
+        if ($Session -and $Session.Manifest) {
+            try { $Session.Manifest.sanityReverted = @($reverted | ForEach-Object { @{ pool = $_.Pool; before = $_.Before; after = $_.After; undone = $_.Undone } }) } catch { }
+        }
+    }
+}
+
 # ---- Verify -------------------------------------------------------------------
 Write-Host ""
 Write-Host "[iis-instr] W3SVC status: $((Get-Service W3SVC -ErrorAction SilentlyContinue).Status)"
@@ -996,5 +1301,34 @@ if ($Session -and $Session.PSObject.Properties['Manifest'] -and $Session.Manifes
 # ASP.NET Framework misconfiguration this script now reports. Microsoft's own wording is that
 # No Managed Code is "optional but recommended" for ASP.NET Core - the app still runs and
 # still reports either way.
+# ---- X-1: record what was DECIDED, so the doctor need not be handed the same flags ----
+# Instrument-IIS used to tell the operator to pass identical -RuntimeOverrides to Test-Agent.ps1 "or the
+# installer and the doctor disagree ... and drift is reported forever". That is the smell this removes:
+# the decisions are written down once, and the doctor compares against them instead of re-deriving.
+if (Get-Command Write-CxInstrumentationState -ErrorAction SilentlyContinue) {
+    try {
+        $stateRecords = @()
+        foreach ($r in @($svcMap)) {
+            $k = Get-IISAppKey -Site $r.Site -AppPath $r.AppPath
+            $stateRecords += [ordered]@{
+                target      = $k
+                kind        = 'iisApp'
+                site        = [string]$r.Site
+                appPath     = [string]$r.AppPath
+                pool        = [string]$r.Pool
+                serviceName = [string]$r.ServiceName
+                runtime     = [string]$r.DotNetRuntime
+                scope       = [string]$r.Scope
+                nodeHosting = [string]$r.NodeHosting
+                excluded    = [bool]($ruleExcluded -contains $k)
+            }
+        }
+        $sp = Write-CxInstrumentationState -Records $stateRecords -InstallerVersion $Version
+        Write-Host "[iis-instr] recorded $(@($stateRecords).Count) decision(s) -> $sp (the doctor reads this instead of needing the same flags)"
+    } catch {
+        Write-Warning "[iis-instr] could not write the decision record ($($_.Exception.Message)); the doctor will fall back to re-deriving expectations from its own flags."
+    }
+}
+
 Write-Host "[iis-instr] done."
 Write-Host "[iis-instr] App pool .NET CLR version: 'No Managed Code' is recommended for ASP.NET CORE pools (the desktop CLR is loaded and unused otherwise). Do NOT apply it to ASP.NET FRAMEWORK pools - those need v4.0 or their managed handlers cannot load and IIS fails every request."

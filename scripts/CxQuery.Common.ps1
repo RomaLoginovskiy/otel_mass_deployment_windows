@@ -12,7 +12,7 @@
 
          watcher - cxup_XXXX
          sga coralogix - cxup_YYYY
-         sga the reference agent - dt0c01.ZZZZ
+         sga other-vendor - dt0c01.ZZZZ
 
      so the token sent was the entire multi-line blob, the API answered 403, and every query came
      back empty. Nothing said "unauthorised" anywhere.
@@ -33,7 +33,7 @@ function Get-CxQueryKey {
 
       Accepts a bare token per line, or 'label - token' lines. -Label picks among several
       (substring, case-insensitive); without it the first Coralogix (cxup_) token wins - never a
-      the reference agent dt0c01 token, which is a different vendor's key that happens to share the file.
+      dt0c01 token, which is a DIFFERENT vendor's key that happens to share the file.
     #>
     [CmdletBinding()]
     param(
@@ -63,7 +63,7 @@ function Get-CxQueryKey {
     }
 
     if (-not $candidates.Count) {
-        throw "no Coralogix (cxup_) key found in $Path. Lines look like 'label - cxup_...' or a bare token; a the reference agent dt0c01 key is not usable here."
+        throw "no Coralogix (cxup_) key found in $Path. Lines look like 'label - cxup_...' or a bare token; a dt0c01 key (another vendor's) is not usable here."
     }
 
     if ($Label) {

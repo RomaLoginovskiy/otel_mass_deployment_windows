@@ -537,7 +537,12 @@ function Resolve-IISAppRuntime {
         [bool] $PoolFound = $true,
         [string[]] $AncestorPhysicalPaths = @(),
         [string[]] $InheritedFromLabels = @(),
-        [string] $Override
+        [string] $Override,
+        # D-2: the application pool this app runs in. Optional, and only used to RESOLVE a static verdict
+        # of 'Unknown' by looking at which CLR the pool's running worker actually loaded. A caller that
+        # does not pass it simply gets today's behaviour (Unknown stays Unknown and needs
+        # -RuntimeOverrides) - the probe is skipped, never guessed.
+        [string] $Pool
     )
 
     # '' is No Managed Code; anything else - including an absent attribute, which arrives here
@@ -640,6 +645,36 @@ function Resolve-IISAppRuntime {
                 }
             }
         }
+    }
+
+    # -- D-2: a RUNNING worker can settle what the static parse could not --------------------
+    # The static parse above answers from configuration, which is right for an app that is not running
+    # and is the only option for most of them. But when it lands on 'Unknown' the operator currently has
+    # to supply -RuntimeOverrides, and a running process already knows: it has loaded whichever CLR it
+    # loaded. The reference agent classifies this way in the first place, reading the target's modules from outside
+    # (reference-agent study doc 11 s2.6).
+    #
+    # Only used to RESOLVE 'Unknown', never to overrule a positive static verdict - a disagreement is
+    # reported instead (below), because silently preferring one source is how a wrong answer becomes
+    # invisible. And never for NonDotNet: that verdict means "no .NET here", and a w3wp hosting several
+    # apps may have a CLR up for a DIFFERENT application in the same pool.
+    if ($runtime -eq 'Unknown' -and $Pool -and (Get-Command Get-CxClrFlavorFromModules -ErrorAction SilentlyContinue)) {
+        try {
+            $poolWorkers = @(Get-CimInstance Win32_Process -Filter "Name='w3wp.exe'" -ErrorAction SilentlyContinue |
+                             Where-Object { "$($_.CommandLine)" -match [regex]::Escape($Pool) })
+            foreach ($pw in $poolWorkers) {
+                $mods = @()
+                try { $mods = @((Get-Process -Id $pw.ProcessId -ErrorAction Stop).Modules | Select-Object -ExpandProperty ModuleName) } catch { continue }
+                if (@($mods).Count -eq 0) { continue }   # unreadable (WOW64) - no evidence, not an answer
+                $flavor = Get-CxClrFlavorFromModules -Modules $mods
+                if (-not $flavor) { continue }
+                $runtime = if ($flavor -eq 'core') { 'AspNetCore' } else { 'AspNetFramework' }
+                $source  = 'runtime-modules'
+                [void]$evidence.Add("$($flavor) CLR loaded in w3wp pid=$($pw.ProcessId)")
+                $reason  = "the static parse could not decide, but the running worker for pool '$Pool' (pid $($pw.ProcessId)) has the $flavor CLR loaded, so the application runs on $runtime. This is evidence from the live process rather than a guess."
+                break
+            }
+        } catch { }
     }
 
     # -- Node hosting, resolved independently of the .NET verdict ----------------------------
