@@ -157,7 +157,7 @@ representative trace.
 `os.type`, `host.id`, `host.arch`) to every signal, including application spans — this is the key
 to correlation: matching `host.name` on both spans and host metrics is what ties a service to the
 host it runs on, and it gives each host's span metrics a unique resource so multi-host aggregation
-adds up instead of overwriting. `resource/environment` stamps the environment label from
+adds up instead of overwriting. `transform/environment` stamps the environment label from
 `CX_ENVIRONMENT`, `transform/appname` resolves the application name, and `batch` groups signals
 into efficient payloads.
 
@@ -236,8 +236,9 @@ for it. Full matrix, the reverse-proxy distinction and the `-RuntimeOverrides` e
 > Reported per pool as `OTLP_ENDPOINT_LOCALHOST`.
 
 To split telemetry by environment in Coralogix, set `CX_ENVIRONMENT` at machine scope and restart
-the collector; the config's `resource/environment` processor stamps `deployment.environment.name`
-onto host and infrastructure signals from it. For host **Service ownership**, the same deploy that
+the collector; the config's `transform/environment` processor stamps `deployment.environment.name`
+onto host and infrastructure signals from it. Leave it unset and those signals read `unspecified`,
+while an application that labelled itself keeps its own value. For host **Service ownership**, the same deploy that
 names applications publishes `CX_IIS_SERVICES` and the union `CX_SERVICES` — see
 [iis-service-ownership.md](iis-service-ownership.md).
 

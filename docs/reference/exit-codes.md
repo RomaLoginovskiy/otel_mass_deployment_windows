@@ -72,6 +72,7 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `DOMAIN_MISSING` | `CORALOGIX_DOMAIN` unset; the config default applies and this host ships to **eu1**. | Re-deploy with `-Region` / `CX_REGION`, or `-Domain` / `CX_DOMAIN` for a private ingress. |
 | `DOMAIN_NOT_A_KNOWN_REGION` | `CORALOGIX_DOMAIN` is not one of the published region domains, so data goes to `ingress.<that domain>`. Expected for a private ingress; a typo otherwise — the collector reports healthy either way. | Confirm the domain is deliberate. |
 | `CX_ENVIRONMENT_MISSING` | `CX_ENVIRONMENT` unset; all telemetry from this host is labelled `unspecified`. | Re-deploy with `-Environment` / `CX_ENVIRONMENT`. |
+| `CX_ENVIRONMENT_MISMATCH` | The environment label is persisted twice — machine `CX_ENVIRONMENT` and `deployment.environment.name` inside `OTEL_RESOURCE_ATTRIBUTES` — and the two disagree, so one host reports two environment identities. Each store passed its own check individually, which is how a host turned up in the field labelled one environment in APM and another in Infrastructure Explorer. | Re-deploy with `-Environment` to rewrite both stores together. |
 | `RESOURCE_ATTRS_MISSING` | `OTEL_RESOURCE_ATTRIBUTES` unset; Fleet Management selector attributes will be absent. | Re-run `Detect-Workloads.ps1` or the full install. |
 | `STARTTYPE_NOT_AUTOMATIC` | The service runs now but its StartType is not Automatic — it will not return after a reboot. | `sc.exe config … start= delayed-auto`. |
 
@@ -116,6 +117,8 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `PORT_4318_NOT_LISTENING` | Nothing listening on the OTLP HTTP port; instrumented apps have nowhere to send. | Check the receiver block in the effective config. |
 | `EFFECTIVE_PROCESSOR_MISSING` | A required processor (for example `transform/iis_service_labels`) is absent from the effective config, so `CX_IIS_SERVICES` is never stamped however correct the variable is. | Add it to the **remote** Fleet Management config. |
 | `EFFECTIVE_PROCESSOR_NOT_WIRED` | The processor is defined but not listed in a required pipeline's `processors`, so it never runs for that signal. | Wire it into the pipeline in the remote config. |
+| `ENV_PROCESSOR_MISSING` | `transform/environment` is absent from the effective config, so `CX_ENVIRONMENT` is never stamped and this host's signals arrive with no environment label however correct the variable is. Checked on **every** host, not only IIS ones. | Add it to the **remote** Fleet Management config. |
+| `ENV_PROCESSOR_NOT_WIRED` | `transform/environment` is defined but missing from the named pipeline's `processors`, so that signal carries no environment label. A stamp wired into `logs` but not `traces` is how spans end up unlabelled while every other check passes. | Wire it into the pipeline in the remote config. |
 
 ### Node instrumentation
 
@@ -196,6 +199,7 @@ prints. Triage `2` rows in bulk; triage `1` rows individually.
 | `EFFECTIVE_CONFIG_NOT_FOUND` | Neither the supervisor effective config nor the base collector config exists. |
 | `EFFECTIVE_CONFIG_UNREADABLE` | The config file exists but could not be read. |
 | `EFFECTIVE_PIPELINE_NOT_FOUND` | A required pipeline block could not be located, so the processor could not be confirmed as wired into it. |
+| `ENV_PIPELINE_NOT_FOUND` | A pipeline the environment stamp is expected on could not be located, so `transform/environment` could not be confirmed as wired into it. |
 | `NODE_PM2_DAEMON_NOT_VISIBLE` | PM2 is installed but its app list is empty or unreadable, and the apps could **not** be proven to exist by other means — almost always another account's daemon. Once they are proven, the finding becomes `NODE_PM2_DAEMON_OWNER_MISMATCH` (fail). |
 | `NODE_PM2_NOT_ON_PATH` | Node processes are running but `pm2` is not on this account's PATH. |
 

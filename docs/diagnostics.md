@@ -45,7 +45,7 @@ could not determine the answer.
 | `health` | The collector health endpoint answers |
 | `exportCounters` | The internal metrics endpoint — is anything actually being exported, and are the failure counters non-zero |
 | `ports` | OTLP receivers listening on 4318 (HTTP) and 4317 (gRPC) |
-| `effectiveConfig` | The required processors are present **and wired into** the required pipelines |
+| `effectiveConfig` | The required processors are present **and wired into** the required pipelines — `transform/iis_service_labels` on IIS hosts, `transform/environment` on every host |
 | `iisInstrumentation` | The CLR profiler and pool configuration — see below |
 | `nodeInstrumentation` | `NODE_OPTIONS`, the register bootstrap, and per-app service names on PM2 apps |
 
