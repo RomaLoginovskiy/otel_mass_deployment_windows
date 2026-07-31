@@ -48,7 +48,13 @@ REM  read this variable directly (like CX_OTEL_DOTNET_ARCHIVE), so the SAME file
 REM  up by the install AND by doctor.bat. If only one of them saw it they would disagree
 REM  about which apps belong in CX_IIS_SERVICES and report drift forever.
 REM ===========================================================================
-setlocal enabledelayedexpansion
+REM Plain setlocal, NOT enabledelayedexpansion. Nothing in this file uses !VAR! syntax,
+REM and leaving delayed expansion on silently ate any '!' out of every value forwarded
+REM below: CX_ENVIRONMENT=prod!x reached Install-Agent.ps1 as "prodx". The loss happened
+REM on the launch line, where %ARGS% is substituted, so quoting the values could not
+REM prevent it. Measured across '!', '&', '^' and embedded spaces - all survive now. A
+REM value containing a literal double quote still cannot survive this quoting scheme.
+setlocal
 cd /d "%~dp0"
 
 REM Always launch the 64-bit PowerShell on 64-bit Windows.
