@@ -88,6 +88,13 @@ param(
     [string]   $LocalCollectorConfig = 'C:\ProgramData\OpenTelemetry\Collector\config.yaml',
     [string[]] $RequiredProcessors  = @('transform/iis_service_labels'),
     [string[]] $RequiredPipelines   = @('logs','logs/resource_catalog'),
+    # The environment stamp is checked separately from $RequiredProcessors, for two
+    # reasons: it applies to EVERY host rather than only the IIS ones (so it must sit
+    # outside the IIS gate below), and it has to reach the app signals as well - a
+    # processor wired into logs but not traces is exactly how spans end up with no
+    # environment label while every other check still reports a pass.
+    [string]   $EnvironmentProcessor = 'transform/environment',
+    [string[]] $EnvironmentPipelines = @('logs','metrics','traces'),
     [string]   $ExpectedOtlpEndpoint = 'http://127.0.0.1:4318',
 
     # Pass the SAME overrides the install used, or the service-name comparison
@@ -330,6 +337,32 @@ if (Use-Check 'env') {
             -Message 'not set - Fleet Management agent-selector attributes (cx.host.role / workload.*) will be absent')
     } else {
         Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'OTEL_RESOURCE_ATTRIBUTES' -Message $attrs)
+    }
+
+    # The environment label is persisted TWICE, by two different scripts: machine
+    # CX_ENVIRONMENT (what the collector stamps host and infra signals from) and
+    # deployment.environment.name inside OTEL_RESOURCE_ATTRIBUTES (what the app SDKs and
+    # the Fleet agent-selector read). Nothing above compares them, so a host carrying two
+    # different environment identities passed every check individually - which is exactly
+    # how one turned up in the field reporting 'qa' in one store and a different
+    # environment in the other, with no finding to point at.
+    if ($attrs) {
+        $envAttrMatch = [regex]::Match($attrs, '(?:^|,)\s*deployment\.environment\.name\s*=\s*([^,]*)')
+        if ($envAttrMatch.Success) {
+            $attrEnv = $envAttrMatch.Groups[1].Value.Trim()
+            if (-not $environment) {
+                Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISMATCH' -Target 'deployment.environment.name' `
+                    -Message "OTEL_RESOURCE_ATTRIBUTES says '$attrEnv' but CX_ENVIRONMENT is not set - app signals keep '$attrEnv' while host and infrastructure signals are labelled 'unspecified'. Re-deploy with -Environment to label the whole host." `
+                    -Data @{ resourceAttributes = $attrEnv; machineVar = '' })
+            } elseif ($attrEnv -ne $environment) {
+                Add-F (New-Finding -Check 'env' -Severity 'warn' -Code 'CX_ENVIRONMENT_MISMATCH' -Target 'deployment.environment.name' `
+                    -Message "two environment identities on one host: CX_ENVIRONMENT='$environment' but OTEL_RESOURCE_ATTRIBUTES says '$attrEnv'. Re-deploy with -Environment to bring both stores back into step." `
+                    -Data @{ resourceAttributes = $attrEnv; machineVar = $environment })
+            } else {
+                Add-F (New-Finding -Check 'env' -Severity 'pass' -Target 'deployment.environment.name' `
+                    -Message "$attrEnv (agrees with CX_ENVIRONMENT)")
+            }
+        }
     }
 
     # CX_IIS_SERVICES: the variable this whole exercise started with.
@@ -854,7 +887,9 @@ if (Use-Check 'ports') {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Effective config: is the service-label processor actually in play?
+# 7. Effective config: are the label-stamping processors actually in play?
+#    7a. transform/iis_service_labels (IIS hosts only)
+#    7b. transform/environment        (every host)
 # ---------------------------------------------------------------------------
 if (Use-Check 'effectiveConfig') {
     # This is the check that explains "CX_IIS_SERVICES is set but Service
@@ -878,9 +913,6 @@ if (Use-Check 'effectiveConfig') {
     if (-not $cfgPath) {
         Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_CONFIG_NOT_FOUND' `
             -Message "no collector config found (looked at: $($searched -join '; '))")
-    } elseif (-not $iisPresent -and -not $cxIisServices) {
-        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'skip' -Code 'IIS_ABSENT' `
-            -Message 'no IIS on this host, so the IIS service-label processor is not expected')
     } else {
         $text = $null
         try { $text = Get-Content -LiteralPath $cfgPath -Raw -ErrorAction Stop } catch { }
@@ -896,7 +928,27 @@ if (Use-Check 'effectiveConfig') {
             # name appears both as a definition and inside each pipeline block.
             $live = ($text -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
 
-            foreach ($proc in @($RequiredProcessors)) {
+            # Pipeline blocks have to be looked up INSIDE service.pipelines. Searching
+            # the whole file for a four-space 'logs:' key matches an exporter's own logs
+            # section hundreds of lines earlier instead - the processor is legitimately
+            # absent there, so the wiring check could report NOT_WIRED against a config
+            # that was in fact wired correctly. Fall back to the whole text if the
+            # pipelines block cannot be located, so a shape change degrades to the old
+            # behaviour rather than silently checking nothing.
+            $pipesText = [regex]::Match($live, '(?ms)^  pipelines:\s*$.*?(?=^  \S|\z)').Value
+            if (-not $pipesText) { $pipesText = $live }
+
+            # -- 7a. IIS service labels -------------------------------------------
+            # Only meaningful where IIS is in play. On a non-IIS host, say so and check
+            # nothing here - but do NOT skip the whole section, because 7b below applies
+            # to every host. Emptying the list is what keeps the loop body untouched.
+            $iisProcs = if ($iisPresent -or $cxIisServices) { @($RequiredProcessors) } else { @() }
+            if (-not $iisProcs) {
+                Add-F (New-Finding -Check 'effectiveConfig' -Severity 'skip' -Code 'IIS_ABSENT' `
+                    -Message 'no IIS on this host, so the IIS service-label processor is not expected')
+            }
+
+            foreach ($proc in $iisProcs) {
                 if ($live -notmatch [regex]::Escape($proc)) {
                     Add-F (New-Finding -Check 'effectiveConfig' -Severity 'warn' -Code 'EFFECTIVE_PROCESSOR_MISSING' -Target $proc `
                         -Message "not present in $cfgPath - CX_IIS_SERVICES is never stamped onto telemetry, so Service ownership stays blank however correct the env var is. Add the processor to the REMOTE Fleet Management config." `
@@ -906,7 +958,7 @@ if (Use-Check 'effectiveConfig') {
 
                 # Present. Now: is it wired into each required pipeline?
                 foreach ($pipe in @($RequiredPipelines)) {
-                    $block = [regex]::Match($live, "(?ms)^\s{4}$([regex]::Escape($pipe)):\s*$.*?(?=^\s{4}\S|\z)")
+                    $block = [regex]::Match($pipesText, "(?ms)^\s{4}$([regex]::Escape($pipe)):\s*$.*?(?=^\s{4}\S|\z)")
                     if (-not $block.Success) {
                         Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'EFFECTIVE_PIPELINE_NOT_FOUND' -Target "$pipe" `
                             -Message "could not locate the '$pipe' pipeline block in $cfgPath to confirm the processor is wired into it")
@@ -920,6 +972,33 @@ if (Use-Check 'effectiveConfig') {
                     }
                 }
             }
+
+            # -- 7b. Environment stamp --------------------------------------------
+            # Every host, IIS or not. This is the check the env-var section cannot make:
+            # CX_ENVIRONMENT reads 'pass' there purely because the variable exists, while
+            # a remote Fleet config that redefines these pipelines drops the processor
+            # and the label never reaches a single signal.
+            if ($live -notmatch [regex]::Escape($EnvironmentProcessor)) {
+                Add-F (New-Finding -Check 'effectiveConfig' -Severity 'warn' -Code 'ENV_PROCESSOR_MISSING' -Target $EnvironmentProcessor `
+                    -Message "not present in $cfgPath - CX_ENVIRONMENT is never stamped onto telemetry, so this host's signals arrive with no environment label however correct the env var is. Add the processor to the REMOTE Fleet Management config." `
+                    -Data @{ config = $cfgPath })
+            } else {
+                foreach ($pipe in @($EnvironmentPipelines)) {
+                    $block = [regex]::Match($pipesText, "(?ms)^\s{4}$([regex]::Escape($pipe)):\s*$.*?(?=^\s{4}\S|\z)")
+                    if (-not $block.Success) {
+                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'unknown' -Code 'ENV_PIPELINE_NOT_FOUND' -Target "$pipe" `
+                            -Message "could not locate the '$pipe' pipeline block in $cfgPath to confirm $EnvironmentProcessor is wired into it")
+                    } elseif ($block.Value -match [regex]::Escape($EnvironmentProcessor)) {
+                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'pass' -Target "$pipe" `
+                            -Message "$EnvironmentProcessor is wired into the $pipe pipeline")
+                    } else {
+                        Add-F (New-Finding -Check 'effectiveConfig' -Severity 'warn' -Code 'ENV_PROCESSOR_NOT_WIRED' -Target "$pipe" `
+                            -Message "$EnvironmentProcessor is defined but NOT listed in the '$pipe' pipeline's processors - $pipe therefore carries no environment label" `
+                            -Data @{ config = $cfgPath })
+                    }
+                }
+            }
+
             Add-F (New-Finding -Check 'effectiveConfig' -Severity 'info' -Target $cfgPath `
                 -Message 'checked by text match (no YAML parser in PS 5.1); comment lines were excluded')
         }
