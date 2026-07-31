@@ -55,14 +55,20 @@
   With -Apply, recycle each pool whose environment changed, so its node.exe children come back
   with the bootstrap. Default $true. Suppress with -Recycle:$false to apply in a maintenance
   window - but note that until the recycle happens the host reads as instrumented and emits
-  nothing, which is the silent state this tooling exists to remove. NEVER runs iisreset: only the
-  pools that changed are recycled.
+  nothing, which is the silent state this tooling exists to remove. NEVER runs iisreset: only pools
+  whose BOOTSTRAP write succeeded are recycled. A pool whose NODE_OPTIONS write failed is left
+  running and named in the report - restarting it would interrupt the request path and bring its
+  node.exe children back just as unable to emit anything.
 
 .PARAMETER RefreshServiceLabels
   With -Apply, add the instrumented application names to machine CX_NODE_SERVICES, republish
   CX_SERVICES (the union the collector actually reads for host Service ownership), and restart the
   collector so it re-reads them. Default $true. Suppress with -RefreshServiceLabels:$false to leave
   every machine variable alone and touch only the app pools.
+
+  Only applications whose bootstrap actually reached their pool are published. A name published for
+  an application that emits nothing is worse than no name: the host entity claims a service with no
+  telemetry behind it while every variable involved still reads as correct.
 
   Why on by default: the collector's transform reads `${env:CX_SERVICES}`, not the per-runtime
   slices. An application instrumented without that update reports spans in APM while the HOST
@@ -191,7 +197,12 @@ function Get-LocalIisnodeEvidence {
     # IsDotNet is the co-tenancy question, not a runtime verdict: it only has to answer "would this
     # application be instrumented by the .NET profiler, and therefore care what OTEL_SERVICE_NAME
     # its pool carries". Mirrors the positive-evidence rules in Get-CxWebConfigRuntimeState.
-    $out = [pscustomobject]@{ IsIisnode = $false; Entry = $null; CustomCmdLine = $false; IsDotNet = $false; State = 'nopath' }
+    # IsFramework is a NARROWER question than IsDotNet and is asked about the application itself,
+    # not its co-tenants: only classic ASP.NET Framework promotes web.config OTEL_* values to
+    # PROCESS-level environment variables, which is what makes per-app naming unsafe for a hybrid
+    # app on a shared pool. Core reads its own <aspNetCore><environmentVariables> per app and does
+    # not have that problem.
+    $out = [pscustomobject]@{ IsIisnode = $false; Entry = $null; CustomCmdLine = $false; IsDotNet = $false; IsFramework = $false; State = 'nopath' }
     if (-not $PhysicalPath) { return $out }
     $wc = Join-Path $PhysicalPath 'web.config'
     $raw = $null
@@ -223,56 +234,80 @@ function Get-LocalIisnodeEvidence {
                 if ($child.NodeType -ne [System.Xml.XmlNodeType]::Element) { continue }
                 if ('compilation','httpRuntime','httpModules','httpHandlers','authentication','sessionState','pages','customErrors','globalization','identity','machineKey','membership','roleManager','trace' -contains $child.LocalName) {
                     $out.IsDotNet = $true
+                    $out.IsFramework = $true
                 }
             }
         }
         foreach ($n in @($x.SelectNodes('//system.webServer/handlers/add')) + @($x.SelectNodes('//system.webServer/modules/add'))) {
             $t = [string]$n.GetAttribute('type')
-            if ($t -and $t -notmatch 'AspNetCoreModule') { $out.IsDotNet = $true }
-            if (([string]$n.GetAttribute('path')) -match '\.(aspx|asmx|ashx|axd)$') { $out.IsDotNet = $true }
+            if ($t -and $t -notmatch 'AspNetCoreModule') { $out.IsDotNet = $true; $out.IsFramework = $true }
+            if (([string]$n.GetAttribute('path')) -match '\.(aspx|asmx|ashx|axd)$') { $out.IsDotNet = $true; $out.IsFramework = $true }
         }
     } catch { }
     return $out
 }
 
-function Get-PoolNameConflict {
+function Get-LocalIISNodeNamingDecision {
     <#
-      Can a pool-level OTEL_SERVICE_NAME honestly name THIS application? Returns $null when it can,
-      or the reason it cannot.
+      WHERE this application's OTEL_SERVICE_NAME can go. The no-libraries fallback for
+      Get-IISNodeNamingDecision in deploy\Resolve-IISAppRuntime.ps1, and it must agree with it -
+      the unit suite asserts that pair against the same inputs, because a host patched by this
+      script and later re-deployed must not flip between instrumented and not.
 
-      A pool variable reaches every application in the pool and every process those applications
-      start, so there are two ways to get this wrong, and the second is worse than doing nothing:
+      Returns the same shape: .Mode ('pool' | 'perApp' | 'refuse'), .Outcome (a
+      New-IISNodeFinding token), .Rivals, .Reason, .RemovePoolName.
 
-        * two iisnode applications in one pool - one name cannot name both
-        * an iisnode application sharing a pool with an instrumented .NET application - writing the
-          Node service name RENAMES the .NET one, corrupting a service that was reporting correctly
+      Why a shared pool is no longer simply refused: a pool variable reaches every application in
+      the pool, but iisnode ALSO appends each application's own <appSettings> to the environment
+      block it builds for its node.exe child, so the name can be per-app while the pool carries
+      only the shared bootstrap. The two remaining refusals are real:
 
-      A static or otherwise uninstrumented co-tenant does not read OTEL_SERVICE_NAME, so it does
-      not block.
-
-      The last check is the belt-and-braces one: if the pool ALREADY carries a different
-      OTEL_SERVICE_NAME, something (very likely Instrument-IIS.ps1, for the .NET app) has claimed
-      that pool. Overwriting it is exactly the silent rename above, so refuse regardless of what
-      classification concluded.
+        * the application is iisnode AND classic ASP.NET Framework on a shared pool - the
+          Framework SDK promotes web.config OTEL_* values PROCESS-wide, so a per-app name would
+          leak onto its co-tenants through w3wp
+        * the pool carries an OTEL_SERVICE_NAME this installer did not write - iisnode copies the
+          parent environment BEFORE appending appSettings and Windows resolves the first entry, so
+          that pool value shadows the per-app one and the per-app name would do nothing
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] $Record,
         [object[]] $All = @(),
-        [string]   $ExistingPoolServiceName
+        [string]   $ExistingPoolServiceName,
+        [string[]] $PoolOwnNames = @()
     )
 
     $rivals = @($All | Where-Object {
         $_.Pool -eq $Record.Pool -and $_.Key -ne $Record.Key -and ($_.IsIisnode -or $_.IsDotNet)
     })
-    if (@($rivals).Count -gt 0) {
-        $kinds = @($rivals | ForEach-Object { "$($_.Key)$(if ($_.IsIisnode) { ' (iisnode)' } else { ' (.NET)' })" }) -join ', '
-        return "pool '$($Record.Pool)' also hosts instrumented application(s): $kinds. A pool-level OTEL_SERVICE_NAME reaches all of them, so naming this one would mis-name or rename the others"
+    $rivalLabels = @($rivals | ForEach-Object { "$($_.Key)$(if ($_.IsIisnode) { ' (iisnode)' } else { ' (.NET)' })" }) -join ', '
+
+    if (@($rivals).Count -eq 0) {
+        if ($ExistingPoolServiceName -and $ExistingPoolServiceName -ne $Record.ServiceName) {
+            return [pscustomobject]@{
+                Mode = 'refuse'; Outcome = 'poolNameShadow'; Rivals = @(); RemovePoolName = $false
+                Reason = "pool '$($Record.Pool)' already carries OTEL_SERVICE_NAME='$ExistingPoolServiceName', which is not the name for this application - something else has claimed this pool and overwriting it would rename that service"
+            }
+        }
+        return [pscustomobject]@{ Mode = 'pool'; Outcome = 'instrumented'; Rivals = @(); RemovePoolName = $false; Reason = $null }
     }
-    if ($ExistingPoolServiceName -and $ExistingPoolServiceName -ne $Record.ServiceName) {
-        return "pool '$($Record.Pool)' already carries OTEL_SERVICE_NAME='$ExistingPoolServiceName', which is not the name for this application - something else has claimed this pool and overwriting it would rename that service"
+    if ($Record.IsFramework) {
+        return [pscustomobject]@{
+            Mode = 'refuse'; Outcome = 'sharedPoolFw'; Rivals = $rivalLabels; RemovePoolName = $false
+            Reason = "this application is iisnode AND instrumented ASP.NET Framework and shares pool '$($Record.Pool)' with $rivalLabels. The Framework SDK promotes web.config OTEL_* values to PROCESS-level environment variables, so a per-app name would leak through w3wp and rename its co-tenants"
+        }
     }
-    return $null
+    if ($ExistingPoolServiceName -and -not ($PoolOwnNames -contains $ExistingPoolServiceName)) {
+        return [pscustomobject]@{
+            Mode = 'refuse'; Outcome = 'poolNameShadow'; Rivals = $rivalLabels; RemovePoolName = $false
+            Reason = "pool '$($Record.Pool)' carries OTEL_SERVICE_NAME='$ExistingPoolServiceName' that this installer did not write, and a pool value shadows the per-app one, so the per-app name would not take effect"
+        }
+    }
+    return [pscustomobject]@{
+        Mode = 'perApp'; Outcome = 'perAppNamed'; Rivals = $rivalLabels
+        RemovePoolName = [bool]$ExistingPoolServiceName
+        Reason = "shares pool '$($Record.Pool)' with $rivalLabels, so the name goes in this application's own web.config <appSettings>"
+    }
 }
 
 function Test-LocalAppIsEsm {
@@ -379,6 +414,25 @@ function Merge-LocalNodeOptions {
     return (($kept | Where-Object { $_ }) -join ' ').Trim()
 }
 
+function Test-CxBootstrapInValue {
+    <#
+      Does a merged NODE_OPTIONS actually preload OUR register.js?
+
+      Asserted rather than assumed because every silent failure this script exists to prevent has the
+      same shape: the six OTEL_* variables land, the bootstrap does not, and the host reads as
+      instrumented while its applications emit nothing. Measured on a real host, where a foreign
+      deploy library returned a bootstrap object this script could not read: the merged value came out
+      empty, 35 pools were written and recycled, and the only complaint was a read-back mismatch with
+      a guess about file locks attached.
+    #>
+    param([string] $Value, [string] $RegisterPath)
+    if (-not $Value -or -not $RegisterPath) { return $false }
+    $v = ($Value -replace '\\','/').ToLowerInvariant()
+    $t = ($RegisterPath -replace '\\','/').ToLowerInvariant()
+    if (-not $v.Contains($t)) { return $false }
+    return [bool]($v -match '--(require|import)')
+}
+
 # ---------------------------------------------------------------------------------------------
 # Stage 0 - preflight
 # ---------------------------------------------------------------------------------------------
@@ -453,6 +507,19 @@ if (-not $boot.RegisterPath) {
     exit 2
 }
 Write-Step OK "bootstrap: $($boot.RegisterPath)"
+# RegisterPath being present is NOT enough to write anything: the string that reaches the pool is
+# $boot.Cjs. When this script runs next to a deploy checkout it takes that string from the library's
+# Resolve-CxNodeBootstrap ($b.NodeOptionsCjs), so a library that names the property differently -
+# or does not return it at all - leaves Cjs empty while RegisterPath, and therefore the OK line
+# above, still reads healthy. Measured on a real host: the run then wrote the six OTEL_* variables
+# to 35 pools with an EMPTY NODE_OPTIONS among them and recycled every one of them, producing
+# exactly the reads-instrumented-emits-nothing state this tooling exists to remove. Preflight abort,
+# because there is no application on this host it could be written correctly for.
+if (-not $boot.Cjs) {
+    Write-Step FAIL "the bootstrap FLAG came back empty even though register.js was found at $($boot.RegisterPath) - $(if ($haveLibs) { "the deploy libraries in use ($libMode) returned a shape this script could not read" } else { 'the standalone resolver in this file produced no --require flag' })" `
+        -Fix $(if ($haveLibs) { "that library's Resolve-CxNodeBootstrap must expose NodeOptionsCjs - check with: . <deploy>\Resolve-NodeServiceNames.ps1 ; Resolve-CxNodeBootstrap -InstallPrefix $InstallPrefix | Format-List * . Or copy this ONE file to a directory with no deploy\ beside or above it, which forces the standalone fallbacks this script's own tests pin against the repository libraries" } else { 'this is a bug in Resolve-LocalNodeBootstrap in this file, not a host problem' })
+    exit 2
+}
 # The ESM loader hook is deliberately NOT required here. It is the fix on the PM2 path, where node
 # runs the app directly; under iisnode an ES module cannot start at all (its interceptor require()s
 # the entry point), so ESM apps are refused regardless and the hook is only tracked so a stale one
@@ -538,6 +605,7 @@ foreach ($site in @($xml.SelectNodes('/configuration/system.applicationHost/site
             IsEsm        = $false
             CustomCmdLine = $false
             IsDotNet     = $false
+            IsFramework  = $false
             WcState      = 'nopath'
         })
     }
@@ -562,6 +630,9 @@ foreach ($r in $records) {
         # Positive .NET evidence from the SAME parsed state - the co-tenancy question below needs
         # it for every app in the pool, not just the iisnode ones.
         $r.IsDotNet = [bool]((@($st.CoreEvidence).Count -gt 0) -or (@($st.FrameworkEvidence).Count -gt 0))
+        # Framework specifically, and only about THIS application: it is what decides whether a
+        # per-app name in web.config would leak process-wide onto the pool's other applications.
+        $r.IsFramework = [bool](@($st.FrameworkEvidence).Count -gt 0)
     } else {
         $ev = Get-LocalIisnodeEvidence -PhysicalPath $r.PhysicalPath
         $r.WcState       = $ev.State
@@ -569,6 +640,7 @@ foreach ($r in $records) {
         $r.Entry         = $ev.Entry
         $r.CustomCmdLine = $ev.CustomCmdLine
         $r.IsDotNet      = $ev.IsDotNet
+        $r.IsFramework   = $ev.IsFramework
     }
     if ($r.IsIisnode) {
         $r.IsEsm = if ($haveLibs -and (Get-Command Test-CxNodeAppIsEsm -ErrorAction SilentlyContinue)) {
@@ -614,6 +686,74 @@ function Get-PoolEnvValue {
     return [string]$n.GetAttribute('value')
 }
 
+function Get-LocalWebConfigAppSetting {
+    <#
+      Read one <appSettings> value from an application's own web.config. The no-libraries fallback
+      for Get-CxWebConfigAppSetting. Returns $null for every "not there" case and never throws.
+    #>
+    param([string] $PhysicalPath, [Parameter(Mandatory)][string] $Key)
+    if (-not $PhysicalPath) { return $null }
+    $wc = Join-Path $PhysicalPath 'web.config'
+    if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) { return $null }
+    try { [xml]$x = [System.IO.File]::ReadAllText($wc) } catch { return $null }
+    $n = $x.SelectSingleNode("/configuration/appSettings/add[@key='$Key']")
+    if (-not $n) { return $null }
+    $v = [string]$n.GetAttribute('value')
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    return $v
+}
+
+function Set-LocalWebConfigAppSetting {
+    <#
+      Write one <appSettings> value into an application's own web.config, creating the section if
+      it is absent. The no-libraries fallback for Set-WebConfigAppSettingServiceName.
+
+      This is how a pool-SHARING iisnode application gets its own name: iisnode appends the
+      application's appSettings to the environment block it builds for node.exe, so two
+      applications in one pool can carry different names.
+
+      Backs the file up next to itself first - this script has no manifest session, and an operator
+      running it on a live host must be able to put a web.config back by hand. Returns $true only
+      when the value is readable back from disk afterwards.
+    #>
+    param([string] $PhysicalPath, [Parameter(Mandatory)][string] $Key, [Parameter(Mandatory)][string] $Value)
+    if (-not $PhysicalPath) { return $false }
+    $wc = Join-Path $PhysicalPath 'web.config'
+    if (-not (Test-Path -LiteralPath $wc -ErrorAction SilentlyContinue)) {
+        Write-Step FAIL "no web.config at '$wc', so this application cannot be named per-app"
+        return $false
+    }
+    try {
+        # One backup per run, named like the applicationHost.config one. $script:StartedAt is set by
+        # this script's own preamble; the fallback keeps the function usable when it is lifted out of
+        # here (the unit suite does exactly that) instead of failing on a null.
+        $when = if ($script:StartedAt) { $script:StartedAt } else { Get-Date }
+        $bak  = "$wc.{0}.bak" -f $when.ToString('yyyyMMdd-HHmmss')
+        if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $wc -Destination $bak -ErrorAction Stop }
+        [xml]$x = [System.IO.File]::ReadAllText($wc)
+        $app = $x.SelectSingleNode('/configuration/appSettings')
+        if (-not $app) {
+            $app = $x.CreateElement('appSettings')
+            if ($x.DocumentElement.FirstChild) { [void]$x.DocumentElement.InsertBefore($app, $x.DocumentElement.FirstChild) }
+            else                              { [void]$x.DocumentElement.AppendChild($app) }
+        }
+        $n = $app.SelectSingleNode("add[@key='$Key']")
+        if (-not $n) {
+            $n = $x.CreateElement('add')
+            [void]$n.SetAttribute('key', $Key)
+            [void]$app.AppendChild($n)
+        }
+        [void]$n.SetAttribute('value', $Value)
+        $x.Save($wc)
+    } catch {
+        Write-Step FAIL "could not write $Key into '$wc': $_"
+        return $false
+    }
+    # Read back, do not assume. A Save that threw nothing but produced no change would otherwise be
+    # reported as a name that landed.
+    return ([string](Get-LocalWebConfigAppSetting -PhysicalPath $PhysicalPath -Key $Key) -eq $Value)
+}
+
 function Get-PoolIdentityAccount {
     <#
       The account a pool's worker runs as, in a form icacls accepts. The default,
@@ -643,12 +783,23 @@ $work = New-Object System.Collections.ArrayList
 foreach ($r in $selected) {
     $label = "$($r.Key) [pool '$($r.Pool)']"
 
-    # Co-tenancy. Same gate as Instrument-IIS.ps1's $poolRivals check, and it must stay the same:
-    # a host patched here and later re-deployed must not flip between instrumented and not.
-    $conflict = Get-PoolNameConflict -Record $r -All $records -ExistingPoolServiceName (Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME')
-    if ($conflict) {
-        Write-Step WARN "$label - $conflict. Left alone: a name that maps to two services, or that renames a service already reporting, is worse than no name." `
-            -Fix 'give this application its own app pool, or set the bootstrap per application via <iisnode nodeProcessCommandLine>'
+    # WHERE the name can go. The library function when it is next to us, the local fallback
+    # otherwise - and the unit suite asserts the two agree, because a host patched here and later
+    # re-deployed must not flip between instrumented and not.
+    $existingPoolSvc = Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'
+    $poolOwnNames    = @($records | Where-Object { $_.Pool -eq $r.Pool } | ForEach-Object { $_.ServiceName } | Where-Object { $_ })
+    $decision = if ($haveLibs -and (Get-Command Get-IISNodeNamingDecision -ErrorAction SilentlyContinue)) {
+        Get-IISNodeNamingDecision -Key $r.Key -Pool $r.Pool -ServiceName $r.ServiceName `
+            -Peers @($records | ForEach-Object {
+                [pscustomobject]@{ Key = $_.Key; Pool = $_.Pool; IsIisnode = [bool]$_.IsIisnode; IsDotNetInstrumented = [bool]$_.IsDotNet } }) `
+            -ExistingPoolServiceName $existingPoolSvc -PoolOwnNames $poolOwnNames `
+            -IsFrameworkInstrumented ([bool]$r.IsFramework)
+    } else {
+        Get-LocalIISNodeNamingDecision -Record $r -All $records -ExistingPoolServiceName $existingPoolSvc -PoolOwnNames $poolOwnNames
+    }
+    if ($decision.Mode -eq 'refuse') {
+        Write-Step WARN "$label - $($decision.Reason). Left alone: a name that maps to two services, or that renames a service already reporting, is worse than no name." `
+            -Fix $(if ($decision.Outcome -eq 'sharedPoolFw') { 'give this application its own app pool - then the name goes on the pool and there is nobody to leak onto' } else { "remove OTEL_SERVICE_NAME from pool '$($r.Pool)' (it cannot correctly name a shared pool anyway), then re-run" })
         continue
     }
     # ESM: refused outright, NOT conditional on the loader hook being staged.
@@ -682,15 +833,28 @@ foreach ($r in $selected) {
         Merge-LocalNodeOptions -Existing $existing -Bootstrap $bootstrap -OwnedTargets $owned
     }
 
-    $vars = [ordered]@{
-        NODE_OPTIONS                = $merged
-        OTEL_SERVICE_NAME           = $r.ServiceName
-        OTEL_EXPORTER_OTLP_ENDPOINT = $OtlpEndpoint
-        OTEL_EXPORTER_OTLP_PROTOCOL = 'http/protobuf'
-        OTEL_TRACES_EXPORTER        = 'otlp'
-        OTEL_METRICS_EXPORTER       = 'otlp'
-        OTEL_LOGS_EXPORTER          = 'otlp'
+    # The merge is checked, not trusted. $ErrorActionPreference is 'Continue' here (a classifier that
+    # cannot read one web.config must not abort a host-wide run), which means a failed call to a
+    # drifted library function - a missing -OwnedTargets parameter, say - only writes an error to the
+    # console and leaves $merged null. Without this gate the six OTEL_* variables below are still
+    # written, and a pool carrying a service name and no --require is an application that reports
+    # nothing while every variable on it reads as configured.
+    if (-not (Test-CxBootstrapInValue -Value $merged -RegisterPath $boot.RegisterPath)) {
+        Write-Step FAIL "$label - the merged NODE_OPTIONS does not carry the bootstrap, so NOTHING is written for this application (its pool is left exactly as it was). Merged value: '$merged'" `
+            -Fix $(if ($haveLibs) { "Merge-CxNodeOptions from $libMode returned a value without $($boot.RegisterPath) - check its signature accepts -OwnedTargets: (Get-Command Merge-CxNodeOptions).Parameters.Keys . Or copy this ONE file to a directory with no deploy\ beside or above it to force the fallbacks in this file" } else { 'this is a bug in Merge-LocalNodeOptions in this file, not a host problem' })
+        continue
     }
+
+    # On the per-app path the NAME is deliberately absent from the pool set: a pool value would
+    # shadow the per-app one (iisnode copies the parent environment before appending appSettings,
+    # and Windows resolves the first entry), so writing both would make the appSettings name inert.
+    $vars = [ordered]@{ NODE_OPTIONS = $merged }
+    if ($decision.Mode -eq 'pool') { $vars['OTEL_SERVICE_NAME'] = $r.ServiceName }
+    $vars['OTEL_EXPORTER_OTLP_ENDPOINT'] = $OtlpEndpoint
+    $vars['OTEL_EXPORTER_OTLP_PROTOCOL'] = 'http/protobuf'
+    $vars['OTEL_TRACES_EXPORTER']        = 'otlp'
+    $vars['OTEL_METRICS_EXPORTER']       = 'otlp'
+    $vars['OTEL_LOGS_EXPORTER']          = 'otlp'
 
     # Already correct? Then this app needs no write and, importantly, no RECYCLE.
     $changes = [ordered]@{}
@@ -698,19 +862,41 @@ foreach ($r in $selected) {
         $cur = Get-PoolEnvValue -Pool $r.Pool -Name $k
         if ([string]$cur -ne [string]$vars[$k]) { $changes[$k] = $vars[$k] }
     }
+    # The per-app name is a web.config edit, not a pool variable, so it needs its own
+    # already-correct check - otherwise every run would recycle the pool for a name that is
+    # already in place, or skip a name that is not.
+    $perAppName = $null
+    if ($decision.Mode -eq 'perApp') {
+        $curPerApp = if ($haveLibs -and (Get-Command Get-CxWebConfigAppSetting -ErrorAction SilentlyContinue)) {
+            Get-CxWebConfigAppSetting -PhysicalPath $r.PhysicalPath -Key 'OTEL_SERVICE_NAME'
+        } else {
+            Get-LocalWebConfigAppSetting -PhysicalPath $r.PhysicalPath -Key 'OTEL_SERVICE_NAME'
+        }
+        if ([string]$curPerApp -ne [string]$r.ServiceName) { $perAppName = $r.ServiceName }
+    }
 
     Write-Host ("  {0,-40} -> {1,-28} {2}" -f $r.Key, $r.ServiceName, $(if ($r.IsEsm) { 'esm loader hook + --require' } else { '--require' }))
     if ($existing) { Write-Host "      preserving the application's own NODE_OPTIONS: $existing" -ForegroundColor DarkGray }
     if ($r.ServiceName -ne $r.AutoName) { Write-Host "      name overridden (auto was '$($r.AutoName)')" -ForegroundColor DarkGray }
+    if ($decision.Mode -eq 'perApp') { Write-Host "      $($decision.Reason)" -ForegroundColor DarkGray }
 
-    if ($changes.Count -eq 0) {
+    if ($changes.Count -eq 0 -and -not $perAppName -and -not $decision.RemovePoolName) {
         Write-Step OK "$label already carries this exact bootstrap and service name - no write, no recycle"
         continue
+    }
+    if ($decision.RemovePoolName) {
+        Write-Step $(if ($Apply) { 'APPLY' } else { 'DRYRUN' }) "$($r.Pool): REMOVE OTEL_SERVICE_NAME='$existingPoolSvc' (a pool value shadows the per-app names in this shared pool)"
+    }
+    if ($perAppName) {
+        Write-Step $(if ($Apply) { 'APPLY' } else { 'DRYRUN' }) "$($r.PhysicalPath)\web.config: <appSettings> OTEL_SERVICE_NAME=$perAppName"
     }
     foreach ($k in $changes.Keys) {
         Write-Step $(if ($Apply) { 'APPLY' } else { 'DRYRUN' }) "$($r.Pool): $k=$($changes[$k])"
     }
-    [void]$work.Add([pscustomobject]@{ Record = $r; Changes = $changes })
+    [void]$work.Add([pscustomobject]@{
+        Record = $r; Changes = $changes
+        PerAppName = $perAppName; RemovePoolName = [bool]$decision.RemovePoolName
+    })
 }
 
 if (@($work).Count -eq 0) {
@@ -746,8 +932,17 @@ try {
     Write-Step WARN "could not back up applicationHost.config: $($_.Exception.Message) - continuing, the writes below are individually reversible with appcmd"
 }
 
-$touchedPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $grantedPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+# Pools whose BOOTSTRAP is on disk when this run ends - the only pools worth recycling, and the only
+# applications this host may claim. Deliberately NOT "pools where some write succeeded": any one of
+# the seven variables landing used to mark a pool as changed, so a run whose NODE_OPTIONS write
+# failed still recycled every pool - a request-path restart for applications that came back just as
+# unable to emit anything - and still published their names for host ownership.
+$bootstrapPools = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$brokenPools    = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$claimNames     = New-Object System.Collections.Generic.List[string]
+$brokenApps     = New-Object System.Collections.Generic.List[string]
 
 foreach ($w in $work) {
     $r = $w.Record
@@ -766,22 +961,87 @@ foreach ($w in $work) {
         }
     }
 
+    # NODE_OPTIONS absent from the change set means the pool already carried this exact bootstrap -
+    # Stage 2 refuses to plan a value without it - so "landed" is the correct default.
+    $bootstrapLanded = $true
+
+    # Name FIRST, in the order that cannot produce an unattributable service:
+    #
+    #   1. take a pool-level name off a shared pool - it shadows the per-app names, so leaving it
+    #      would make the write below inert while everything read as configured
+    #   2. write the per-app name into the application's own web.config <appSettings>
+    #   3. only then the pool variables, the bootstrap among them
+    #
+    # A failure at 1 or 2 skips this application entirely: instrumenting it without a name that
+    # takes effect produces spans under 'unknown_service:node', which is worse than leaving it dark
+    # because it cannot be attributed to anything and merges with every other unnamed Node service.
+    if ($w.RemovePoolName) {
+        & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/-[name='$($r.Pool)'].environmentVariables.[name='OTEL_SERVICE_NAME']" /commit:apphost 2>$null | Out-Null
+        $still = Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'
+        if ($still) {
+            Write-Step FAIL "$($r.Key) [pool '$($r.Pool)'] - the pool still carries OTEL_SERVICE_NAME='$still', which shadows the per-app name, so NOTHING was written for this application" `
+                -Fix "remove that variable from pool '$($r.Pool)' by hand (appcmd set config -section:system.applicationHost/applicationPools ""/-[name='$($r.Pool)'].environmentVariables.[name='OTEL_SERVICE_NAME']"" /commit:apphost), then re-run"
+            $brokenApps.Add("$($r.Key) [pool '$($r.Pool)']")
+            continue
+        }
+        Write-Step APPLY "$($r.Pool): OTEL_SERVICE_NAME removed (shared pool - names are per-app)"
+    }
+    if ($w.PerAppName) {
+        $named = if ($haveLibs -and (Get-Command Set-WebConfigAppSettingServiceName -ErrorAction SilentlyContinue)) {
+            Set-WebConfigAppSettingServiceName -PhysicalPath $r.PhysicalPath -ServiceName $w.PerAppName
+        } else {
+            Set-LocalWebConfigAppSetting -PhysicalPath $r.PhysicalPath -Key 'OTEL_SERVICE_NAME' -Value $w.PerAppName
+        }
+        if (-not $named) {
+            Write-Step FAIL "$($r.Key) - the per-app OTEL_SERVICE_NAME could not be written into '$($r.PhysicalPath)\web.config', so NOTHING was written for this application (its pool is left exactly as it was)" `
+                -Fix 'check the file exists, is writable and is valid XML, then re-run'
+            $brokenApps.Add("$($r.Key) [pool '$($r.Pool)']")
+            continue
+        }
+        Write-Step APPLY "$($r.PhysicalPath)\web.config: <appSettings> OTEL_SERVICE_NAME=$($w.PerAppName)"
+    }
+
     foreach ($k in $w.Changes.Keys) {
         $v = [string]$w.Changes[$k]
         # Idempotent: remove any existing entry, then add. The removal is best-effort - a pool that
         # never had the variable has nothing to remove.
         & $appcmd set config -section:system.applicationHost/applicationPools `
             "/-[name='$($r.Pool)'].environmentVariables.[name='$k']" /commit:apphost 2>$null | Out-Null
-        & $appcmd set config -section:system.applicationHost/applicationPools `
-            "/+[name='$($r.Pool)'].environmentVariables.[name='$k',value='$v']" /commit:apphost 2>&1 | Out-Null
-        $now = Get-PoolEnvValue -Pool $r.Pool -Name $k
+        # appcmd's own output on the ADD is KEPT. Discarding it (2>&1 | Out-Null) is what made this
+        # failure unreadable on a real host: 35 pools reported "did NOT take" with a guess about file
+        # locks attached, while appcmd's actual message - and its exit code - had been thrown away.
+        $addOut  = & $appcmd set config -section:system.applicationHost/applicationPools `
+            "/+[name='$($r.Pool)'].environmentVariables.[name='$k',value='$v']" /commit:apphost 2>&1 | Out-String
+        $addCode = $LASTEXITCODE
+        $now     = Get-PoolEnvValue -Pool $r.Pool -Name $k
         if ([string]$now -eq $v) {
             Write-Step APPLY "$($r.Pool): $k set"
-            [void]$touchedPools.Add($r.Pool)
         } else {
-            Write-Step FAIL "$($r.Pool): $k did NOT take - applicationHost.config still reads '$now'" `
-                -Fix 'check for a locked applicationHost.config, a configuration lock on the section, or a read-only file'
+            # An unreadable config, an absent variable and a wrong value are three different faults
+            # with three different fixes. They used to be reported identically, because
+            # Get-PoolEnvValue returns $null for both "could not read the file" and "no such
+            # variable", and [string]$null renders as '' - so the report read "still reads ''" for a
+            # write that may never have been attempted.
+            $state = if (-not (Get-AppHostXml)) {
+                'applicationHost.config could not be re-read, so this write is UNVERIFIED rather than known-failed'
+            } elseif ($null -eq $now) {
+                'the variable is absent from applicationHost.config'
+            } else {
+                "applicationHost.config reads '$now'"
+            }
+            Write-Step FAIL "$($r.Pool): $k did NOT take - $state. appcmd exit $addCode$(if ($addOut.Trim()) { ": $($addOut.Trim())" } else { ' (appcmd printed nothing)' })" `
+                -Fix 'appcmd''s own message is above - work from it. Otherwise check for a configuration lock on system.applicationHost/applicationPools, a read-only applicationHost.config, or a value appcmd rejected'
+            if ($k -eq 'NODE_OPTIONS') { $bootstrapLanded = $false }
         }
+    }
+
+    if ($bootstrapLanded) {
+        [void]$bootstrapPools.Add($r.Pool)
+        $claimNames.Add([string]$r.ServiceName)
+    } else {
+        [void]$brokenPools.Add($r.Pool)
+        $brokenApps.Add("$($r.Key) [pool '$($r.Pool)']")
     }
 }
 
@@ -798,7 +1058,16 @@ foreach ($w in $work) {
 Write-Host ''
 Write-Host '--- host ownership labels ---' -ForegroundColor Cyan
 
-$instrumentedNames = @($work | ForEach-Object { [string]$_.Record.ServiceName } | Where-Object { $_ } | Select-Object -Unique)
+# ONLY applications whose bootstrap landed. Publishing a name for an application that emits nothing
+# produces the exact confusion this variable exists to remove: the host entity claims a service with
+# no telemetry behind it, every variable involved still reads as correct, and the gap presents as a
+# Coralogix-side problem. Measured on a real host, where all 35 names were published in a run whose
+# 35 NODE_OPTIONS writes had every one of them failed.
+$instrumentedNames = @($claimNames | Where-Object { $_ } | Select-Object -Unique)
+if (@($brokenApps).Count) {
+    Write-Step WARN "$(@($brokenApps).Count) application(s) are NOT being claimed, because their bootstrap did not land: $($brokenApps -join ', '). Their pools carry the OTEL_* variables from this run and no --require, so they still emit nothing." `
+        -Fix 'work from the appcmd messages above, then re-run. To put those pools back as they were, restore the applicationHost.config backup named at the start of the apply stage'
+}
 if (-not $RefreshServiceLabels) {
     Write-Step WARN "-RefreshServiceLabels:`$false - CX_NODE_SERVICES / CX_SERVICES were NOT updated, so this host does not claim $(@($instrumentedNames).Count) newly instrumented service(s): $($instrumentedNames -join ', '). They will report in APM with no host ownership." `
         -Fix 'run misc\Set-CxServiceLabels.ps1 -Apply, or re-run this script without -RefreshServiceLabels:$false'
@@ -896,16 +1165,29 @@ if (-not $RefreshServiceLabels) {
 Write-Host ''
 Write-Host '--- recycle ---' -ForegroundColor Cyan
 
-if (@($touchedPools).Count -eq 0) {
-    Write-Step INFO 'no pool environment actually changed, so no recycle is needed'
+# A pool with a failed bootstrap write is left running on purpose: a recycle is a request-path
+# restart, and its node.exe children would come back exactly as unable to emit anything. Only pools
+# that actually carry the bootstrap are worth that cost.
+$skippedPools = @($brokenPools | Where-Object { -not $bootstrapPools.Contains($_) })
+
+if (@($bootstrapPools).Count -eq 0) {
+    if (@($skippedPools).Count) {
+        Write-Step WARN "nothing is being recycled: the bootstrap landed on none of the $(@($skippedPools).Count) changed pool(s), so a restart would interrupt the request path and change nothing." `
+            -Fix 'work from the appcmd messages above, then re-run - this script recycles only pools whose bootstrap is on disk'
+    } else {
+        Write-Step INFO 'no pool environment actually changed, so no recycle is needed'
+    }
 } elseif (-not $Recycle) {
-    Write-Step WARN "-Recycle:`$false - $(@($touchedPools).Count) pool(s) still run the OLD environment: $(@($touchedPools) -join ', '). Until they recycle, this host READS as instrumented and emits nothing." `
+    Write-Step WARN "-Recycle:`$false - $(@($bootstrapPools).Count) pool(s) still run the OLD environment: $(@($bootstrapPools) -join ', '). Until they recycle, this host READS as instrumented and emits nothing." `
         -Fix "recycle them in your window: appcmd recycle apppool `"<pool>`""
 } else {
-    foreach ($p in @($touchedPools)) {
+    foreach ($p in @($bootstrapPools)) {
         $out = & $appcmd recycle apppool "$p" 2>&1 | Out-String
         if ($LASTEXITCODE -eq 0) { Write-Step APPLY "recycled pool '$p' - its node.exe children restart with the bootstrap" }
         else { Write-Step FAIL "could not recycle pool '$p': $($out.Trim())" -Fix "recycle it by hand: appcmd recycle apppool `"$p`"" }
+    }
+    if (@($skippedPools).Count) {
+        Write-Step WARN "left $(@($skippedPools).Count) pool(s) un-recycled on purpose - their bootstrap did not land, so a restart would cost a request-path interruption and change nothing: $(@($skippedPools) -join ', ')"
     }
 }
 

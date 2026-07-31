@@ -48,8 +48,11 @@ $here    = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInv
 $deploy  = Join-Path $here '..\deploy'
 $rtLib   = Join-Path $deploy 'Resolve-IISAppRuntime.ps1'
 $nodeLib = Join-Path $deploy 'Resolve-NodeServiceNames.ps1'
+# The per-app <appSettings> writer and its inverse live here, next to the <aspNetCore> pair they
+# parallel - a pool-sharing iisnode application is named through them.
+$svcLib  = Join-Path $deploy 'Resolve-IISServiceNames.ps1'
 $patch   = Join-Path $here '..\misc\Enable-IisnodeInstrumentation.ps1'
-foreach ($p in @($rtLib, $nodeLib, $patch)) {
+foreach ($p in @($rtLib, $nodeLib, $svcLib, $patch)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "missing: $p" }
 }
 
@@ -61,6 +64,12 @@ foreach ($p in @($rtLib, $nodeLib, $patch)) {
 # on return. Failing loudly on a rename is the point.
 . $nodeLib
 . $rtLib
+. $svcLib
+
+# The lifted patch-script functions report through Write-Step, which belongs to that script's own
+# preamble. A no-op stand-in keeps their FAILURE paths exercisable here instead of turning a
+# reported error into a CommandNotFoundException that hides the assertion it was meant to fail.
+function Write-Step { param([string]$Level, [string]$Message, [string]$Fix) }
 
 function Get-ScriptFunctionText {
     param([string] $Path, [string[]] $Names)
@@ -75,7 +84,7 @@ function Get-ScriptFunctionText {
 }
 
 Invoke-Expression (Get-ScriptFunctionText -Path $patch -Names @(
-    'Get-LocalIisnodeEvidence','Test-LocalAppIsEsm','Resolve-LocalNodeBootstrap','Merge-LocalNodeOptions','Get-PoolIdentityAccount','Get-PoolNameConflict'))
+    'Get-LocalIisnodeEvidence','Test-LocalAppIsEsm','Resolve-LocalNodeBootstrap','Merge-LocalNodeOptions','Get-PoolIdentityAccount','Get-LocalIISNodeNamingDecision','Get-LocalWebConfigAppSetting','Set-LocalWebConfigAppSetting','Test-CxBootstrapInValue'))
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-True {
@@ -234,6 +243,26 @@ try {
     Assert-Eq 'a marker-bearing legacy hook is still recognised' '-X' (Remove-CxNodeOptionsBootstrap -Existing '--require D:/old/opentelemetry/register.js -X' -OwnedTargets @())
 
     Write-Host ''
+    Write-Host '== the write gate: does the merged value actually carry the bootstrap? ==' -ForegroundColor Cyan
+
+    # This gate is the difference between a run that FAILS loudly and one that writes a service name
+    # onto 35 pools with no --require among them. It exists because a drifted library returned a
+    # bootstrap object the patch script could not read, $merged came out empty, and every OTEL_*
+    # variable was written anyway - so the empty and whitespace cases are pinned, not assumed.
+    Assert-True 'a merged CommonJS value passes'        (Test-CxBootstrapInValue -Value "$own $cjs" -RegisterPath $reg)
+    Assert-True 'a merged ESM value passes'             (Test-CxBootstrapInValue -Value "$esm $own"  -RegisterPath $reg)
+    Assert-True 'backslashes still match'               (Test-CxBootstrapInValue -Value "--require $($reg -replace '/','\')" -RegisterPath $reg)
+    Assert-True 'case differences still match'          (Test-CxBootstrapInValue -Value "--require $($reg.ToUpperInvariant())" -RegisterPath $reg)
+    Assert-True 'an empty value is refused'        (-not (Test-CxBootstrapInValue -Value ''    -RegisterPath $reg))
+    Assert-True 'a null value is refused'          (-not (Test-CxBootstrapInValue -Value $null -RegisterPath $reg))
+    Assert-True 'whitespace only is refused'       (-not (Test-CxBootstrapInValue -Value '   ' -RegisterPath $reg))
+    Assert-True "the app's own flags alone are refused" (-not (Test-CxBootstrapInValue -Value $own -RegisterPath $reg))
+    Assert-True 'a DIFFERENT register.js is refused'    (-not (Test-CxBootstrapInValue -Value '--require C:/app/patch.js' -RegisterPath $reg))
+    Assert-True 'the path present without a preload flag is refused' (-not (Test-CxBootstrapInValue -Value "--stack-size=2000 $reg" -RegisterPath $reg))
+    # A bootstrap-less merge and an unresolvable package are the same refusal: nothing gets written.
+    Assert-True 'no RegisterPath to compare against is refused' (-not (Test-CxBootstrapInValue -Value "$own $cjs" -RegisterPath ''))
+
+    Write-Host ''
     Write-Host '== bootstrap resolution against a staged package ==' -ForegroundColor Cyan
 
     # Fake the package layout: only the two files matter to either resolver.
@@ -296,46 +325,84 @@ try {
     }
 
     Write-Host ''
-    Write-Host '== pool co-tenancy gate (must match Instrument-IIS.ps1 $poolRivals) ==' -ForegroundColor Cyan
+    Write-Host '== naming decision: pool, per-app, or refuse (one function, two callers) ==' -ForegroundColor Cyan
 
     function New-Rec {
-        param([string]$Key, [string]$Pool, [bool]$Node, [bool]$DotNet, [string]$Svc)
-        [pscustomobject]@{ Key = $Key; Pool = $Pool; IsIisnode = $Node; IsDotNet = $DotNet; ServiceName = $(if ($Svc) { $Svc } else { $Key }) }
+        param([string]$Key, [string]$Pool, [bool]$Node, [bool]$DotNet, [string]$Svc, [bool]$Framework)
+        [pscustomobject]@{ Key = $Key; Pool = $Pool; IsIisnode = $Node; IsDotNet = $DotNet; IsFramework = $Framework
+                           ServiceName = $(if ($Svc) { $Svc } else { $Key }) }
+    }
+    # Both implementations, over the same inputs. The standalone script must not drift from the
+    # library: a host patched by one and re-deployed by the other must not flip between
+    # instrumented and not, and that is what these two lambdas assert together.
+    function Decide {
+        param($Record, [object[]]$All, [string]$PoolSvc, [string[]]$OwnNames)
+        $lib = Get-IISNodeNamingDecision -Key $Record.Key -Pool $Record.Pool -ServiceName $Record.ServiceName `
+            -Peers @($All | ForEach-Object { [pscustomobject]@{ Key = $_.Key; Pool = $_.Pool; IsIisnode = [bool]$_.IsIisnode; IsDotNetInstrumented = [bool]$_.IsDotNet } }) `
+            -ExistingPoolServiceName $PoolSvc -PoolOwnNames $OwnNames -IsFrameworkInstrumented ([bool]$Record.IsFramework)
+        $loc = Get-LocalIISNodeNamingDecision -Record $Record -All $All -ExistingPoolServiceName $PoolSvc -PoolOwnNames $OwnNames
+        Assert-Eq "standalone agrees with the library on $($Record.Key) (mode)"    $lib.Mode    $loc.Mode
+        Assert-Eq "standalone agrees with the library on $($Record.Key) (outcome)" $lib.Outcome $loc.Outcome
+        Assert-Eq "standalone agrees with the library on $($Record.Key) (remove)"  ([bool]$lib.RemovePoolName) ([bool]$loc.RemovePoolName)
+        return $lib
     }
 
-    # A lone iisnode app on its own pool: nameable.
+    # A lone iisnode app on its own pool: the name goes on the pool, as it always did.
     $solo = New-Rec 'Site/api' 'PoolA' $true $false
-    Assert-Eq 'lone iisnode app on its own pool is nameable' '' (Get-PoolNameConflict -Record $solo -All @($solo))
+    Assert-Eq 'lone iisnode app on its own pool -> pool' 'pool' (Decide $solo @($solo)).Mode
 
-    # A static co-tenant does not read OTEL_SERVICE_NAME, so it must NOT block.
+    # A static co-tenant does not read OTEL_SERVICE_NAME, so it must NOT force the per-app route.
     $static = New-Rec 'Site/' 'PoolA' $false $false
-    Assert-Eq 'a static co-tenant does not block' '' (Get-PoolNameConflict -Record $solo -All @($solo, $static))
+    Assert-Eq 'a static co-tenant does not change the route' 'pool' (Decide $solo @($solo, $static)).Mode
 
-    # Two iisnode apps in one pool: one name cannot name both.
+    # Two iisnode apps in one pool. One pool value cannot name both - but each app's own
+    # <appSettings> can, and iisnode appends it to that app's node.exe environment.
     $node2 = New-Rec 'Site/admin' 'PoolA' $true $false
-    Assert-True 'two iisnode apps in one pool are refused' ([bool](Get-PoolNameConflict -Record $solo -All @($solo, $node2)))
+    Assert-Eq 'two iisnode apps in one pool -> per-app naming' 'perApp' (Decide $solo @($solo, $node2)).Mode
 
-    # The case the patch script used to miss: an instrumented .NET app in the same pool. Writing the
-    # Node name here silently RENAMES a service that was reporting correctly.
+    # THE CASE THIS FEATURE EXISTS FOR: a pool holding an instrumented .NET app and a Node app.
+    # Each is named separately - the .NET one by Instrument-IIS.ps1 in its <aspNetCore> element,
+    # this one in its own <appSettings> - and neither renames the other.
     $dotnet = New-Rec 'Site/wallet' 'PoolA' $false $true
-    $c = Get-PoolNameConflict -Record $solo -All @($solo, $dotnet)
-    Assert-True 'a co-hosted .NET app in the same pool is refused' ([bool]$c)
-    Assert-True 'and the reason names the rival'                   ($c -match 'Site/wallet')
+    $d = Decide $solo @($solo, $dotnet)
+    Assert-Eq   'a mixed .NET + Node pool -> per-app naming' 'perApp' $d.Mode
+    Assert-Eq   'and it is graded as a pass outcome'         'perAppNamed' $d.Outcome
+    Assert-True 'and the reason names the co-tenant'         ($d.Rivals -match 'Site/wallet')
+    Assert-True 'and nothing is written on the pool for it'  (-not $d.RemovePoolName)
 
-    # A hybrid app is BOTH - itself, not a rival, so it stays nameable.
+    # A hybrid app is BOTH - itself, not a rival, so a dedicated pool still names it on the pool.
     $hybridRec = New-Rec 'Site/hyb' 'PoolB' $true $true
-    Assert-Eq 'a hybrid app is not its own rival' '' (Get-PoolNameConflict -Record $hybridRec -All @($hybridRec))
+    Assert-Eq 'a hybrid app is not its own rival' 'pool' (Decide $hybridRec @($hybridRec)).Mode
+
+    # The one shape per-app naming cannot solve: Framework promotes web.config OTEL_* PROCESS-wide,
+    # so on a SHARED pool the name would leak onto the co-tenants through w3wp.
+    $hybShared = New-Rec 'Site/hyb2' 'PoolC' $true $true '' $true
+    $hs = Decide $hybShared @($hybShared, (New-Rec 'Site/other2' 'PoolC' $false $true))
+    Assert-Eq 'iisnode + Framework on a shared pool is refused' 'refuse' $hs.Mode
+    Assert-Eq 'and says which case it is'                       'sharedPoolFw' $hs.Outcome
 
     # An app in a DIFFERENT pool is irrelevant.
     $other = New-Rec 'Site/other' 'PoolZ' $true $true
-    Assert-Eq 'an app in another pool does not block' '' (Get-PoolNameConflict -Record $solo -All @($solo, $other))
+    Assert-Eq 'an app in another pool does not change the route' 'pool' (Decide $solo @($solo, $other)).Mode
 
-    # Belt and braces: a pool already claiming a different name is refused even when classification
-    # found no rival (e.g. the .NET app's name was written by Instrument-IIS.ps1).
-    Assert-True 'a foreign OTEL_SERVICE_NAME already on the pool is refused' `
-        ([bool](Get-PoolNameConflict -Record $solo -All @($solo) -ExistingPoolServiceName 'Wallet'))
-    Assert-Eq 'our own name already on the pool is fine (re-run)' '' `
-        (Get-PoolNameConflict -Record $solo -All @($solo) -ExistingPoolServiceName 'Site/api')
+    # Belt and braces on a DEDICATED pool: a pool already claiming a different name is refused.
+    Assert-Eq 'a foreign OTEL_SERVICE_NAME already on the pool is refused' 'refuse' `
+        (Decide $solo @($solo) 'Wallet').Mode
+    Assert-Eq 'our own name already on the pool is fine (re-run)' 'pool' `
+        (Decide $solo @($solo) 'Site/api').Mode
+
+    # On a SHARED pool a leftover pool-level name must come OFF first: iisnode copies the parent
+    # environment before appending appSettings and Windows resolves the first entry, so a pool value
+    # shadows the per-app one. Ours (it is a name this installer computes for an app in the pool).
+    $sh = Decide $solo @($solo, $dotnet) 'Site/api' @('Site/api','Site/wallet')
+    Assert-Eq   'a stale pool name we wrote still allows per-app naming' 'perApp' $sh.Mode
+    Assert-True 'and it is removed first, or the per-app name is inert'  ([bool]$sh.RemovePoolName)
+
+    # Somebody else's pool value is NOT ours to remove, and it would shadow the per-app name, so
+    # refuse rather than write a name that does nothing.
+    $fs = Decide $solo @($solo, $dotnet) 'HandSetName' @('Site/api','Site/wallet')
+    Assert-Eq 'a foreign pool name on a shared pool is refused' 'refuse' $fs.Mode
+    Assert-Eq 'and says the pool value shadows the per-app one' 'poolNameShadow' $fs.Outcome
 
     # The library classifier must agree about what counts as .NET, or the two gates diverge.
     $dnDir  = New-App 'gate-dotnet' $WC_HYBRID @{ 'app.js' = 'x' }
@@ -347,6 +414,63 @@ try {
     Assert-Eq 'library sees no .NET evidence in the ARR site' 'False' ([bool]((@($libSt.CoreEvidence).Count + @($libSt.FrameworkEvidence).Count) -gt 0))
     Assert-Eq 'standalone agrees'                            'False' (Get-LocalIisnodeEvidence -PhysicalPath $stDir).IsDotNet
 
+    # IsFramework is the NARROWER question, and the two implementations must agree about it too:
+    # it alone decides whether per-app naming is refused on a shared pool, so a divergence here
+    # means one writer instruments an app the other refuses.
+    Assert-Eq 'library and standalone agree on Framework evidence (hybrid)' `
+        ([bool](@($libDn.FrameworkEvidence).Count -gt 0)) ([bool](Get-LocalIisnodeEvidence -PhysicalPath $dnDir).IsFramework)
+    Assert-Eq 'library and standalone agree on Framework evidence (ARR site)' `
+        ([bool](@($libSt.FrameworkEvidence).Count -gt 0)) ([bool](Get-LocalIisnodeEvidence -PhysicalPath $stDir).IsFramework)
+
+    Write-Host ''
+    Write-Host '== per-app naming: the web.config <appSettings> round trip ==' -ForegroundColor Cyan
+
+    # This is the channel that makes a mixed pool work, so the writer and its inverse are asserted
+    # against real files - iisnode reads /configuration/appSettings, nothing else.
+    $paDir = New-App 'perapp-plain' $WC_IISNODE @{ 'server.js' = 'x' }
+    Assert-True 'writer creates <appSettings> when the file has none' `
+        (Set-WebConfigAppSettingServiceName -PhysicalPath $paDir -ServiceName 'Site/api')
+    Assert-Eq   'and the value reads back'  'Site/api' (Get-CxWebConfigAppSetting -PhysicalPath $paDir -Key 'OTEL_SERVICE_NAME')
+    Assert-Eq   'standalone reader agrees'  'Site/api' (Get-LocalWebConfigAppSetting -PhysicalPath $paDir -Key 'OTEL_SERVICE_NAME')
+    Assert-True 'the file is still valid XML and still an iisnode app' `
+        ([bool](([xml](Get-Content -LiteralPath (Join-Path $paDir 'web.config') -Raw)).SelectSingleNode('//handlers/add')))
+
+    # Re-running must be idempotent, and a rename must land rather than add a second entry.
+    [void](Set-WebConfigAppSettingServiceName -PhysicalPath $paDir -ServiceName 'Site/api')
+    Assert-Eq 'a re-run adds no second entry' 1 `
+        (@(([xml](Get-Content -LiteralPath (Join-Path $paDir 'web.config') -Raw)).SelectNodes("/configuration/appSettings/add[@key='OTEL_SERVICE_NAME']")).Count)
+    [void](Set-WebConfigAppSettingServiceName -PhysicalPath $paDir -ServiceName 'Site/renamed')
+    Assert-Eq 'a rename overwrites in place' 'Site/renamed' (Get-CxWebConfigAppSetting -PhysicalPath $paDir -Key 'OTEL_SERVICE_NAME')
+
+    # Uninstall: ours comes out, the section we created is pruned, and an app setting that was
+    # already there is left alone.
+    Assert-True 'remover takes ours out' (Remove-WebConfigAppSettingServiceName -PhysicalPath $paDir -ExpectedValue 'Site/renamed')
+    Assert-Eq   'and the value is gone'  '' ([string](Get-CxWebConfigAppSetting -PhysicalPath $paDir -Key 'OTEL_SERVICE_NAME'))
+    Assert-True 'and an <appSettings> we created is pruned' `
+        (-not ([xml](Get-Content -LiteralPath (Join-Path $paDir 'web.config') -Raw)).SelectSingleNode('/configuration/appSettings'))
+
+    # A value somebody else set is not ours to remove.
+    $paKeep = New-App 'perapp-handset' $WC_IISNODE @{ 'server.js' = 'x' }
+    [void](Set-WebConfigAppSettingServiceName -PhysicalPath $paKeep -ServiceName 'HandSet')
+    Assert-True 'a value that is not the installer''s is left alone' `
+        (-not (Remove-WebConfigAppSettingServiceName -PhysicalPath $paKeep -ExpectedValue 'SomethingElse'))
+    Assert-Eq 'and it still reads back' 'HandSet' (Get-CxWebConfigAppSetting -PhysicalPath $paKeep -Key 'OTEL_SERVICE_NAME')
+
+    # A prior value is RESTORED, not deleted - the same contract the <aspNetCore> writer has.
+    Assert-True 'a prior value is restored' (Remove-WebConfigAppSettingServiceName -PhysicalPath $paKeep -ExpectedValue 'HandSet' -PriorValue 'TheirOwnName')
+    Assert-Eq   'to what was there before'  'TheirOwnName' (Get-CxWebConfigAppSetting -PhysicalPath $paKeep -Key 'OTEL_SERVICE_NAME')
+
+    # The standalone writer must produce a file the library reader accepts, and vice versa.
+    $paStd = New-App 'perapp-standalone' $WC_IISNODE @{ 'server.js' = 'x' }
+    Assert-True 'standalone writer succeeds' (Set-LocalWebConfigAppSetting -PhysicalPath $paStd -Key 'OTEL_SERVICE_NAME' -Value 'Site/std')
+    Assert-Eq   'library reader agrees with the standalone writer' 'Site/std' (Get-CxWebConfigAppSetting -PhysicalPath $paStd -Key 'OTEL_SERVICE_NAME')
+
+    # Absent file / absent key must be $null, never a throw: the doctor grades a missing name as a
+    # finding, and a reader that threw would take the whole per-app report down with it.
+    Assert-Eq 'a missing key reads as null'  '' ([string](Get-CxWebConfigAppSetting -PhysicalPath $paStd -Key 'NO_SUCH_KEY'))
+    Assert-Eq 'a missing path reads as null' '' ([string](Get-CxWebConfigAppSetting -PhysicalPath (Join-Path $paStd 'nope') -Key 'OTEL_SERVICE_NAME'))
+    Assert-Eq 'standalone agrees on a missing path' '' ([string](Get-LocalWebConfigAppSetting -PhysicalPath (Join-Path $paStd 'nope') -Key 'OTEL_SERVICE_NAME'))
+
     Write-Host ''
     Write-Host '== finding emitter ==' -ForegroundColor Cyan
 
@@ -356,7 +480,7 @@ try {
     if (Get-Command New-Finding -ErrorAction SilentlyContinue) {
         $rec = Resolve-IISAppRuntime -PhysicalPath (New-App 'fx-find' $WC_IISNODE @{ 'server.js' = 'x' }) -PoolManagedRuntimeVersion 'v4.0'
         $codes = @{}
-        foreach ($o in 'instrumented','missing','esmUnsupported','sharedPool','packageMissing','stalePath','customCmdLine') {
+        foreach ($o in 'instrumented','perAppNamed','missing','esmUnsupported','sharedPool','sharedPoolFw','poolNameShadow','packageMissing','stalePath','customCmdLine') {
             $f = New-IISNodeFinding -Outcome $o -Record $rec -Target 'Site/api'
             Assert-True "$o produces a finding with a code and a message" ([bool]($f.code -and $f.message))
             $codes[$o] = $f.code
@@ -373,6 +497,13 @@ try {
         Assert-True 'and names the real cause'      ($esmF.message -match 'ERR_REQUIRE_ESM')
         Assert-True 'and does not blame a missing hook' ($esmF.message -notmatch 'hook\.mjs')
         Assert-Eq 'every outcome has a distinct code' $codes.Count (@($codes.Values | Select-Object -Unique).Count)
+        # A pool-sharing app that IS named must grade pass, or a correctly instrumented mixed pool
+        # reads as degraded and the feature looks broken on every host that uses it.
+        Assert-Eq   'perAppNamed is graded pass' 'pass' (New-IISNodeFinding -Outcome 'perAppNamed' -Record $rec -Target 'x').severity
+        Assert-True 'and says where the name lives' ((New-IISNodeFinding -Outcome 'perAppNamed' -Record $rec -Target 'x').message -match 'appSettings')
+        Assert-Eq   'the Framework refusal is graded warn' 'warn' (New-IISNodeFinding -Outcome 'sharedPoolFw' -Record $rec -Target 'x').severity
+        Assert-True 'and explains the process-wide promotion' ((New-IISNodeFinding -Outcome 'sharedPoolFw' -Record $rec -Target 'x').message -match 'PROCESS-level')
+        Assert-True 'the shadow finding explains the ordering' ((New-IISNodeFinding -Outcome 'poolNameShadow' -Record $rec -Target 'x').message -match 'FIRST entry')
         Assert-True 'the dark-app message says pool env, not PM2' ((New-IISNodeFinding -Outcome 'missing' -Record $rec -Target 'x').message -match 'CHILD OF W3WP')
     } else {
         Write-Host '  (skipped: Write-DeployLog.ps1 not available, so New-Finding is absent)' -ForegroundColor DarkGray

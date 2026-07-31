@@ -581,9 +581,97 @@ function Test-IISInstrumentation {
                 -Message "$svc has CORECLR_PROFILER but CORECLR_ENABLE_PROFILING='$clrEnable' (expected '1') - the profiler is registered but switched off" `
                 -Data @{ profiler = $clrGuid; enable = $clrEnable })
         } else {
-            Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
-                -Message "profiler registered (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
-                -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; coreclrEnable = $clrEnable; corEnable = $fwEnable })
+            # WHOSE profiler, not merely whether one is registered. Only ONE CLR profiler can attach
+            # to a process, so a GUID that is not ours means another vendor's agent owns IIS here and
+            # our .NET instrumentation produces NOTHING - while a check that stopped at "a profiler
+            # is registered and enabled" graded that host a pass. That is the reads-healthy /
+            # emits-nothing report this tooling exists to prevent.
+            #
+            # Decided by comparing against OUR CLSID, never by recognising a vendor: an agent we have
+            # never heard of must fail this too. The name is a hint for the operator, nothing more.
+            $otelClsid = '{918728DD-259F-4A6A-AC2B-B85E1B658318}'
+            $foreign = @()
+            foreach ($pair in @(@('CORECLR_PROFILER', $clrGuid), @('COR_PROFILER', $fwGuid))) {
+                $n, $g = $pair
+                if ($g -and $g -ne $otelClsid) { $foreign += "$n=$g" }
+            }
+            if (@($foreign).Count -gt 0) {
+                # Path is the stronger vendor signal than the CLSID, and it is the one an operator can
+                # act on: it names the product and the tree to uninstall or exclude.
+                $paths = @('CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH','COR_PROFILER_PATH_64','COR_PROFILER_PATH' |
+                            ForEach-Object { Get-CxEnvEntry -Entries $entries -Name $_ } | Where-Object { $_ } | Select-Object -Unique)
+                $vendor = switch -Regex ($paths -join ';') {
+                    'dynatrace|oneagent'   { 'Dynatrace OneAgent'; break }
+                    'newrelic'             { 'New Relic'; break }
+                    'appdynamics|appdynam' { 'AppDynamics'; break }
+                    'datadog|dd-trace'     { 'Datadog'; break }
+                    'elastic'              { 'Elastic APM'; break }
+                    'instana'              { 'Instana'; break }
+                    default                { 'an unidentified third-party agent' }
+                }
+                Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_FOREIGN_OWNER' -Target $svc `
+                    -Message "$svc registers a CLR profiler that is NOT the OpenTelemetry one ($($foreign -join ', ')), and only one profiler can attach to a process - so .NET auto-instrumentation emits NOTHING for anything this service starts, however healthy the collector is. The DLL path points at $vendor$(if ($paths) { " ($($paths -join ', '))" }). Decide which agent owns .NET on this host: keep theirs and instrument these applications another way, or remove/exclude theirs and re-run the install." `
+                    -Data @{ foreign = $foreign; expected = $otelClsid; paths = @($paths); vendorHint = $vendor })
+            } else {
+                # REGISTERED is not LOADED, and the difference is the whole finding. MEASURED on a
+                # host running Dynatrace OneAgent in fullstack mode: W3SVC carried our CLSID and all
+                # four path variants, every value correct - and no process on the box had
+                # OpenTelemetry.AutoInstrumentation.Native.dll in it. OneAgent injects at process
+                # creation, into w3wp AND into the dotnet/apphost children of out-of-process apps, and
+                # only one CLR profiler can attach - so ours never did. This check graded that host a
+                # pass, which is the false green this tooling exists to prevent.
+                #
+                # Evidence, not inference: enumerate the worker processes and look for our library.
+                # Absence is only meaningful once a worker is actually up, so a host with no worker
+                # running is 'unknown', never a fail - an idle pool has nothing to load it into yet.
+                $ourDll  = 'OpenTelemetry.AutoInstrumentation.Native'
+                $workers = @()
+                try {
+                    $workers = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+                        Where-Object { $_.Name -in @('w3wp.exe','dotnet.exe') -or ($_.CommandLine -and $_.CommandLine -match '\\aspnetcorev2') })
+                } catch { }
+                if (@($workers).Count -eq 0) {
+                    Add-F (New-Finding -Check 'profiler' -Severity 'unknown' -Code 'PROFILER_LOAD_UNVERIFIED' -Target $svc `
+                        -Message "$svc registers our profiler correctly, but no IIS worker process is running, so whether the profiler actually LOADS could not be verified. Send a request to an application and re-run - a registration that never loads is the failure mode this check exists for.")
+                } else {
+                    $withOurs = @(); $withForeign = @()
+                    foreach ($w in $workers) {
+                        $mods = @()
+                        try { $mods = @((Get-Process -Id $w.ProcessId -ErrorAction Stop).Modules | Select-Object -ExpandProperty ModuleName) } catch { continue }
+                        if ($mods -match $ourDll) { $withOurs += $w.ProcessId }
+                        # Any other vendor's CLR profiler in the same process explains WHY ours is not
+                        # there, and is the actionable half for the operator.
+                        $f = @($mods | Where-Object { $_ -match 'oneagent|newrelic|appdynamics|datadog|elastic.*profiler|instana' } | Select-Object -Unique)
+                        if (@($f).Count -gt 0) { $withForeign += "pid $($w.ProcessId): $($f -join ',')" }
+                    }
+                    if (@($withOurs).Count -gt 0) {
+                        Add-F (New-Finding -Check 'profiler' -Severity 'pass' -Target $svc `
+                            -Message "profiler registered AND loaded - our native library is in $(@($withOurs).Count) of $(@($workers).Count) worker process(es) (coreclr=$([bool]$clrGuid) framework=$([bool]$fwGuid), enabled)" `
+                            -Data @{ coreclrProfiler = $clrGuid; corProfiler = $fwGuid; loadedIn = @($withOurs) })
+                    } else {
+                        Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_NOT_LOADED_IN_PROCESS' -Target $svc `
+                            -Message "$svc registers OUR profiler correctly, but our native library ($ourDll.dll) is loaded in NONE of the $(@($workers).Count) running worker process(es) - so .NET auto-instrumentation produces no spans while every variable reads as configured.$(if (@($withForeign).Count -gt 0) { " Another vendor's CLR profiler is in those processes instead ($($withForeign -join '; ')), and only ONE profiler can attach per process - it injects at process creation and wins over environment-based registration." } else { ' No other vendor profiler was found either, so check the profiler DLL path and that the worker restarted after the install.' }) Registration is not attachment: this is the state a check on the environment alone reports as healthy." `
+                            -Data @{ workers = @($workers | ForEach-Object { $_.ProcessId }); foreign = @($withForeign) })
+                    }
+                }
+            }
+
+            # Our GUID with somebody else's library is the subtler half, and it is silent: the CLR
+            # loads that DLL, asks it for our CLSID, gets nothing, and attaches no profiler. It
+            # happens when a bitness-specific path from another agent outranks the unsuffixed one.
+            if (@($foreign).Count -eq 0) {
+                $home = Get-CxEnvEntry -Entries $entries -Name 'OTEL_DOTNET_AUTO_HOME'
+                foreach ($pn in @('CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32','CORECLR_PROFILER_PATH',
+                                  'COR_PROFILER_PATH_64','COR_PROFILER_PATH_32','COR_PROFILER_PATH')) {
+                    $dll = Get-CxEnvEntry -Entries $entries -Name $pn
+                    if (-not $dll -or -not $home) { continue }
+                    if ($dll -notlike "$home*") {
+                        Add-F (New-Finding -Check 'profiler' -Severity 'fail' -Code 'PROFILER_PATH_FOREIGN' -Target "$svc/$pn" `
+                            -Message "$pn points outside OTEL_DOTNET_AUTO_HOME while CORECLR_PROFILER is ours: '$dll' is not under '$home'. The CLR loads that library, asks it for our CLSID and gets nothing, so no profiler attaches and no spans are produced - with every variable reading as configured. The CLR prefers the *_PATH_64 name over the unsuffixed one, so this is what a leftover from another agent looks like." `
+                            -Data @{ path = $dll; home = $home; name = $pn })
+                    }
+                }
+            }
         }
 
         # (b) does the DLL the registry points at still exist? A stale path lets
@@ -841,13 +929,36 @@ function Test-IISInstrumentation {
                 $nodeCount  = if ($iisnodePools.ContainsKey($app.Pool)) { [int]$iisnodePools[$app.Pool] } else { 0 }
                 $claimCount = if ($claimPools.ContainsKey($app.Pool))   { [int]$claimPools[$app.Pool]   } else { 0 }
 
-                if ($nodeCount -gt 1 -or $claimCount -gt 1) {
-                    $detail = if ($nodeCount -gt 1) {
-                        "$nodeCount iisnode applications share pool '$($app.Pool)'"
-                    } else {
-                        "pool '$($app.Pool)' hosts $claimCount applications that read OTEL_SERVICE_NAME (this one plus at least one instrumented .NET application), so a pool-level name would rename one of them"
-                    }
-                    Add-F (New-IISNodeFinding -Outcome 'sharedPool' -Record $rt -Target $label -Detail $detail)
+                # Sharing a pool is no longer a verdict on its own. The NAME can live in the
+                # application's own web.config <appSettings>, which iisnode promotes into the node
+                # child's environment, so a shared pool is instrumentable - the pool just must not
+                # carry an OTEL_SERVICE_NAME of its own. Read both sides before deciding.
+                $isShared = ($nodeCount -gt 1 -or $claimCount -gt 1)
+                $poolSvc  = if ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_SERVICE_NAME')) { [string]$poolEnvEff['OTEL_SERVICE_NAME'] } else { '' }
+                $perAppSvc = if (Get-Command Get-CxWebConfigAppSetting -ErrorAction SilentlyContinue) {
+                    Get-CxWebConfigAppSetting -PhysicalPath $app.PhysicalPath -Key 'OTEL_SERVICE_NAME'
+                } else { $null }
+                # iisnode copies the pool environment first and appends appSettings after it, and
+                # Windows resolves the FIRST entry - so the pool value wins wherever both exist.
+                $effSvc   = if ($poolSvc) { $poolSvc } else { $perAppSvc }
+                $sharedDetail = if ($nodeCount -gt 1) {
+                    "$nodeCount iisnode applications share pool '$($app.Pool)'"
+                } else {
+                    "pool '$($app.Pool)' hosts $claimCount applications that read OTEL_SERVICE_NAME (this one plus at least one instrumented .NET application)"
+                }
+
+                if ($isShared -and $rt.DotNetRuntime -eq 'AspNetFramework' -and $rt.Instrumentability -eq 'Supported') {
+                    Add-F (New-IISNodeFinding -Outcome 'sharedPoolFw' -Record $rt -Target $label -Detail $sharedDetail)
+                }
+                elseif ($isShared -and $poolSvc) {
+                    # Either a name we left behind before per-app naming existed, or one someone
+                    # else set. Both shadow the per-app value, and both mis-name a shared pool.
+                    Add-F (New-IISNodeFinding -Outcome 'poolNameShadow' -Record $rt -Target $label `
+                        -Detail "$sharedDetail, and that pool carries OTEL_SERVICE_NAME='$poolSvc'$(if ($perAppSvc) { " while this application's own web.config asks for '$perAppSvc' - the pool value is what takes effect" })")
+                }
+                elseif ($isShared -and -not $perAppSvc) {
+                    Add-F (New-IISNodeFinding -Outcome 'sharedPool' -Record $rt -Target $label `
+                        -Detail "$sharedDetail, and no per-app OTEL_SERVICE_NAME is set in this application's own web.config <appSettings>")
                 }
                 elseif ($rt.NodeIsEsm) {
                     # Checked BEFORE the bootstrap checks, and it outranks them: an ESM app under
@@ -872,7 +983,10 @@ function Test-IISInstrumentation {
                         -Message "the bootstrap is present on pool '$($app.Pool)', but Resolve-NodeServiceNames.ps1 was not next to this script, so this application's module system could not be determined. iisnode cannot host an ES module at all (ERR_REQUIRE_ESM), so if this one is ESM it is returning HTTP 500 rather than reporting telemetry. Copy the full package and re-run.")
                 }
                 else {
-                    Add-F (New-IISNodeFinding -Outcome 'instrumented' -Record $rt -Target $label)
+                    # Same bootstrap, two naming shapes: on a dedicated pool the name is on the
+                    # pool, on a shared one it is in the app's own web.config. Grading them with
+                    # one code would hide which mechanism is actually carrying the name.
+                    Add-F (New-IISNodeFinding -Outcome $(if ($isShared) { 'perAppNamed' } else { 'instrumented' }) -Record $rt -Target $label)
                     # Same localhost trap as everywhere else: ::1 first, export silently dropped.
                     $nodeEp = if ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_EXPORTER_OTLP_ENDPOINT')) { [string]$poolEnvEff['OTEL_EXPORTER_OTLP_ENDPOINT'] } else { '' }
                     if ($nodeEp -match 'localhost') {
@@ -880,9 +994,9 @@ function Test-IISInstrumentation {
                             -Message "pool '$($app.Pool)' exports to '$nodeEp'; localhost resolves to ::1 first and the OTLP export is silently dropped. Use http://127.0.0.1:4318." `
                             -Data @{ endpoint = $nodeEp })
                     }
-                    if (-not ($poolEnvEff -and $poolEnvEff.ContainsKey('OTEL_SERVICE_NAME') -and $poolEnvEff['OTEL_SERVICE_NAME'])) {
+                    if (-not $effSvc) {
                         Add-F (New-Finding -Check 'iisnode' -Severity 'warn' -Code 'IISNODE_SERVICE_NAME_MISSING' -Target $label `
-                            -Message "the bootstrap is on pool '$($app.Pool)' but no OTEL_SERVICE_NAME is - its spans land under the SDK default (unknown_service:node)")
+                            -Message "the bootstrap is on pool '$($app.Pool)' but no OTEL_SERVICE_NAME is - not on the pool, and not in this application's own web.config <appSettings> either, which is where a pool-sharing application carries it. Its spans land under the SDK default (unknown_service:node)")
                     }
                 }
             }

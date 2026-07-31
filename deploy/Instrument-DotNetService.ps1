@@ -112,6 +112,23 @@ function Set-CxServiceEnvMap {
     return $lines
 }
 
+# The OpenTelemetry .NET auto-instrumentation profiler's CLSID. Anything else in COR_PROFILER /
+# CORECLR_PROFILER is a DIFFERENT vendor's profiler, and only one can attach to a process.
+$script:CxOtelProfilerClsid = '{918728DD-259F-4A6A-AC2B-B85E1B658318}'
+
+function Get-CxFirstEnvValue {
+    <#
+      First name in -Names that the map actually carries, else -Default. Order matters at every
+      call site: the bitness-specific profiler path outranks the unsuffixed one in the CLR, and it
+      is the only one the vendor module writes.
+    #>
+    param([hashtable] $Map, [string[]] $Names, [string] $Default)
+    foreach ($n in $Names) {
+        if ($Map -and $Map.Contains($n) -and [string]$Map[$n]) { return [string]$Map[$n] }
+    }
+    return $Default
+}
+
 function Get-CxProfilerTemplate {
     <#
       The profiler variable set to copy onto a target service, taken from W3SVC (i.e. from whatever
@@ -133,10 +150,29 @@ function Get-CxProfilerTemplate {
 
     # Prefer the exact values already on W3SVC; fall back to the vendor's documented layout under
     # OTEL_DOTNET_AUTO_HOME when a host has the payload but never registered IIS.
-    $coreGuid = if ($w3.Contains('CORECLR_PROFILER')) { [string]$w3['CORECLR_PROFILER'] } else { '{918728DD-259F-4A6A-AC2B-B85E1B658318}' }
+    #
+    # The PATH is read from the BITNESS-SPECIFIC name first, because that is the only one the
+    # vendor module actually writes. Measured on a registered host: W3SVC carries
+    # CORECLR_PROFILER_PATH_64 and _32 and NO unsuffixed CORECLR_PROFILER_PATH. Reading only the
+    # unsuffixed name therefore always missed, so the GUID came from W3SVC while the path came from
+    # the fallback - a pair that is mismatched by construction the moment W3SVC's GUID is not ours.
+    $coreGuid = if ($w3.Contains('CORECLR_PROFILER')) { [string]$w3['CORECLR_PROFILER'] } else { $script:CxOtelProfilerClsid }
     $fwGuid   = if ($w3.Contains('COR_PROFILER'))     { [string]$w3['COR_PROFILER'] }     else { $coreGuid }
-    $corePath = if ($w3.Contains('CORECLR_PROFILER_PATH')) { [string]$w3['CORECLR_PROFILER_PATH'] } else { Join-Path $home 'win-x64\OpenTelemetry.AutoInstrumentation.Native.dll' }
-    $fwPath   = if ($w3.Contains('COR_PROFILER_PATH'))     { [string]$w3['COR_PROFILER_PATH'] }     else { $corePath }
+    $corePath = Get-CxFirstEnvValue -Map $w3 -Names 'CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH' `
+                                    -Default (Join-Path $home 'win-x64\OpenTelemetry.AutoInstrumentation.Native.dll')
+    $fwPath   = Get-CxFirstEnvValue -Map $w3 -Names 'COR_PROFILER_PATH_64','COR_PROFILER_PATH' -Default $corePath
+
+    # A GUID that is not ours means another CLR profiler owns IIS on this host. Copying it onto a
+    # service alongside OUR dll registers a CLSID that dll does not implement: the CLR loads the
+    # library, fails to create the profiler, and the service runs completely uninstrumented - while
+    # every variable on it reads as correctly configured. Refuse and name the cause instead.
+    foreach ($pair in @(@('CORECLR_PROFILER', $coreGuid), @('COR_PROFILER', $fwGuid))) {
+        $name, $guid = $pair
+        if ($guid -and $guid -ne $script:CxOtelProfilerClsid) {
+            return [pscustomobject]@{ Ok = $false
+                Reason = "W3SVC carries $name=$guid, which is not the OpenTelemetry profiler ($script:CxOtelProfilerClsid) - another CLR profiler owns IIS on this host. Copying that CLSID onto a service together with our profiler DLL would register a class that DLL does not implement, so the service would load no profiler at all and still read as configured. Resolve the profiler ownership first: only one CLR profiler can attach to a process." }
+        }
+    }
 
     foreach ($p in @($corePath, $fwPath)) {
         if ($p -and -not (Test-Path -LiteralPath $p)) {
@@ -151,8 +187,21 @@ function Get-CxProfilerTemplate {
         if ($w3.Contains($k)) { $common[$k] = [string]$w3[$k] }
     }
 
-    $core = [ordered]@{ CORECLR_ENABLE_PROFILING = '1'; CORECLR_PROFILER = $coreGuid; CORECLR_PROFILER_PATH = $corePath }
-    $fw   = [ordered]@{ COR_ENABLE_PROFILING     = '1'; COR_PROFILER     = $fwGuid;   COR_PROFILER_PATH     = $fwPath }
+    # The bitness-specific names are written TOO, not instead: a service's Environment overrides the
+    # machine environment only for the names it declares, and the CLR prefers *_PATH_64 over the
+    # unsuffixed one. So on a host where another agent left CORECLR_PROFILER_PATH_64 at machine
+    # scope, declaring only the unsuffixed path leaves that foreign DLL winning - our GUID, their
+    # library, no profiler, no telemetry. Both variants point at our DLL so nothing inherited can
+    # outrank it. The 32-bit path is derived from the same tree, and only when it exists.
+    $core = [ordered]@{ CORECLR_ENABLE_PROFILING = '1'; CORECLR_PROFILER = $coreGuid
+                        CORECLR_PROFILER_PATH    = $corePath; CORECLR_PROFILER_PATH_64 = $corePath }
+    $fw   = [ordered]@{ COR_ENABLE_PROFILING     = '1'; COR_PROFILER     = $fwGuid
+                        COR_PROFILER_PATH        = $fwPath;   COR_PROFILER_PATH_64     = $fwPath }
+    $core32 = Get-CxFirstEnvValue -Map $w3 -Names 'CORECLR_PROFILER_PATH_32' -Default (Join-Path $home 'win-x86\OpenTelemetry.AutoInstrumentation.Native.dll')
+    if ($core32 -and (Test-Path -LiteralPath $core32)) {
+        $core['CORECLR_PROFILER_PATH_32'] = $core32
+        $fw['COR_PROFILER_PATH_32']       = Get-CxFirstEnvValue -Map $w3 -Names 'COR_PROFILER_PATH_32' -Default $core32
+    }
 
     return [pscustomobject]@{ Ok = $true; Home = $home; Common = $common; Core = $core; Framework = $fw
                               FromW3svc = [bool]$w3.Contains('CORECLR_PROFILER'); Reason = $null }
@@ -236,8 +285,12 @@ function Restart-CxServiceVerified {
 # ---- main ---------------------------------------------------------------------
 Assert-Admin
 
+     # The bitness-specific PATH names are ours too now (see Get-CxProfilerTemplate): leaving them
+     # out of this list would strip the unsuffixed value on a re-run and leave the _64 one behind.
 $ourNames = @('CORECLR_ENABLE_PROFILING','CORECLR_PROFILER','CORECLR_PROFILER_PATH',
+              'CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32',
               'COR_ENABLE_PROFILING','COR_PROFILER','COR_PROFILER_PATH',
+              'COR_PROFILER_PATH_64','COR_PROFILER_PATH_32',
               'OTEL_DOTNET_AUTO_HOME','DOTNET_ADDITIONAL_DEPS','DOTNET_SHARED_STORE',
               'DOTNET_STARTUP_HOOKS','OTEL_DOTNET_AUTO_PLUGINS',
               'OTEL_EXPORTER_OTLP_ENDPOINT','OTEL_EXPORTER_OTLP_PROTOCOL','OTEL_SERVICE_NAME')

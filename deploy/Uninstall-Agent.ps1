@@ -276,7 +276,13 @@ try {
             foreach ($w in @($manifest.webConfig)) {
                 if (-not $w) { continue }
                 $phys = Split-Path -Parent $w.path
-                Remove-WebConfigServiceName -PhysicalPath $phys -ExpectedValue $w.setValue -PriorValue $w.priorValue | Out-Null
+                # kind says which element carries the name. Absent on manifests written before
+                # per-app iisnode naming existed, and those only ever wrote <aspNetCore>.
+                if ([string]$w.kind -eq 'appSettings') {
+                    Remove-WebConfigAppSettingServiceName -PhysicalPath $phys -ExpectedValue $w.setValue -PriorValue $w.priorValue | Out-Null
+                } else {
+                    Remove-WebConfigServiceName -PhysicalPath $phys -ExpectedValue $w.setValue -PriorValue $w.priorValue | Out-Null
+                }
             }
         }
         if ($manifest -and $manifest.poolEnv) {
@@ -335,6 +341,11 @@ try {
                 foreach ($r in @($svcMap)) {
                     if ($r.Scope -eq 'webconfig' -and $r.PhysicalPath) {
                         Remove-WebConfigServiceName -PhysicalPath $r.PhysicalPath | Out-Null
+                        # And the per-app iisnode name, which lives in <appSettings> instead. The
+                        # map is built with -SkipRuntimeClassification here, so there is no
+                        # NodeHosting to filter on - the remover is a no-op when the element or the
+                        # entry is absent, which is the case for every non-iisnode app.
+                        Remove-WebConfigAppSettingServiceName -PhysicalPath $r.PhysicalPath | Out-Null
                     }
                 }
             } catch { Write-Warning "[uninstall] could not enumerate IIS apps for web.config cleanup: $_" }
@@ -413,7 +424,7 @@ try {
     }
 
     # -- 3. Machine env vars ----------------------------------------------------
-    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES','CX_DOTNET_SERVICES','CX_SERVICES')
+    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES','CX_IISNODE_SERVICES','CX_DOTNET_SERVICES','CX_SERVICES')
     if ($manifest -and $manifest.envVars) {
         foreach ($e in @($manifest.envVars)) {
             if (-not $e) { continue }
@@ -473,8 +484,12 @@ try {
         # Ownership-checked: entries are removed only when a path-bearing value resolves under a
         # directory this purge is about to delete. A service instrumented by something else keeps its
         # own configuration.
+        # Includes the bitness-specific PATH names the service instrumenter now writes: the CLR
+        # prefers *_PATH_64, so one left behind pointing into a removed payload is not cosmetic.
         $ourSvcNames = @('CORECLR_ENABLE_PROFILING','CORECLR_PROFILER','CORECLR_PROFILER_PATH',
+                         'CORECLR_PROFILER_PATH_64','CORECLR_PROFILER_PATH_32',
                          'COR_ENABLE_PROFILING','COR_PROFILER','COR_PROFILER_PATH',
+                         'COR_PROFILER_PATH_64','COR_PROFILER_PATH_32',
                          'OTEL_DOTNET_AUTO_HOME','DOTNET_ADDITIONAL_DEPS','DOTNET_SHARED_STORE',
                          'DOTNET_STARTUP_HOOKS','OTEL_DOTNET_AUTO_PLUGINS','NODE_OPTIONS',
                          'OTEL_EXPORTER_OTLP_ENDPOINT','OTEL_EXPORTER_OTLP_PROTOCOL','OTEL_SERVICE_NAME')

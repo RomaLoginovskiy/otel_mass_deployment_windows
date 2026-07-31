@@ -216,11 +216,44 @@ Three things that decide whether it works:
    uninstrumented.
 2. **The environment only takes effect on a recycle**, which is a request-path restart. Between the
    write and the recycle the host reads as instrumented and emits nothing.
-3. **Two iisnode apps in one pool are left alone.** One pool-level `OTEL_SERVICE_NAME` cannot name
-   them apart, and a name that maps to two services is worse than no name
-   (`IISNODE_SHARED_POOL_AMBIGUOUS`). Same for an iisnode app sharing a pool with an instrumented
-   .NET app: writing the pool name would silently *rename* a service that was reporting correctly.
-   Give the app its own pool, or set the bootstrap per app via `<iisnode nodeProcessCommandLine>`.
+3. **A shared pool names each application separately** — see below. The pool carries only what its
+   applications share (the bootstrap, the OTLP endpoint) and **no** `OTEL_SERVICE_NAME`.
+
+### A pool holding both a .NET application and a Node application
+
+This is the common brownfield shape, and it works: each application is named on its own, so neither
+renames the other.
+
+A pool-level variable reaches every application in the pool, so it cannot name two of them. But
+iisnode gives us a genuinely per-application channel — measured in its source
+(`src/iisnode/cmoduleconfiguration.cpp`, `CreateNodeEnvironment`): it copies `w3wp`'s environment
+block and then **appends every `<appSettings>` key/value from the configuration resolved for that
+application**. So the `node.exe` child of `w3wp` sees its own app's appSettings as environment
+variables, and two applications in one pool see different ones.
+
+| What | Where it is written | Scope |
+| --- | --- | --- |
+| The Node app's `OTEL_SERVICE_NAME` | its own `web.config` `<appSettings>` | that application |
+| The .NET (Core) app's `OTEL_SERVICE_NAME` | its own `web.config` `<aspNetCore><environmentVariables>` | that application |
+| `NODE_OPTIONS` bootstrap, OTLP endpoint/protocol, exporters | the app **pool** | shared, identical for all |
+
+The doctor grades a correctly named pool-sharing app `IISNODE_APP_NAMED_PER_APP` (**pass**).
+
+**Ordering matters, and it is why a leftover pool name is removed.** The parent environment is
+copied *first* and appSettings appended *after* it, and `GetEnvironmentVariableW` returns the
+**first** match in the block — so a pool-level `OTEL_SERVICE_NAME` **shadows** the per-app one
+rather than losing to it. Both writers therefore take a pool-level name they recognise as their own
+off a shared pool before writing the per-app names. A pool value they did **not** write is not
+theirs to remove, so they refuse instead and say so (`IISNODE_POOL_NAME_SHADOWS_APP`) — writing a
+per-app name that nothing would read is worse than leaving the app dark, because every value
+involved reads as correct.
+
+**The one shape this cannot solve:** an application that is iisnode **and** instrumented classic
+ASP.NET Framework, on a **shared** pool (`IISNODE_SHARED_POOL_FRAMEWORK`). On .NET Framework the
+OTel SDK reads `OTEL_*` out of `web.config` and promotes it to **process-level** environment
+variables, once per worker process, so that name would travel through `w3wp` and rename the pool's
+other applications. Give such an app a dedicated pool — then the name goes on the pool and there is
+nobody to leak onto.
 
 ### ESM is different here, and it is not our limitation
 

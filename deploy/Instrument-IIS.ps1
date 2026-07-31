@@ -654,16 +654,59 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
                 # would be silently RENAMED to the Node app's service name - a worse failure than
                 # not instrumenting, because it corrupts an app that was reporting correctly.
                 # A static or otherwise uninstrumented co-tenant does not care, so it does not block.
-                $poolRivals = @($svcMap | Where-Object {
-                    $_.Pool -eq $r.Pool -and
-                    (Get-IISAppKey -Site $_.Site -AppPath $_.AppPath) -ne $appKey -and
-                    ($_.NodeHosting -eq 'iisnode' -or $_.Instrumentability -eq 'Supported')
+                # WHERE the name can go, decided by the one function both this script and
+                # misc\Enable-IisnodeInstrumentation.ps1 call, so the two cannot drift: 'pool' when
+                # nothing else in the pool reads OTEL_SERVICE_NAME, 'perApp' when the pool is shared
+                # (the name goes into the app's own web.config <appSettings>, which iisnode appends
+                # to the environment block it builds for node.exe), 'refuse' when neither is honest.
+                $peers = @($svcMap | ForEach-Object {
+                    [pscustomobject]@{
+                        Key                  = Get-IISAppKey -Site $_.Site -AppPath $_.AppPath
+                        Pool                 = $_.Pool
+                        IsIisnode            = ($_.NodeHosting -eq 'iisnode')
+                        IsDotNetInstrumented = ($_.Instrumentability -eq 'Supported')
+                    }
                 })
-                if (@($poolRivals).Count -gt 0) {
-                    $rivalKeys = @($poolRivals | ForEach-Object { Get-IISAppKey -Site $_.Site -AppPath $_.AppPath }) -join ', '
-                    Add-RF (New-IISNodeFinding -Outcome 'sharedPool' -Record $r -Target $appKey -Detail "Also instrumented in pool '$($r.Pool)': $rivalKeys")
-                    Write-Warning "[iis-instr] $appKey shares pool '$($r.Pool)' with other instrumented app(s) ($rivalKeys), so a pool-level OTEL_SERVICE_NAME cannot name it - left uninstrumented rather than renaming a working service."
-                } else {
+                $decision = Get-IISNodeNamingDecision -Key $appKey -Pool $r.Pool -ServiceName $r.ServiceName `
+                    -Peers $peers -ExistingPoolServiceName (Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME') `
+                    -PoolOwnNames @($svcMap | Where-Object { $_.Pool -eq $r.Pool } | ForEach-Object { $_.ServiceName } | Where-Object { $_ }) `
+                    -IsFrameworkInstrumented ($r.DotNetRuntime -eq 'AspNetFramework' -and $r.Instrumentability -eq 'Supported')
+
+                if ($decision.Mode -eq 'refuse') {
+                    Add-RF (New-IISNodeFinding -Outcome $decision.Outcome -Record $r -Target $appKey -Detail $decision.Reason)
+                    Write-Warning "[iis-instr] $appKey - not instrumented: $($decision.Reason)."
+                }
+                elseif ($decision.Mode -eq 'perApp') {
+                    # Name FIRST, bootstrap second. The reverse order is what produces an
+                    # instrumented app reporting as 'unknown_service:node' when the web.config write
+                    # fails - telemetry that cannot be attributed to anything.
+                    if ($decision.RemovePoolName) {
+                        $stale = Get-PoolEnvValue -Pool $r.Pool -Name 'OTEL_SERVICE_NAME'
+                        if (Remove-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME' -ExpectedValue $stale) {
+                            Write-Host "  [pool] removed OTEL_SERVICE_NAME=$stale from shared pool '$($r.Pool)' - a pool value shadows the per-app names" -ForegroundColor Yellow
+                        }
+                    }
+                    if (Set-WebConfigAppSettingServiceName -PhysicalPath $r.PhysicalPath -ServiceName $r.ServiceName -Session $Session) {
+                        $bootstrap = $nodeBoot.NodeOptionsCjs
+                        $owned     = @($nodeBoot.RegisterPath, $nodeBoot.HookUrl) | Where-Object { $_ }
+                        $merged    = Merge-CxNodeOptions -Existing (Get-PoolEnvValue -Pool $r.Pool -Name 'NODE_OPTIONS') -Bootstrap $bootstrap -OwnedTargets $owned
+
+                        Grant-PoolReadAccess -Pool $r.Pool -Path $NodeInstallPrefix | Out-Null
+                        Set-PoolEnv -Pool $r.Pool -Name 'NODE_OPTIONS'                -Value $merged
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_ENDPOINT' -Value $OtlpEndpoint
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_EXPORTER_OTLP_PROTOCOL' -Value 'http/protobuf'
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_TRACES_EXPORTER'        -Value 'otlp'
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_METRICS_EXPORTER'       -Value 'otlp'
+                        Set-PoolEnv -Pool $r.Pool -Name 'OTEL_LOGS_EXPORTER'          -Value 'otlp'
+                        Write-Host "  [node] $appKey -> $($r.ServiceName) --require, per-app name in web.config <appSettings>, bootstrap on shared pool '$($r.Pool)' (with $($decision.Rivals))" -ForegroundColor Green
+                        Add-RF (New-IISNodeFinding -Outcome 'perAppNamed' -Record $r -Target $appKey -Detail $decision.Reason)
+                        [void]$iisnodeApps.Add($r)
+                    } else {
+                        Add-RF (New-IISNodeFinding -Outcome 'sharedPool' -Record $r -Target $appKey -Detail "Shares pool '$($r.Pool)' with $($decision.Rivals); the per-app write into its web.config <appSettings> did not succeed")
+                        Write-Warning "[iis-instr] $appKey shares pool '$($r.Pool)' with $($decision.Rivals) and its per-app name could not be written into web.config, so no bootstrap was written either - an instrumented app with no name reports as 'unknown_service:node'."
+                    }
+                }
+                else {
                     # Always the CommonJS form here: the ESM branch above already refused, because
                     # iisnode cannot host an ES module at all. HookUrl still goes into $owned so a
                     # stale ESM loader written by an earlier build of this installer is stripped out
@@ -707,7 +750,14 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
             # <aspNetCore><environmentVariables>, so an app can only have one if it had an
             # <aspNetCore> element - and if it no longer classifies as Core, that element is
             # gone and took the name with it. There is no stale-web.config-name case to clean.
-            if ($r.Scope -eq 'pool' -and (Remove-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME' -ExpectedValue $r.ServiceName)) {
+            # NOT when the iisnode branch above just wrote that very name. A pure Node app under
+            # iisnode is correctly Unsupported for the .NET profiler, so it reaches this cleanup -
+            # and the value it would "clean up" is the name its own node.exe needs, written moments
+            # earlier with the identical value the -ExpectedValue guard matches on. MEASURED on
+            # cx-e2e-c1: the installer reported IISNODE_APP_INSTRUMENTED and the pool ended up with
+            # NODE_OPTIONS and no OTEL_SERVICE_NAME, so the app reported as unknown_service:node.
+            if ($r.Scope -eq 'pool' -and -not ($iisnodeApps -contains $r) -and
+                (Remove-PoolEnv -Pool $r.Pool -Name 'OTEL_SERVICE_NAME' -ExpectedValue $r.ServiceName)) {
                 Write-Host "  [pool] removed stale OTEL_SERVICE_NAME=$($r.ServiceName) from '$($r.Pool)' (left by an installer that did not classify runtimes)" -ForegroundColor Yellow
             }
             continue
@@ -807,19 +857,37 @@ if (-not $svcMap -or @($svcMap).Count -eq 0) {
 # rollout: PM2 apps on this host wrote their names into this variable, and overwriting would strip
 # the ownership label off services that are reporting fine - which reads in Coralogix as those
 # services having gone away.
+#
+# CX_IISNODE_SERVICES, not CX_NODE_SERVICES. Unioning into the PM2 variable was not enough, because
+# the next instrumenter OWNS that variable: MEASURED on cx-e2e-c1, Instrument-NodePM2.ps1 found no
+# live PM2 apps, took its clear-the-stale-value path, and set CX_NODE_SERVICES empty - wiping both
+# iisnode names. The two applications stayed instrumented and reporting while the host claimed
+# neither, with every finding in the run reading PASS. Update-CxServicesUnion folds this slice into
+# CX_SERVICES alongside the others, so one slice per writer and a writer may only clear its own.
+$iisnodeValue = ''
 if (@($iisnodeApps).Count -gt 0) {
-    $nodeNames = @($iisnodeApps | ForEach-Object { [string]$_.ServiceName } | Where-Object { $_ })
-    $priorNode = [Environment]::GetEnvironmentVariable('CX_NODE_SERVICES', 'Machine')
-    $existingNode = @()
-    if ($priorNode) { $existingNode = @($priorNode -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    $nodeUnion = @(@($existingNode) + @($nodeNames) | Where-Object { $_ } | Select-Object -Unique)
-    $nodeValue = ($nodeUnion -join ',')
-    if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
-        Record-EnvChange -Session $Session -Name 'CX_NODE_SERVICES' -PriorValue $priorNode
+    $nodeNames = @($iisnodeApps | ForEach-Object { [string]$_.ServiceName } | Where-Object { $_ } | Select-Object -Unique)
+    $priorNode = [Environment]::GetEnvironmentVariable('CX_IISNODE_SERVICES', 'Machine')
+    $iisnodeValue = ($nodeNames -join ',')
+    if ($iisnodeValue -ne [string]$priorNode) {
+        if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+            Record-EnvChange -Session $Session -Name 'CX_IISNODE_SERVICES' -PriorValue $priorNode
+        }
+        [Environment]::SetEnvironmentVariable('CX_IISNODE_SERVICES', $iisnodeValue, 'Machine')
+        $env:CX_IISNODE_SERVICES = $iisnodeValue
+        Write-Host "[iis-instr] set machine CX_IISNODE_SERVICES=$iisnodeValue ($(@($nodeNames).Count) iisnode service(s) claimed)" -ForegroundColor Green
     }
-    [Environment]::SetEnvironmentVariable('CX_NODE_SERVICES', $nodeValue, 'Machine')
-    $env:CX_NODE_SERVICES = $nodeValue
-    Write-Host "[iis-instr] set machine CX_NODE_SERVICES=$nodeValue ($(@($nodeNames).Count) iisnode service(s) added to the Node ownership set)" -ForegroundColor Green
+}
+elseif ([Environment]::GetEnvironmentVariable('CX_IISNODE_SERVICES', 'Machine')) {
+    # This script owns this slice, so it is also the only one that may clear it - a leftover here
+    # would keep the host claiming an iisnode app that no longer exists.
+    $priorNode = [Environment]::GetEnvironmentVariable('CX_IISNODE_SERVICES', 'Machine')
+    if ($Session -and (Get-Command Record-EnvChange -ErrorAction SilentlyContinue)) {
+        Record-EnvChange -Session $Session -Name 'CX_IISNODE_SERVICES' -PriorValue $priorNode
+    }
+    [Environment]::SetEnvironmentVariable('CX_IISNODE_SERVICES', $null, 'Machine')
+    $env:CX_IISNODE_SERVICES = $null
+    Write-Host "[iis-instr] cleared stale CX_IISNODE_SERVICES (no instrumented iisnode apps)" -ForegroundColor Yellow
 }
 
 # ---- 2b-iv. Republish CX_SERVICES ---------------------------------------------

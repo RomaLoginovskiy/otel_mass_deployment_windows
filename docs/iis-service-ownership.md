@@ -66,6 +66,11 @@ changed value does nothing until it restarts.
 > disk does not override it. `Test-Agent.ps1` reports this as `CX_SERVICES_NOT_CONSUMED`, decided
 > from the effective config, and says when the fix belongs in the remote config.
 
+> A pool-sharing **iisnode** app is still claimed: its name goes into the app's own `web.config`
+> `<appSettings>`, which iisnode appends to the environment it builds for `node.exe`, so a pool
+> holding a .NET app and a Node app yields two distinct ownership items. See
+> [nodejs-pm2.md](nodejs-pm2.md#a-pool-holding-both-a-net-application-and-a-node-application).
+
 > **iisnode apps land in `CX_NODE_SERVICES`, not `CX_IIS_SERVICES`** — even though
 > `Instrument-IIS.ps1` is what writes them. `CX_IIS_SERVICES` is the set instrumented by the .NET
 > profiler, and `Test-Agent.ps1` rebuilds it with that same .NET-only filter, so a Node service in
@@ -134,6 +139,33 @@ missing ownership item, over-claiming costs permanent drift. To bring such an ap
 management, give it a dedicated application pool so the pool variable can carry a chosen name.
 
 See the shared-pool constraints in [single-host.md](single-host.md#known-limitations).
+
+> **Known gap: a Core app on an out-of-support runtime is claimed but can never report.**
+> MEASURED on a Server 2025 host with auto-instrumentation **1.16.0-beta.1** and an ASP.NET Core
+> app targeting **.NET 6.0.36**: the native profiler attaches to `w3wp` (both
+> `OpenTelemetry.AutoInstrumentation.Native.dll` and `...StartupHook.dll` load), and the StartupHook
+> then refuses the runtime —
+>
+> ```
+> Rule Engine: Error in StartupHook initialization: 6.0.36 is not supported
+> Rule 'Minimum Supported Framework Version Validator' failed
+> Automatic Instrumentation won't be loaded.
+> ```
+>
+> (in `%ProgramData%\OpenTelemetry .NET AutoInstrumentation\logs\*-StartupHook-*.log`). .NET 6 went
+> out of support in November 2024 and the module enforces the .NET support lifecycle, so **no
+> configuration on our side can make such an app report** — the app itself is unaffected and serves
+> normally.
+>
+> The gap is that `Resolve-IISAppRuntime.ps1` still classifies it `AspNetCore`/`Supported`, so it is
+> named and **claimed in `CX_IIS_SERVICES`** — the host advertises ownership of a service that never
+> reports, which is exactly what the membership rule above exists to prevent. It is the same shape as
+> `FRAMEWORK_CLR2_NOT_INSTRUMENTABLE`, which already refuses a CLR-2 Framework app for the same
+> reason, and the fix is the same: read the target version from the app's `runtimeconfig.json`,
+> refuse below the module's minimum, and change `Test-Agent.ps1`'s rebuild filter **in the same
+> commit** — the two must agree or every host reports `CX_IIS_SERVICES_DRIFT` that no re-run clears.
+> Until then, exclude such an app with
+> `-RuntimeOverrides @{'<Site><path>'='NonDotNet'}` so the host stops claiming it.
 
 ## Where the processor lives
 
