@@ -63,8 +63,11 @@ if (Get-Command Resolve-CxOtlpEndpoint -ErrorAction SilentlyContinue) {
 # The requested OTEL resource attributes (literal Coralogix-visible tag keys).
 $resourceAttrs = "tags.CX_SERVICE_NAME=$ServiceName,tags.service=$ServiceName"
 # Environment label: set machine CX_ENVIRONMENT (read by the single-host collector's
-# resource/environment processor for host/infra signals) and append the env keys to
+# transform/environment processor for host/infra signals) and append the env keys to
 # the app-pool attrs so app spans carry it immediately, no collector restart needed.
+# Both stores get the SAME value here, which is what keeps the two in step - see the
+# CX_ENVIRONMENT_MISMATCH finding in docs/reference/exit-codes.md for what it looks
+# like when they drift apart.
 if ($Environment) {
     [Environment]::SetEnvironmentVariable('CX_ENVIRONMENT', $Environment, 'Machine')
     $resourceAttrs += ",tags.cx_environment=$Environment,tags.cx_env=$Environment,deployment.environment.name=$Environment"

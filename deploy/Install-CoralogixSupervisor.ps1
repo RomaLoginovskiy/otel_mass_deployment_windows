@@ -74,7 +74,7 @@
 
 .PARAMETER Environment
   Optional deployment environment (e.g. production/staging/dev). Persisted as the
-  machine env var CX_ENVIRONMENT, which the base config's resource/environment
+  machine env var CX_ENVIRONMENT, which the base config's transform/environment
   processor stamps onto all signals (tags.cx_environment, tags.cx_env,
   deployment.environment.name) so Coralogix can split telemetry by environment.
 
@@ -103,7 +103,7 @@ param(
     [string] $StageDir   = $PSScriptRoot,
     [string] $Version    = $null,
     # Deployment environment -> machine env var CX_ENVIRONMENT (read by the base
-    # config's resource/environment processor).
+    # config's transform/environment processor).
     [string] $Environment = $null,
     # Coralogix application name -> machine env var CX_APPLICATION (read by the base
     # config's transform/appname processor). Unset = fall back to host.name.
@@ -688,7 +688,7 @@ $env:CORALOGIX_PRIVATE_KEY = $PrivateKey
 Write-Host ("[supervisor] CORALOGIX_DOMAIN={0} (machine env set; region {1})" -f
     $Domain, $(if ($resolvedRegion) { $resolvedRegion } else { 'custom' }))
 
-# ---- Persist deployment environment (read by resource/environment processor) --
+# ---- Persist deployment environment (read by transform/environment processor) -
 if ($Environment) {
     if ($Session) {
         Record-EnvChange -Session $Session -Name 'CX_ENVIRONMENT' -PriorValue ([Environment]::GetEnvironmentVariable('CX_ENVIRONMENT', 'Machine'))
