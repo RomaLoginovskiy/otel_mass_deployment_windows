@@ -113,8 +113,14 @@ REM with no diagnostics at all. So if any argument was typed, the env-var block 
 REM skipped entirely. Note the arguments go to Install-Agent.ps1, which accepts -Region
 REM and -Domain but ALSO -KeyFile / -Application / -InstrumentVersion that no env var
 REM below exposes; run `powershell -File Install-Agent.ps1 -?` for the full set.
+REM
+REM Skipping that block used to be silent, which made it a trap rather than a rule:
+REM `set CX_ENVIRONMENT=prod && deploy.bat -Region eu2` deployed with no environment
+REM label at all, and every signal from the host came out labelled 'unspecified' with
+REM nothing in the output to say why. Each variable that is being ignored is now named
+REM on stderr, so the operator can re-run with it as an argument.
 set ARGS=
-if not "%~1"=="" goto :runargs
+if not "%~1"=="" goto :argsgiven
 
 if defined CORALOGIX_PRIVATE_KEY set ARGS=%ARGS% -PrivateKey "%CORALOGIX_PRIVATE_KEY%"
 if defined CX_REGION set ARGS=%ARGS% -Region "%CX_REGION%"
@@ -122,6 +128,21 @@ if defined CX_DOMAIN set ARGS=%ARGS% -Domain "%CX_DOMAIN%"
 if defined CX_ENVIRONMENT set ARGS=%ARGS% -Environment "%CX_ENVIRONMENT%"
 if defined CX_NO_SUPERVISOR set ARGS=%ARGS% -NoSupervisor
 if defined CX_SKIP_INSTRUMENT set ARGS=%ARGS% -SkipInstrument
+goto :runargs
+
+:argsgiven
+REM Arguments win, so the block above was skipped. Name every variable it would have
+REM consumed. Warn only - never fail - because a host that meant to pass arguments and
+REM happens to have a stale variable set still deserves its deploy.
+set "IGNORED="
+if defined CORALOGIX_PRIVATE_KEY set "IGNORED=%IGNORED% CORALOGIX_PRIVATE_KEY"
+if defined CX_REGION set "IGNORED=%IGNORED% CX_REGION"
+if defined CX_DOMAIN set "IGNORED=%IGNORED% CX_DOMAIN"
+if defined CX_ENVIRONMENT set "IGNORED=%IGNORED% CX_ENVIRONMENT"
+if defined CX_NO_SUPERVISOR set "IGNORED=%IGNORED% CX_NO_SUPERVISOR"
+if defined CX_SKIP_INSTRUMENT set "IGNORED=%IGNORED% CX_SKIP_INSTRUMENT"
+if defined IGNORED echo WARNING: command-line arguments were given, so these environment variables are IGNORED:%IGNORED% 1>&2
+if defined IGNORED echo WARNING: pass them as arguments instead - see the usage header of this file. 1>&2
 
 :runargs
 "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-Agent.ps1"%ARGS% %*
