@@ -588,8 +588,8 @@ function Test-CxNodeProcessBlocked {
     <#
       N-2: should this node process be left alone entirely?
 
-      The reference agent keeps a blocklist in a CONFIG section (agentproc.conf [blocklist], with app and exe
-      filters) rather than in code, and gates separately on a debug flag ("Nodejs has a debug option
+      The reference agent keeps a blocklist in a CONFIG section (a [blocklist] section in its
+      process-agent config file, with app and exe filters) rather than in code, and gates separately on a debug flag ("Nodejs has a debug option
       set"). Both are copied, and the shape matters: an operator will need to add to this list, so it
       lives in a file.
 

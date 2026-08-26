@@ -1,16 +1,16 @@
-# How this deployment compares to the reference agent
+# How this deployment compares to a full-stack APM agent
 
-Written from a reverse-engineering study of the reference agent 1.341.56 for Windows (the full corpus lives in
-`C:\Users\roman\Documents\projects\the reference agent\docs`, notably `11-INVOCATION-GRAPH.md` and
-`12-GUARDRAILS-AND-CONFIG.md`). The point is not feature parity — it is knowing precisely where a
-zero-code OpenTelemetry deployment differs, so a customer conversation and a rollout plan can both be
-honest.
+Written from a reverse-engineering study of **the reference agent** — a commercial full-stack
+.NET + Node APM agent for Windows, build 1.341.56. The study corpus is kept **outside this repo**
+(notably its `11-INVOCATION-GRAPH.md` and `12-GUARDRAILS-AND-CONFIG.md` notes). The point is not
+feature parity — it is knowing precisely where a zero-code OpenTelemetry deployment differs, so a
+customer conversation and a rollout plan can both be honest.
 
 ## The one structural difference
 
-| | the reference agent | This deployment |
+| | The reference agent | This deployment |
 | --- | --- | --- |
-| How environment reaches the target | injects `agent-injector.dll` into **every** process and hooks `CreateProcessA`, writing `COR_*`/`CORECLR_*`/`NODE_OPTIONS` into each child **before it starts** | deploy scripts write environment to the **spawner** in advance: IIS pool env, service `Environment` REG_MULTI_SZ, nssm `AppEnvironmentExtra`, winsw XML, pm2 env |
+| How environment reaches the target | injects its process-wide injector DLL into **every** process and hooks `CreateProcessA`, writing `COR_*`/`CORECLR_*`/`NODE_OPTIONS` into each child **before it starts** | deploy scripts write environment to the **spawner** in advance: IIS pool env, service `Environment` REG_MULTI_SZ, nssm `AppEnvironmentExtra`, winsw XML, pm2 env |
 | Reach | any child of any parent, no prior knowledge required | only *known* spawners |
 | Restart | needed only for processes that pre-date the agent, and reported per process (`RESTART_REQUIRED`) | always needed; now reported as `PENDING_RESTART` |
 | Identity | PGI computed by the host agent **and** recomputed in-process, reconciled through a shared-memory "inproc store" | decided once by the installer and recorded to `instrumentation-state.json` for the doctor to compare |
@@ -22,10 +22,10 @@ been to make the edges visible rather than to pretend they are not there.
 
 ## What we now do that the reference agent also does
 
-| Behaviour | the reference agent's version | Ours |
+| Behaviour | The reference agent's version | Ours |
 | --- | --- | --- |
 | Refuse unsupported runtimes | `Node.js version %d.%d.%d not supported`; extensionless gated ≥18.19/≥20.10 | `NODE_RUNTIME_BELOW_MINIMUM`, `NODE_ESM_RUNTIME_UNSUPPORTED`, `NODE_EXTENSIONLESS_UNSUPPORTED`, per target |
-| Skip tool processes | `[blocklist]` in `agentproc.conf`, app + exe filters | `deploy/cx-node-blocklist.txt`, anchored patterns, plus built-in defaults |
+| Skip tool processes | a `[blocklist]` section in its process-agent config file, app + exe filters | `deploy/cx-node-blocklist.txt`, anchored patterns, plus built-in defaults |
 | Skip debugged processes | `Nodejs has a debug option set` | `--inspect`/`--inspect-brk`/`--inspect-port` → skipped, rule named |
 | Skip REPL/eval shapes | argv table gates `-e`, `--eval`, `--print`, `--interactive` | same set; "no entry script" is an answer, not a failure |
 | Resolve the entry script properly | argv walk skipping `-r`/`--require` and their values | `Get-CxNodeEntryScript`, same approach, incl. extensionless |
@@ -46,8 +46,8 @@ been to make the edges visible rather than to pretend they are not there.
   separate WOW64 registry hive, is skipped for images on network shares, breaks real debugging, and needs
   a launcher executable we do not ship.
 - **`AppInit_DLLs` / `AppCertDlls` / any hooking DLL** — `AppInit_DLLs` never loads in `node.exe` (it has
-  no user32 import), and the others mean shipping and signing an injector. That is rebuilding
-  `agent-injector.dll`, which is a different product.
+  no user32 import), and the others mean shipping and signing an injector. That is rebuilding the
+  reference agent's process-wide injector, which is a different product.
 - **WMI `Win32_ProcessStartTrace`, ETW, scheduled task on process start** — all fire *after* the child's
   environment block exists. Observation only; they can never inject.
 - **Post-start environment injection** — no supported mechanism on Windows. This is why `PENDING_RESTART`
@@ -56,14 +56,14 @@ been to make the edges visible rather than to pretend they are not there.
   IL rewriting, and the OTel native profiler needs `SetILFunctionBody`. Not a path.
 
 **Out of scope by design:** Azure App Service, Windows containers, AWS Lambda, RUM / browser
-instrumentation (the reference agent's `agent-iis-module.dll` injects a JS agent into HTML responses; we do not),
-method-level sensors, live debugging, and cluster-pushed per-sensor configuration.
+instrumentation (the reference agent's IIS native module injects a JS agent into HTML responses; we do
+not), method-level sensors, live debugging, and cluster-pushed per-sensor configuration.
 
 ## Signal coverage: the honest delta
 
-the reference agent ships ~130 `Introspection.*` sensor assemblies. The naive comparison ("they have WCF, MSMQ,
-Remoting, IBM MQ, MassTransit, Cosmos…") **overstates the gap**, because several of those sensors ship
-**disabled** — measured in `any/dotnet/runtimeConfiguration`:
+The reference agent ships ~130 `Introspection.*` sensor assemblies. The naive comparison ("they have WCF,
+MSMQ, Remoting, IBM MQ, MassTransit, Cosmos…") **overstates the gap**, because several of those sensors
+ship **disabled** — measured in its `any/dotnet/runtimeConfiguration`:
 
 | Sensor | Shipped default |
 | --- | --- |
@@ -74,16 +74,16 @@ So the real headline differences are **WCF as first-class**, **exceptions as fir
 method detection**, **live debugging** and **RUM**. Against that, OTel gives vendor-neutral OTLP, per-app
 control, and no IL-rewriting risk.
 
-On the Node side the reference agent covers log enrichment for pino/winston/bunyan/log4js, `undici`/`fetch`, HTTP/2,
-route naming for express/fastify/koa/restify/connect, and per-channel propagation switches. Our coverage
-is whatever `@opentelemetry/auto-instrumentations-node` bundles, which overlaps heavily but is not
-identical.
+On the Node side the reference agent covers log enrichment for pino/winston/bunyan/log4js,
+`undici`/`fetch`, HTTP/2, route naming for express/fastify/koa/restify/connect, and per-channel
+propagation switches. Our coverage is whatever `@opentelemetry/auto-instrumentations-node` bundles, which
+overlaps heavily but is not identical.
 
 ## Coexistence: the case that matters most
 
-Only **one** `ICorProfilerCallback` can attach to a process. On a host where the reference agent has .NET deep
-monitoring active, our .NET auto-instrumentation attaches to **nothing** — measured, three
-configurations tried, `infra-only` included. Full detail and the four ways out are in
+Only **one** `ICorProfilerCallback` can attach to a process. On a host where the reference agent has .NET
+deep monitoring active, our .NET auto-instrumentation attaches to **nothing** — measured, three
+configurations tried, its infra-only mode included. Full detail and the four ways out are in
 [exception-foreign-profiler.md](exception-foreign-profiler.md).
 
 The measured good news: **startup-hooks-only works**. With `CORECLR_ENABLE_PROFILING=0` and
@@ -101,18 +101,19 @@ OpenTelemetry existing.
 
 ## Operational surface
 
-the reference agent ships `agentctl` with **56 verbs**, every one a symmetric get *and* set — monitoring
-mode, auto-injection, host tags/group, network zone, deployment metadata, version management. Ours is
-scripts plus machine environment variables plus flags, with the decision record and rule file as the
-durable state. A single operator get/set surface is the remaining gap (plan item X-7).
+The reference agent ships a control CLI with **56 verbs**, every one a symmetric get *and* set —
+monitoring mode, auto-injection, host tags/group, network zone, deployment metadata, version management.
+Ours is scripts plus machine environment variables plus flags, with the decision record and rule file as
+the durable state. A single operator get/set surface is the remaining gap (plan item X-7).
 
-One detail worth copying that we have not: the reference agent's watchdog distinguishes a **suspended VM** from a
-hung agent (*"Potential suspension detected, resetting heartbeat timeout counter"*). Collector failure
-actions here should not treat a VM resume as a failure — see [fleet.md](fleet.md).
+One detail worth copying that we have not: its watchdog distinguishes a **suspended VM** from a hung
+agent (*"Potential suspension detected, resetting heartbeat timeout counter"*). Collector failure actions
+here should not treat a VM resume as a failure — see [fleet.md](fleet.md).
 
 ## Related
 
 - [exception-foreign-profiler.md](exception-foreign-profiler.md) — the profiler-slot conflict, measured
 - [reference/exit-codes.md](reference/exit-codes.md) — every finding code, including the ones added from
   this comparison
-- `the reference agent/docs/11-INVOCATION-GRAPH.md`, `12-GUARDRAILS-AND-CONFIG.md` — the evidence base
+- the study corpus's `11-INVOCATION-GRAPH.md` and `12-GUARDRAILS-AND-CONFIG.md` notes — the evidence
+  base, kept outside this repo

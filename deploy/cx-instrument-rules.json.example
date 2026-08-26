@@ -1,6 +1,6 @@
 {
   "//": "X-2/X-3 instrumentation rules. Copy to cx-instrument-rules.json next to the deploy scripts.",
-  "//hostDisabled": "true turns auto-injection off for this WHOLE host, whatever the rules say. The equivalent of the reference agent's deployment.conf AutoInjectionDisabled - one switch, distinct from per-app exclusion.",
+  "//hostDisabled": "true turns auto-injection off for this WHOLE host, whatever the rules say. The equivalent of the reference agent's host-wide AutoInjectionDisabled switch - one switch, distinct from per-app exclusion.",
   "hostDisabled": false,
 
   "//rules": [

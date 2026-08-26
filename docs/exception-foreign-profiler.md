@@ -1,15 +1,19 @@
-# Exception: a host running the reference agent cannot take our .NET instrumentation
+# Exception: a host already running a full-stack APM agent cannot take our .NET instrumentation
 
 **Status:** known, measured, not fixable from this deployment. Node.js on such a host **is** covered.
 
 This is the one host shape this deployment does not support, stated precisely so it is recognised
 before a rollout rather than diagnosed afterwards from missing data.
 
+Throughout, **the reference agent** means the commercial full-stack .NET + Node APM agent this was
+measured against (build 1.341.56). The conclusion is not specific to that product: it follows from the
+CLR allowing exactly one profiler per process, so any agent that owns the slot produces it.
+
 ## The rule
 
-> On a Windows host where **the reference agent is installed with .NET deep monitoring active**, our
+> On a Windows host where **another full-stack agent is installed with .NET deep monitoring active**, our
 > .NET auto-instrumentation attaches to **nothing**. Only one CLR profiler can attach to a process,
-> the reference agent injects at process creation, and it wins. Our **Node.js** instrumentation is unaffected.
+> that agent injects at process creation, and it wins. Our **Node.js** instrumentation is unaffected.
 
 ## What was measured
 
@@ -18,8 +22,8 @@ before a rollout rather than diagnosed afterwards from missing data.
 
 | Process | Loaded profiler |
 | --- | --- |
-| `w3wp.exe` (net8, fw48, mixed pool) | `agent-injector.dll`, `agent-iis-module.dll`, `agent-dotnet-profiler.dll` |
-| `coreweb.exe` (out-of-process child of the mixed pool) | `agent-dotnet-profiler.dll` |
+| `w3wp.exe` (net8, fw48, mixed pool) | the reference agent's injector, IIS native module and .NET profiler DLLs |
+| `coreweb.exe` (out-of-process child of the mixed pool) | the reference agent's .NET profiler DLL |
 | any process | `OpenTelemetry.AutoInstrumentation.Native.dll` — **absent everywhere** |
 
 Our registration was **perfect** throughout: `W3SVC`/`WAS` carried our CLSID
@@ -31,13 +35,13 @@ co-tenant (`mixedpool/node`, 6 spans) and the PM2 app (`cx-pm2-fork`, 6 spans) r
 
 ### Three configurations tried, all with the same result
 
-| the reference agent configuration | Our profiler attaches? |
+| The reference agent's configuration | Our profiler attaches? |
 | --- | --- |
 | fullstack (default) | no |
-| `agentctl --set-monitoring-mode=infra-only --restart-service` | no |
-| `infra-only` **after a full host reboot** | no |
+| infra-only monitoring mode, set through its control CLI, service restarted | no |
+| infra-only **after a full host reboot** | no |
 
-`infra-only` is **not** a workaround: `agent-dotnet-profiler.dll` stayed injected into recycled and
+Infra-only is **not** a workaround: its .NET profiler DLL stayed injected into recycled and
 post-reboot workers alike.
 
 ## Partial coverage without the profiler — MEASURED, and it works
@@ -94,25 +98,26 @@ mode with a known-good floor (ASP.NET Core server spans) and an unknown ceiling.
 
 ## How to resolve it — pick one
 
-1. **Exclude the IIS process groups in the reference agent** (keeps both agents installed). In the the reference agent
-   tenant, turn off .NET deep monitoring for that host's IIS process groups — *Settings > Monitoring
-   > Monitored technologies > .NET*, or a process-group override. Then reboot the host and confirm
+1. **Exclude the IIS process groups in the other agent** (keeps both agents installed). In that agent's
+   management console, turn off .NET deep monitoring for this host's IIS process groups — typically a
+   monitored-technologies switch for .NET, or a process-group override. Then reboot the host and confirm
    `OpenTelemetry.AutoInstrumentation.Native.dll` appears in `w3wp.exe`. **Untested here** — it needs
-   tenant access, and it is the only route that keeps the reference agent monitoring the host while we own .NET.
-2. **Uninstall the reference agent** (`…\the reference agent\the reference agent\agent\uninstall.exe --quiet`, then reboot). Our
-   .NET instrumentation then works normally. This is what was done on `cx-e2e-c1`.
-3. **Accept the split**: leave the reference agent owning .NET and let us instrument only Node.js. Nothing to
-   configure — it is the steady state — but the host's `CX_IIS_SERVICES` will claim .NET service
+   tenant access, and it is the only route that keeps the other agent monitoring the host while we own
+   .NET.
+2. **Uninstall the other agent** (its own uninstaller, quiet mode, then reboot). Our .NET
+   instrumentation then works normally. This is what was done on `cx-e2e-c1`.
+3. **Accept the split**: leave the other agent owning .NET and let us instrument only Node.js. Nothing
+   to configure — it is the steady state — but the host's `CX_IIS_SERVICES` will claim .NET service
    names that never report, so pass `-RuntimeOverrides` marking those apps `NonDotNet` to stop the
    host advertising ownership it cannot honour.
-4. **Run degraded on .NET Core** (see the measurements above). Leave the reference agent owning the profiler slot
-   and pass **`-NoProfiler`**: `Instrument-IIS.ps1 -NoProfiler` for pools, or
+4. **Run degraded on .NET Core** (see the measurements above). Leave the other agent owning the profiler
+   slot and pass **`-NoProfiler`**: `Instrument-IIS.ps1 -NoProfiler` for pools, or
    `Instrument-DotNetService.ps1 -Services <name> -NoProfiler` for services. That sets
    `CORECLR_ENABLE_PROFILING=0` while keeping `DOTNET_STARTUP_HOOKS`,
    `ASPNETCORE_HOSTINGSTARTUPASSEMBLIES` and `OTEL_DOTNET_AUTO_HOME`, so ASP.NET Core request spans and
-   HttpClient spans flow to our collector alongside the reference agent's own tracing. **Framework gains nothing**
-   (no startup hooks) — the service path refuses it outright with the reason; for Framework use option
-   1, 2 or 3. The bytecode-instrumented libraries (SqlClient, Redis, Mongo, WCF, System.Web) are
+   HttpClient spans flow to our collector alongside the other agent's own tracing. **Framework gains
+   nothing** (no startup hooks) — the service path refuses it outright with the reason; for Framework use
+   option 1, 2 or 3. The bytecode-instrumented libraries (SqlClient, Redis, Mongo, WCF, System.Web) are
    expected not to report and are **unmeasured** — treat them as unknown, not proven absent.
 
 ## How to detect it on a host
@@ -120,14 +125,15 @@ mode with a known-good floor (ASP.NET Core server spans) and an unknown ceiling.
 ```powershell
 Get-CimInstance Win32_Process -Filter "Name='w3wp.exe' OR Name='dotnet.exe'" | ForEach-Object {
   $procId = $_.ProcessId
-  $m = (Get-Process -Id $procId -EA 0).Modules |
-         Where-Object { $_.ModuleName -match 'AutoInstrumentation.Native|the reference agentdotnet' } |
-         Select-Object -Expand ModuleName -Unique
-  "{0} {1} -> {2}" -f $_.Name, $procId, ($m -join ',')
+  $mods = @((Get-Process -Id $procId -EA 0).Modules | Select-Object -Expand ModuleName -Unique)
+  $ours = @($mods -match 'AutoInstrumentation\.Native')
+  "{0} {1} -> ours={2}, modules={3}" -f $_.Name, $procId, [bool]@($ours).Count, @($mods).Count
 }
 ```
 
-`agent-dotnet-profiler.dll` with no `AutoInstrumentation.Native.dll` **is** this exception.
+A CLR-hosting worker with **no** `AutoInstrumentation.Native.dll` in it **is** this exception. To have
+the doctor name *which* agent is in there, add that agent's module regex to `deploy/cx-foreign-apm.json`
+— the same table drives the pre-flight probe and the in-process scan.
 
 `Test-IISInstrumentation.ps1` reports it as `PROFILER_NOT_LOADED_IN_PROCESS`.
 
@@ -159,20 +165,21 @@ Get-CimInstance Win32_Process -Filter "Name='w3wp.exe' OR Name='dotnet.exe'" | F
 > | scoping the worker set by parentage also caught `conhost.exe` | "1 of 2 scanned" on a fully loaded host | processes with no CLR mapped count in neither tally: "2 of 2 CLR-hosting worker process(es); 1 non-CLR child ignored" |
 >
 > Note the first defect is **why the original run showed `0 fail`**: `PROFILER_PATH_FOREIGN` only runs
-> when the CLSID is ours, and with the reference agent owning the slot `PROFILER_FOREIGN_OWNER` fired instead and
-> that block never executed. Uninstalling the reference agent is what exposed it.
+> when the CLSID is ours, and with the other agent owning the slot `PROFILER_FOREIGN_OWNER` fired
+> instead and that block never executed. Uninstalling that agent is what exposed it.
 >
-> Still **not** re-measured: the foreign-profiler-*loaded* case itself. the reference agent has been uninstalled
-> from `cx-e2e-c1`, so that shape no longer exists there, and the container can only reproduce the
-> foreign *registration* (D7/D8). For a host that genuinely runs another agent, the snippet above
-> remains the authority.
+> Still **not** re-measured: the foreign-profiler-*loaded* case itself. The other agent has been
+> uninstalled from `cx-e2e-c1`, so that shape no longer exists there, and the container can only
+> reproduce the foreign *registration* (D7/D8). For a host that genuinely runs another agent, the
+> snippet above remains the authority.
 
 ## Why it matters beyond this VM
 
 The failure is **silent and reads as healthy**: every environment variable is correct, the collector
 is up, the apps serve, and the host simply produces no .NET spans. Without the module check the only
 symptom is absence of data, which presents as a Coralogix-side problem. At least one customer
-engagement (SGA) runs the reference agent on IIS hosts, so this shape is live, not hypothetical.
+engagement (SGA) runs a full-stack agent of this kind on IIS hosts, so this shape is live, not
+hypothetical.
 
 ## Related
 
@@ -182,4 +189,4 @@ engagement (SGA) runs the reference agent on IIS hosts, so this shape is live, n
 - [reference/exit-codes.md](reference/exit-codes.md) — `PROFILER_FOREIGN_OWNER`,
   `PROFILER_PATH_FOREIGN`, `PROFILER_NOT_LOADED_IN_PROCESS`.
 - [nodejs-pm2.md](nodejs-pm2.md#a-pool-holding-both-a-net-application-and-a-node-application) — the
-  Node half, which keeps working with the reference agent present.
+  Node half, which keeps working with another agent present.

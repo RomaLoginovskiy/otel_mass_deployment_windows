@@ -3,7 +3,8 @@
 # Resolve-NodeServiceNames.ps1 (Test-CxNodeProcessBlocked).
 #
 # This file exists because the reference agent keeps the same thing in configuration rather than in code
-# (agentproc.conf [blocklist], with app and exe filters): the list is site-specific and an operator
+# (a [blocklist] section in its process-agent config, with app and exe filters): the list is
+# site-specific and an operator
 # needs to extend it without editing a script.
 #
 # ANCHOR YOUR PATTERNS. A bare word like `npm` also matches an application called

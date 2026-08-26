@@ -13,14 +13,15 @@
     "installDir": "optional absolute path whose existence is a signal; null to skip"
   },
 
+  "//incomplete": "This table is NOT exhaustive and is not meant to be. The hard fail an operator acts on",
+  "//incomplete2": "(PROFILER_FOREIGN_OWNER) is decided by comparing the registered CLSID against OURS, so an",
+  "//incomplete3": "agent with no row here still fails the check - it is reported as 'an unidentified third-party",
+  "//incomplete4": "agent' instead of by label, and its DLL is not named in the doctor's in-process module scan.",
+  "//incomplete5": "Add a row for whatever runs on your estate: the label is free text, the three patterns are",
+  "//incomplete6": "regexes, and nothing else needs to change. Leave no pattern empty - an empty regex matches",
+  "//incomplete7": "every module and would report all of them as foreign profilers.",
+
   "vendors": [
-    {
-      "name": "a full-stack .NET + Node APM agent",
-      "pathPattern": "the reference agent|the reference agent",
-      "modulePattern": "the reference agent",
-      "servicePattern": "the reference agent|the reference agent",
-      "installDir": "C:\\Program Files\\the reference agent\\the reference agent"
-    },
     {
       "name": "a .NET + Node APM agent (managed+native)",
       "pathPattern": "newrelic",

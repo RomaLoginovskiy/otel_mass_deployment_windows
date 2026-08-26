@@ -497,7 +497,8 @@ function Get-CxInstrumentRules {
       Load the rule list from JSON. Shape: { "hostDisabled": false, "rules": [ ... ] }
 
       Kept in a file rather than in parameters because the reference agent keeps the equivalent in configuration
-      (agentproc.conf [blocklist], deployment.conf AutoInjectionDisabled) and because a rule set has
+      (a [blocklist] section in its process-agent config, plus a host-wide AutoInjectionDisabled
+      switch) and because a rule set has
       to survive between the installer run and the doctor run without being retyped - which is the whole
       complaint about the current -ServiceNameOverrides / -RuntimeOverrides pair.
     #>
