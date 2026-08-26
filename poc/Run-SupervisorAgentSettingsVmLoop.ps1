@@ -190,9 +190,20 @@ $ProbeRuntime = {
 }
 
 $ProbeLogs = {
-    param($statePath)
+    param($statePath, $cfgPath)
     $ErrorActionPreference = 'Continue'
     $o = [ordered]@{}
+
+    # Only events written SINCE we patched config.yaml count. Measured on the dev host: an
+    # 'opampsupervisor' event-log source survives an uninstall, so an unfiltered read returned 90 KB
+    # of events from a previous install - which would have failed S8 on lines written before the fix
+    # existed. The config's own mtime is the right boundary and needs no state threaded between
+    # phases, so a single-phase run gets the same answer as a full one.
+    $since = [datetime]::MinValue
+    if ($cfgPath -and (Test-Path -LiteralPath $cfgPath)) {
+        try { $since = (Get-Item -LiteralPath $cfgPath).LastWriteTime } catch { }
+    }
+    $o['since'] = $since.ToString('o')
 
     # DISCOVER the log rather than hardcoding a path - the supervisor's own layout is not ours to
     # assume, and a wrong path would make every log assertion vacuously silent.
@@ -212,9 +223,10 @@ $ProbeLogs = {
     }
     # The Application event log is the other place the service's output can land.
     try {
-        $ev = Get-EventLog -LogName Application -Source 'opampsupervisor' -Newest 200 -ErrorAction Stop
+        $ev = @(Get-EventLog -LogName Application -Source 'opampsupervisor' -Newest 200 -ErrorAction Stop |
+                Where-Object { $_.TimeGenerated -ge $since })
         foreach ($e in $ev) { $text += "`n" + $e.Message }
-        $o['events'] = @($ev).Count
+        $o['events'] = $ev.Count
     } catch { $o['events'] = 0 }
 
     $o['chars'] = $text.Length
@@ -515,7 +527,7 @@ try {
     # ---- S7 : passthrough_logs is not inert ------------------------------------
     if (Want 'S7') {
         Write-PhaseHeader 'S7' 'passthrough_logs actually passes something through'
-        $before = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState) -TimeoutSeconds 300
+        $before = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState, $SupCfg) -TimeoutSeconds 300
         if (-not $before) {
             Assert-True 'log probe returned data' $false 'no JSON from the guest'
         } else {
@@ -540,7 +552,7 @@ try {
                     (([int]$killed.Killed -ge 1) -and ([int]$killed.Back -ge 1)) "killed=$($killed.Killed) back=$($killed.Back)"
             }
 
-            $after = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState) -TimeoutSeconds 300
+            $after = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState, $SupCfg) -TimeoutSeconds 300
             if ($after) {
                 Assert-True 'the supervisor log GREW after the collector restarted' `
                     ([int]$after.chars -gt [int]$before.chars) `
@@ -554,14 +566,18 @@ try {
     # ---- S8 : no apply failure, in the supervisor's own words -------------------
     if (Want 'S8') {
         Write-PhaseHeader 'S8' 'no config-apply failure reported locally'
-        $lg = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState) -TimeoutSeconds 300
+        $lg = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState, $SupCfg) -TimeoutSeconds 300
         if (-not $lg) {
             Assert-True 'log probe returned data' $false 'no JSON from the guest'
         } elseif ([int]$lg.chars -eq 0) {
             Note 'apply-failure check inconclusive' 'no supervisor log text on this host, so absence of the phrase proves nothing'
         } else {
+            # The event-log half of this is bounded by the config's mtime. A *.log FILE cannot be
+            # bounded the same way without knowing the supervisor's line format, so on a long-lived
+            # host a pre-fix line could still trip this - which is why the failure detail prints the
+            # matches: they carry their own timestamps and an operator can date them.
             Assert-True 'no "failed to apply" / apply-timeout line anywhere in the supervisor output' `
-                (-not [bool]$lg.hasApplyFail) "matches: $($lg.applyFailLines)"
+                (-not [bool]$lg.hasApplyFail) "since $($lg.since); matches: $($lg.applyFailLines)"
         }
     }
 
@@ -674,7 +690,7 @@ try {
             Assert-Equal 'config_apply_timeout survived the reboot' $ExpectTimeout ([string]$cfg4.config_apply_timeout_value)
             Assert-Equal 'passthrough_logs survived the reboot' 'true' ([string]$cfg4.passthrough_logs_value)
         }
-        $lg2 = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState) -TimeoutSeconds 300
+        $lg2 = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState, $SupCfg) -TimeoutSeconds 300
         if ($lg2 -and [int]$lg2.chars -gt 0) {
             Assert-True 'still no apply-failure line after the reboot' (-not [bool]$lg2.hasApplyFail) "matches: $($lg2.applyFailLines)"
         } elseif ($lg2) {
