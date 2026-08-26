@@ -128,7 +128,10 @@ $ProbeConfig = {
     $exe = @($lines | Where-Object { $_ -match '^\s*executable\s*:' })
     $o['exeCount']     = $exe.Count
     $o['exeIndentLen'] = $(if ($exe.Count) { IndentLen $exe[0] } else { -1 })
-    $o['exeLine']      = $(if ($exe.Count) { $exe[0] } else { '' })
+    # [string] matters: Get-Content emits strings decorated with PSPath/PSParentPath note properties
+    # and ConvertTo-Json serializes the whole decorated object - the first run printed
+    # "@{value=  executable: ...; PSPath=...}" instead of the line.
+    $o['exeLine']      = $(if ($exe.Count) { [string]$exe[0] } else { '' })
 
     foreach ($k in @('passthrough_logs', 'config_apply_timeout')) {
         $hits = @($lines | Where-Object { $_ -match ('^\s*' + [regex]::Escape($k) + '\s*:') })
@@ -145,8 +148,8 @@ $ProbeConfig = {
     # The vendor's own lines, which neither writer may touch.
     $sn = @($lines | Where-Object { $_ -match '^\s*service\.name\s*:' })
     $at = @($lines | Where-Object { $_ -match '^\s*cx\.agent\.type\s*:' })
-    $o['serviceNameLine'] = $(if ($sn.Count) { $sn[0].Trim() } else { '' })
-    $o['agentTypeLine']   = $(if ($at.Count) { $at[0].Trim() } else { '' })
+    $o['serviceNameLine'] = $(if ($sn.Count) { ([string]$sn[0]).Trim() } else { '' })
+    $o['agentTypeLine']   = $(if ($at.Count) { ([string]$at[0]).Trim() } else { '' })
     $o['descAnchor']      = [bool](@($lines | Where-Object { $_ -match '^\s*non_identifying_attributes\s*:\s*$' }).Count)
 
     [pscustomobject]$o | ConvertTo-Json -Compress
@@ -160,8 +163,32 @@ $ProbeRuntime = {
     $o['supervisor'] = [string]$sup.Status
     $o['supStart']   = [string]$sup.StartType
     $o['otelChild']  = @(Get-Process otelcol* -ErrorAction SilentlyContinue).Count
+
+    # The health endpoint is RESOLVED from the merged effective config, never assumed to be 13133.
+    # In supervisor mode the supervisor composes the collector's config and owns its own
+    # health_check wiring, so the port the base config asks for is not necessarily the port being
+    # served. misc\Test-CxInstrumentation.ps1 already resolves it this way for exactly this reason;
+    # the first run of this loop hardcoded 13133 and reported 503 / never-healthy against a
+    # collector whose log said "Everything is ready".
+    $eff = Join-Path $statePath 'state\effective.yaml'
+    $o['healthUrl'] = 'http://127.0.0.1:13133'
     try {
-        $r = Invoke-WebRequest -Uri 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 15
+        if (Test-Path -LiteralPath $eff) {
+            $fs = New-Object System.IO.FileStream($eff, [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $sr = New-Object System.IO.StreamReader($fs)
+            $cfgTxt = $sr.ReadToEnd(); $sr.Close(); $fs.Close()
+            $m = [regex]::Match($cfgTxt, '(?ms)^\s{2}health_check(/[\w\.\-]+)?\s*:\s*.*?^\s{4}endpoint\s*:\s*["'']?([^\s"'']+)')
+            if ($m.Success) {
+                $ep = $m.Groups[2].Value -replace '^0\.0\.0\.0', '127.0.0.1' -replace '^\[::\]', '127.0.0.1'
+                $o['healthUrl'] = "http://$ep"
+                $o['healthFrom'] = 'effective.yaml'
+            } else { $o['healthFrom'] = 'default (no health_check endpoint in effective.yaml)' }
+        } else { $o['healthFrom'] = 'default (no effective.yaml)' }
+    } catch { $o['healthFrom'] = "default (parse failed: $($_.Exception.Message))" }
+
+    try {
+        $r = Invoke-WebRequest -Uri $o['healthUrl'] -UseBasicParsing -TimeoutSec 15
         $o['health'] = [int]$r.StatusCode
     } catch {
         $c = 0; try { $c = [int]$_.Exception.Response.StatusCode.value__ } catch { }
@@ -190,7 +217,7 @@ $ProbeRuntime = {
 }
 
 $ProbeLogs = {
-    param($statePath, $cfgPath)
+    param($statePath, $cfgPath, $sinceIso)
     $ErrorActionPreference = 'Continue'
     $o = [ordered]@{}
 
@@ -202,6 +229,14 @@ $ProbeLogs = {
     $since = [datetime]::MinValue
     if ($cfgPath -and (Test-Path -LiteralPath $cfgPath)) {
         try { $since = (Get-Item -LiteralPath $cfgPath).LastWriteTime } catch { }
+    }
+    # An explicit marker wins when it is LATER: that is how a caller asks "what arrived after this
+    # moment", the only sound way to detect new output when the source is a fixed-size window.
+    # Measured: the Application log read with -Newest 200 saturates at 200 events, so its total
+    # character count can FALL as old events roll off - the first run of this loop saw
+    # 135883 -> 131663 chars and read that as "the log did not grow".
+    if ($sinceIso) {
+        try { $m = [datetime]::Parse($sinceIso); if ($m -gt $since) { $since = $m } } catch { }
     }
     $o['since'] = $since.ToString('o')
 
@@ -222,12 +257,17 @@ $ProbeLogs = {
         } catch { }
     }
     # The Application event log is the other place the service's output can land.
+    $o['newest'] = ''
     try {
-        $ev = @(Get-EventLog -LogName Application -Source 'opampsupervisor' -Newest 200 -ErrorAction Stop |
-                Where-Object { $_.TimeGenerated -ge $since })
+        $all = @(Get-EventLog -LogName Application -Source 'opampsupervisor' -Newest 200 -ErrorAction Stop)
+        if ($all.Count) {
+            $o['newest'] = ($all | Sort-Object TimeGenerated -Descending | Select-Object -First 1).TimeGenerated.ToString('o')
+        }
+        $ev = @($all | Where-Object { $_.TimeGenerated -gt $since })
         foreach ($e in $ev) { $text += "`n" + $e.Message }
         $o['events'] = $ev.Count
-    } catch { $o['events'] = 0 }
+        $o['eventsTotal'] = $all.Count
+    } catch { $o['events'] = 0; $o['eventsTotal'] = 0 }
 
     $o['chars'] = $text.Length
     # A collector-emitted line is what proves passthrough_logs is not inert. These are otelcol's
@@ -328,7 +368,28 @@ try {
     # Without this, S3 can pass on a config.yaml left behind by an earlier run - a green result
     # about code that never executed.
     if (Want 'S1') {
-        Write-PhaseHeader 'S1' 'clean baseline: no agent, no supervisor config'
+        Write-PhaseHeader 'S1' 'prerequisites, and a clean baseline'
+
+        # IIS IS A HARD PREREQUISITE, and this check exists because its absence cost three full
+        # runs. The base config ships a windowsperfcounters/iis_apppool receiver and an IIS filelog
+        # receiver. On a host without IIS the APP_POOL_WAS counter object does not exist, that
+        # component fails to start, the collector SHUTS ITSELF DOWN, and the supervisor restarts it
+        # in a loop. The visible result is not "no IIS" - it is health 503 or refused, S6 unable to
+        # measure anything, and S7 seeing killed=1/back=0, i.e. five confusing failures that all
+        # look like the config edit broke something. One actionable failure here beats that.
+        $prereq = Invoke-GuestJson -Script {
+            [pscustomobject]@{
+                W3SVC   = [string](Get-Service W3SVC -ErrorAction SilentlyContinue).Status
+                AppCmd  = [bool](Test-Path 'C:\Windows\System32\inetsrv\appcmd.exe')
+                WasCtr  = [bool](Get-Counter -ListSet 'APP_POOL_WAS' -ErrorAction SilentlyContinue)
+            } | ConvertTo-Json -Compress
+        } -TimeoutSeconds 300
+        $iisOk = $prereq -and [bool]$prereq.AppCmd -and [bool]$prereq.WasCtr
+        Assert-True 'IIS is installed, so the base config''s IIS receivers can start' $iisOk `
+            "appcmd=$($prereq.AppCmd) APP_POOL_WAS=$($prereq.WasCtr) W3SVC=$($prereq.W3SVC) - run poc\Configure-Guest.ps1 on this guest first"
+        if (-not $iisOk) {
+            throw 'IIS missing: the collector will crash-loop on windowsperfcounters/iis_apppool and every health assertion below would fail for that reason rather than anything this loop is testing. Run poc\Configure-Guest.ps1 against the guest, then re-run.'
+        }
         $pre = Invoke-GuestJson -Script {
             param($cfg)
             [pscustomobject]@{
@@ -424,7 +485,17 @@ try {
 
             # The vendor's lines and the description block, which this change must not touch.
             Assert-Equal 'agent.executable is still a single line' 1 ([int]$cfg.exeCount)
-            Assert-Equal 'vendor service.name untouched' 'service.name: "coralogix-collector"' ([string]$cfg.serviceNameLine)
+            # NOT an equality check against a literal. Measured on vendor collector 0.156.0, the
+            # installer writes service.name: "opentelemetry-collector"; an older version wrote
+            # "coralogix-collector". Pinning either one makes this assertion fail on the other
+            # vendor build while saying nothing about our change. The invariant that actually
+            # matters is that the line is still the VENDOR'S: present, and in the vendor's
+            # double-quoted style rather than the single-quoted style our writer emits. That the
+            # value is never modified is proved fixture-side in test\Test-SupervisorConfigWriter.ps1,
+            # against both spellings.
+            Assert-Match 'vendor service.name still present, in the vendor''s own quoting style' `
+                '^service\.name:\s*"[^"]+"$' ([string]$cfg.serviceNameLine)
+            Write-Host "  vendor service.name = $($cfg.serviceNameLine)\"
             Assert-True  'the non_identifying_attributes anchor is intact' ([bool]$cfg.descAnchor)
             Write-Host "  executable: $($cfg.exeLine)"
         }
@@ -442,7 +513,32 @@ try {
             # "Service is Running" is not sufficient anywhere in this code: a config the supervisor
             # rejects can still leave the service up with no collector under it.
             Assert-True  'a collector child process is alive' ([int]$rt.otelChild -ge 1) "otelcol processes=$($rt.otelChild)"
-            Assert-Equal 'health endpoint 13133 returns 200' 200 ([int]$rt.health)
+            # Polled, not sampled once. The collector legitimately needs seconds to come up - the
+            # installer itself sleeps 6 before its own probe - so a single read straight after a
+            # deploy reports 503 on a collector that is merely still starting. That is exactly what
+            # the first run of this loop did, and the event log then showed "Everything is ready"
+            # moments later.
+            Write-Host "  health endpoint $($rt.healthUrl) (from $($rt.healthFrom))"
+            $h = Invoke-GuestJson -Script {
+                param($url)
+                $ErrorActionPreference = 'Continue'
+                $code = 0
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                while ($sw.Elapsed.TotalSeconds -lt 120) {
+                    try {
+                        $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
+                        $code = [int]$r.StatusCode
+                        if ($code -eq 200) { break }
+                    } catch {
+                        $code = 0
+                        try { $code = [int]$_.Exception.Response.StatusCode.value__ } catch { }
+                    }
+                    Start-Sleep -Milliseconds 500
+                }
+                [pscustomobject]@{ Code = $code; WaitedMs = [int]$sw.Elapsed.TotalMilliseconds } | ConvertTo-Json -Compress
+            } -ArgumentList @([string]$rt.healthUrl) -TimeoutSeconds 300
+            Assert-Equal 'health endpoint returns 200 (polled up to 120s)' 200 ([int]$h.Code)
+            Write-Host "  health 200 after $($h.WaitedMs)ms of polling\"
         }
     }
 
@@ -473,7 +569,15 @@ try {
         # interval from "supervisor service is Running" to "health endpoint answers 200" is the
         # window config_apply_timeout is racing. Timed on the guest; a host-side stopwatch would
         # be measuring guestcontrol round trips.
+        # Resolve the endpoint first - same reason as S4: in supervisor mode the served health port
+        # comes from the merged effective config, not from the base config's request.
+        $pre = Invoke-GuestJson -Script $ProbeRuntime -ArgumentList @($SupState) -TimeoutSeconds 300
+        $healthUrl = 'http://127.0.0.1:13133'
+        if ($pre -and $pre.healthUrl) { $healthUrl = [string]$pre.healthUrl }
+        Write-Host "  measuring against $healthUrl (from $($pre.healthFrom))"
+
         $m = Invoke-GuestJson -Script {
+            param($url)
             $ErrorActionPreference = 'Continue'
             $o = [ordered]@{}
             try { Stop-Service -Name opampsupervisor -Force -ErrorAction Stop } catch { $o['stopErr'] = "$($_.Exception.Message)" }
@@ -499,7 +603,7 @@ try {
             $sw2 = [System.Diagnostics.Stopwatch]::StartNew()
             while ($sw2.Elapsed.TotalSeconds -lt 180) {
                 try {
-                    $r = Invoke-WebRequest -Uri 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 3
+                    $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 3
                     if ($r.StatusCode -eq 200) { $healthy = [int]$sw2.Elapsed.TotalMilliseconds; break }
                 } catch { }
                 Start-Sleep -Milliseconds 250
@@ -507,7 +611,7 @@ try {
             $o['healthyMs']  = $healthy
             $o['otelChild']  = @(Get-Process otelcol* -ErrorAction SilentlyContinue).Count
             [pscustomobject]$o | ConvertTo-Json -Compress
-        } -TimeoutSeconds 900
+        } -ArgumentList @($healthUrl) -TimeoutSeconds 900
 
         if (-not $m) {
             Assert-True 'the startup measurement returned data' $false 'no JSON from the guest'
@@ -515,7 +619,7 @@ try {
             $ms = [int]$m.healthyMs
             Write-Host "  service Running after $($m.svcRunningMs)ms; health 200 after a further ${ms}ms"
             Assert-True 'the collector became healthy at all' ($ms -ge 0) `
-                'no 200 from :13133 within 180s after a supervisor restart'
+                "no 200 from $healthUrl within 180s after a supervisor restart\"
             if ($ms -ge 0) {
                 # The falsifiable core. If this host reaches healthy inside the supervisor's 5s
                 # default, then a timeout cannot explain the FAILED status and the diagnosis behind
@@ -559,11 +663,15 @@ try {
                     (([int]$killed.Killed -ge 1) -and ([int]$killed.Back -ge 1)) "killed=$($killed.Killed) back=$($killed.Back)"
             }
 
-            $after = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState, $SupCfg) -TimeoutSeconds 300
+            # Ask for output strictly NEWER than the newest line already seen. Comparing total
+            # characters cannot work: the only source is a -Newest 200 window, so it is capped and
+            # its character count falls as old events age out.
+            $marker = [string]$before.newest
+            $after = Invoke-GuestJson -Script $ProbeLogs -ArgumentList @($SupState, $SupCfg, $marker) -TimeoutSeconds 300
             if ($after) {
-                Assert-True 'the supervisor log GREW after the collector restarted' `
-                    ([int]$after.chars -gt [int]$before.chars) `
-                    "before=$($before.chars) after=$($after.chars) chars - a static log means passthrough_logs is inert"
+                Assert-True 'new supervisor/collector output appeared after the restart' `
+                    ([int]$after.events -gt 0) `
+                    "no events newer than [$marker] - passthrough_logs is inert, or nothing was logged"
                 Assert-True 'and it carries a line the COLLECTOR emitted, not just the supervisor' `
                     ([bool]$after.hasCollector) "no collector startup line found; last matches: $($after.collectorLines)"
             }
@@ -667,7 +775,8 @@ try {
                 Assert-Equal 'still exactly one config_apply_timeout' 1 ([int]$cfg3.config_apply_timeout_count)
                 Assert-Equal 'still exactly one passthrough_logs' 1 ([int]$cfg3.passthrough_logs_count)
                 Assert-Equal 'timeout value unchanged' $ExpectTimeout ([string]$cfg3.config_apply_timeout_value)
-                Assert-Equal 'vendor service.name still untouched' 'service.name: "coralogix-collector"' ([string]$cfg3.serviceNameLine)
+                Assert-Match 'vendor service.name still in the vendor''s own quoting style' `
+                    '^service\.name:\s*"[^"]+"$' ([string]$cfg3.serviceNameLine)
             }
         }
     }

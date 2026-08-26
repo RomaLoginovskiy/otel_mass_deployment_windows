@@ -49,10 +49,10 @@ Two ways to pass options, and they are **mutually exclusive by design**:
 
 ```bat
 REM 1. arguments - forwarded verbatim to Install-Agent.ps1
-deploy.bat -Region eu2 -Environment prod
+deploy.bat -Region eu2 -Environment prod -Team payments
 
 REM 2. environment variables - for tools that cannot pass arguments to a remote command
-set CX_REGION=eu2 && set CX_ENVIRONMENT=prod && deploy.bat
+set CX_REGION=eu2 && set CX_ENVIRONMENT=prod && set CX_TEAM=payments && deploy.bat
 ```
 
 Typing **any** argument skips the environment-variable block entirely. Mixing the two would pass
@@ -71,11 +71,13 @@ while exiting 0.
 | `CX_REGION` | `-Region <code>` |
 | `CX_DOMAIN` | `-Domain <domain>` |
 | `CX_ENVIRONMENT` | `-Environment <label>` |
+| `CX_TEAM` | `-Team <team>` |
 | `CX_NO_SUPERVISOR` | `-NoSupervisor` |
 | `CX_SKIP_INSTRUMENT` | `-SkipInstrument` |
 
-`CORALOGIX_DOMAIN` and `CX_RUNTIME_OVERRIDES_JSON` are **not** forwarded as flags; the scripts read
-them directly. See [env-vars.md](env-vars.md) for why.
+`CORALOGIX_DOMAIN`, `CX_RUNTIME_OVERRIDES_JSON` and the bare `TEAM` are **not** forwarded as flags;
+the scripts read them directly. `TEAM` is therefore *not* named in the ignored-variables warning
+above — it still applies when arguments are given. See [env-vars.md](env-vars.md) for why.
 
 ### `Install-Agent.ps1`
 
@@ -91,6 +93,7 @@ and records every config it changes.
 | `-PrivateKey` | string | none | The key **value**. Overrides `-KeyFile`. |
 | `-Environment` | string | none | `deployment.environment.name` for this host, e.g. `prod`. Omit it on a re-run and the persisted machine `CX_ENVIRONMENT` is inherited, so the two stores that hold this label cannot drift apart. |
 | `-Application` | string | none | Coralogix application name for this host. Omit to fall back to the host's own name. |
+| `-Team` | string | none | Owning team, persisted as machine `CX_TEAM` **and** `TEAM`. Omitted, the value comes from `CX_TEAM`, then a bare `TEAM` the host already carried, then the persisted `CX_TEAM` — and the transcript names which source was used. Stamps nothing on telemetry; see [env-vars.md](env-vars.md). |
 | `-NoSupervisor` | switch | off | Install the plain `otelcol-contrib` service with a local config instead of the OpAMP Supervisor. Affects only the vendor-installer arguments. |
 | `-SkipInstrument` | switch | off | Install the collector and leave IIS/Node/.NET services alone. |
 | `-DotNetServices` | string | none | Comma-separated Windows service names to instrument as .NET services outside IIS. Merged with `CX_DOTNET_SERVICE_NAMES`. Without either, no Windows service is instrumented and the run says so. |
@@ -126,6 +129,7 @@ Installs the Coralogix collector, with the OpAMP Supervisor by default. Called b
 | `-Version` | string | none | Pin a collector version (passed to the vendor installer). |
 | `-Environment` | string | none | Persisted as `CX_ENVIRONMENT`; the config stamps it as `deployment.environment.name`. |
 | `-Application` | string | none | Persisted as `CX_APPLICATION`; the config stamps it as `service.namespace`, which the exporter maps to the application name. Omit for the host-name fallback. |
+| `-Team` | string | none | Persisted as `CX_TEAM` **and** `TEAM`, same value in both. No processor in the base config reads either; the prior value of each is recorded so uninstall can restore a `TEAM` the host owned first. |
 | `-ResourceAttributes` | string | machine `OTEL_RESOURCE_ATTRIBUTES` | Attributes injected into the supervisor `AgentDescription` so Fleet Management can target the host. Normally supplied by detection. |
 | `-ConfigApplyTimeout` | string | `30s` | Written to the supervisor config as `agent.config_apply_timeout`. The supervisor's own default is `5s`, which is shorter than this config's cold start — so every apply was reported to Fleet Management as **failed** while it had in fact succeeded. |
 | `-Session` | object | none | An open backup session, so config changes are recorded. Passed by `Install-Agent.ps1`. |
