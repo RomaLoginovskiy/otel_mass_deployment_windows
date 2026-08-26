@@ -414,6 +414,8 @@ shows both `1` and `2` as red rows; the exit-code column tells them apart. Full 
 | Nothing in Infrastructure Explorer, install said success | Same root cause as the row above. The collector logs `Exporting failed. Dropping data.` with `Unauthenticated` per batch while the local health endpoint stays green. Check the export counters (`EXPORT_SEND_FAILED`). |
 | Selector attributes not shown in Fleet Management | They must be in the **supervisor** config's `agent.description.non_identifying_attributes`, not just `OTEL_RESOURCE_ATTRIBUTES` — the vendor template writes only a static `service.name` and `cx.agent.type`. `Install-CoralogixSupervisor.ps1` injects them post-install and restarts the supervisor. If still absent, detection did not run elevated (empty `OTEL_RESOURCE_ATTRIBUTES`), or the vendor template changed its anchor. Re-run the deploy. |
 | `opampsupervisor` will not start after a config edit; the Application log says `could not compose initial merged config: yaml: line NN: found unknown escape character` | A selector attribute value contains a **backslash**. See the next section — every backslash must be doubled in the YAML value. |
+| Fleet Management shows the remote config as **failed to apply**, but telemetry is arriving | The supervisor's `agent.config_apply_timeout` is shorter than the collector's cold start, so it gave up waiting and reported `FAILED` for a config that applied fine. See the next section. |
+| An apply really did fail and there is nothing on the host that says why | The collector's own stdout/stderr is swallowed unless the supervisor config sets `agent.passthrough_logs: true`. The installer sets it. |
 | A selector value looks mangled in Fleet Management rather than missing | Same root cause, benign side: when the character after the backslash is a valid YAML escape, the second parse succeeds and silently rewrites the value. The service starts, so nothing reports a problem. Fix is identical. |
 | No IIS telemetry | `PROFILER_NOT_REGISTERED` → the register step never ran here. `PROFILER_PATH_MISSING` → the profiler DLL was deleted; IIS starts and emits nothing. `OTLP_ENDPOINT_LOCALHOST` → `::1`, export silently dropped. `POOL_LOST_INHERITANCE` → the pool has its own `<environmentVariables>` and never saw the defaults; re-run the deploy and recycle. `POOL_NOT_NO_MANAGED_CODE` is worth fixing but is **not** a cause of silence. |
 | One IIS application sends nothing | `NON_DOTNET_APP_NOT_INSTRUMENTED` → static, native, another runtime behind IIS, or a reverse proxy; instrument the backend where it runs, or force the runtime if detection is wrong. `RUNTIME_UNKNOWN_NEEDS_OVERRIDE` → deliberately undecided; supply the override. `FRAMEWORK_POOL_NO_MANAGED_CLR` → the application is not merely uninstrumented, it is **down**; set that pool to `v4.0`. |
@@ -453,6 +455,48 @@ would otherwise be skipped.
 To verify the value survived end-to-end rather than merely that the service started, publish an
 attribute whose value contains both `\P` and `\L`, restart, and read it back out of the
 supervisor's effective config.
+
+### A config apply reported as failed when it succeeded
+
+`agent.config_apply_timeout` in the supervisor's `config.yaml` is how long the supervisor waits for
+the collector to report healthy after it applies a new config. Its own default is **5s**. This base
+config is large — four pipelines, dynamic IIS parsing — and the collector routinely needs longer
+than that to come up on Windows, which is also why the installer sleeps 6 seconds before its own
+health probe. On timeout the supervisor reports `RemoteConfigStatus = FAILED` upstream, so the
+console showed a red config on a host that was working.
+
+`Install-CoralogixSupervisor.ps1` writes two keys as direct children of `agent:`:
+
+```yaml
+agent:
+  executable: C:\Program Files\OpenTelemetry Collector\otelcol-contrib.exe
+  passthrough_logs: true
+  config_apply_timeout: 30s
+  description:
+    non_identifying_attributes:
+      service.name: "coralogix-collector"
+```
+
+- `config_apply_timeout` — `30s` by default, `-ConfigApplyTimeout` to change it. Written in place,
+  so a re-deploy repairs a host still on `5s` rather than skipping a key that is already there.
+- `passthrough_logs` — always `true`, not configurable. Without it the collector's own stdout and
+  stderr are swallowed by the supervisor, so a genuine apply failure leaves nothing on the host to
+  read. There is no host on which that is the better outcome.
+
+Two things this deliberately does **not** touch: the vendor's `service.name` /
+`cx.agent.type` lines, and `agent.executable`. Note also that neither of these two values is
+backslash-doubled the way the section above requires — that rule applies only to
+`non_identifying_attributes`, which the supervisor re-serializes and reparses. These are
+supervisor-side settings that are never re-emitted, and quoting them would be the opposite bug:
+go-yaml has to read `30s` as a duration and `true` as a bool, not as strings.
+
+Verifying it locally: `agent.config_apply_timeout: 30s` present exactly once in
+`C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml`, the service Running with an
+`otelcol` child under it, and no `failed to apply` line in the supervisor's log. Fleet-side
+confirmation that the config now reads *applied* is still a manual step — see
+[Verification](#verification). `poc\Run-SupervisorAgentSettingsVmLoop.ps1` asserts the local half against the
+real supervisor binary, including a measurement of the cold start that fails if it comes in under
+5s — because then this diagnosis does not hold on that host.
 
 ## Related
 

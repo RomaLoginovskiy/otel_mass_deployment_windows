@@ -127,6 +127,7 @@ Installs the Coralogix collector, with the OpAMP Supervisor by default. Called b
 | `-Environment` | string | none | Persisted as `CX_ENVIRONMENT`; the config stamps it as `deployment.environment.name`. |
 | `-Application` | string | none | Persisted as `CX_APPLICATION`; the config stamps it as `service.namespace`, which the exporter maps to the application name. Omit for the host-name fallback. |
 | `-ResourceAttributes` | string | machine `OTEL_RESOURCE_ATTRIBUTES` | Attributes injected into the supervisor `AgentDescription` so Fleet Management can target the host. Normally supplied by detection. |
+| `-ConfigApplyTimeout` | string | `30s` | Written to the supervisor config as `agent.config_apply_timeout`. The supervisor's own default is `5s`, which is shorter than this config's cold start — so every apply was reported to Fleet Management as **failed** while it had in fact succeeded. |
 | `-Session` | object | none | An open backup session, so config changes are recorded. Passed by `Install-Agent.ps1`. |
 
 In supervisor mode the collector's configuration is owned **remotely** by Fleet Management; the
