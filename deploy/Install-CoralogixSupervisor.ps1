@@ -85,6 +85,14 @@
   OMIT IT to get the default: the application name falls back to the host's own name
   (host.name). Use it only when several hosts must report under one shared application.
 
+.PARAMETER Team
+  Optional owning team for this host. Persisted as TWO machine env vars with the same
+  value: CX_TEAM (the name this package owns) and TEAM (the bare name software already
+  on these hosts reads). No processor in the shipped base config reads either one - the
+  label is here for a remote Fleet Management config, or the host's own software, to
+  consume as ${env:CX_TEAM}. Both prior values are recorded for uninstall, because TEAM
+  is a generic name that may well have belonged to something else first.
+
 .PARAMETER ConfigApplyTimeout
   How long the OpAMP Supervisor waits for the collector to report healthy after it
   applies a new remote config, written to the supervisor config as
@@ -117,6 +125,9 @@ param(
     # Coralogix application name -> machine env var CX_APPLICATION (read by the base
     # config's transform/appname processor). Unset = fall back to host.name.
     [string] $Application = $null,
+    # Owning team -> machine env vars CX_TEAM and TEAM (same value in both). Read by no
+    # processor in the base config; it exists for remote Fleet config / host software.
+    [string] $Team = $null,
     # How long the supervisor waits for the collector to become healthy after applying a
     # remote config -> the supervisor config's agent.config_apply_timeout. The supervisor
     # defaults to 5s, which this config cannot meet, and a timeout is reported upstream as
@@ -843,6 +854,33 @@ if ($Application) {
     Write-Host "[supervisor] CX_APPLICATION=$Application (machine env set)"
 } else {
     Write-Host "[supervisor] CX_APPLICATION not set - Coralogix application falls back to host.name ($env:COMPUTERNAME)"
+}
+
+# ---- Persist the owning team (CX_TEAM + TEAM) ---------------------------------
+# Two names, one value. CX_TEAM is ours; TEAM is the bare name software already on
+# these hosts reads, and writing it is the whole point of the pair - so it is set even
+# though nothing in this repo consumes it.
+# Both prior values are recorded BEFORE the write. That matters more here than for the
+# CX_* variables: TEAM is a generic name, so on some hosts it already exists and belongs
+# to something else, and uninstall has to put that value back rather than delete it.
+# Overwriting it is still what the operator asked for by passing a team - the point is
+# that it is reversible, and the prior value is printed so the change is visible in the
+# transcript rather than discovered later.
+if ($Team) {
+    foreach ($teamVar in @('CX_TEAM','TEAM')) {
+        $priorTeam = [Environment]::GetEnvironmentVariable($teamVar, 'Machine')
+        if ($Session) {
+            Record-EnvChange -Session $Session -Name $teamVar -PriorValue $priorTeam
+        }
+        [Environment]::SetEnvironmentVariable($teamVar, $Team, 'Machine')
+        if ($priorTeam -and $priorTeam -ne $Team) {
+            Write-Host "[supervisor] $teamVar=$Team (machine env set; replaced prior value '$priorTeam', restored on uninstall)"
+        } else {
+            Write-Host "[supervisor] $teamVar=$Team (machine env set)"
+        }
+    }
+    $env:CX_TEAM = $Team
+    $env:TEAM    = $Team
 }
 
 # ---- Download vendor installer ------------------------------------------------
