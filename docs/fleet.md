@@ -170,6 +170,27 @@ tag *all* of that host's telemetry with the deployment environment, so Coralogix
   rather than clearing one of them, and `doctor.bat` reports `CX_ENVIRONMENT_MISMATCH` if they
   ever disagree.
 
+## Team labelling
+
+Set **`CX_TEAM`** on a host, via `deploy.bat` or `Install-Agent.ps1 -Team <team>`, to record which
+team owns it.
+
+- Persisted by `Install-CoralogixSupervisor.ps1` under **two** machine variables with the same
+  value: `CX_TEAM` and the bare `TEAM`, because software already deployed on these hosts reads the
+  bare name. The prior value of each is recorded, so an uninstall restores a `TEAM` the host owned
+  before the install rather than deleting it.
+- **Env-var only, on purpose.** Nothing in the base config reads either variable, so setting a team
+  changes no attribute on any signal. Consume it from a remote Fleet Management config as
+  `${env:CX_TEAM}` when you want it on telemetry — which keeps the choice of key, and of which
+  pipelines carry it, in the remote config where the rest of your fleet policy lives.
+- Omit the flag on a re-run and the label is inherited rather than dropped: `-Team`, then
+  `CX_TEAM`, then a bare `TEAM` the host already carried, then the persisted `CX_TEAM`. The install
+  transcript names which of those it used — worth reading once per fleet, since the third source is
+  a value nothing in this package set.
+- `doctor.bat` grades the pair, not just its presence: `CX_TEAM_PARTIAL` when only one name is set,
+  `CX_TEAM_MISMATCH` when the two disagree. Neither set at all is `info`, because an unlabelled
+  host loses no telemetry.
+
 ## Application naming
 
 The Coralogix **application** name is resolved per signal by the `coralogix` exporter, which walks
@@ -489,6 +510,27 @@ backslash-doubled the way the section above requires — that rule applies only 
 `non_identifying_attributes`, which the supervisor re-serializes and reparses. These are
 supervisor-side settings that are never re-emitted, and quoting them would be the opposite bug:
 go-yaml has to read `30s` as a duration and `true` as a bool, not as strings.
+
+**Measured.** On a Windows Server 2025 guest (4 vCPU, 8 GB, IIS present), timing from
+`opampsupervisor` reporting Running to the collector's first HTTP 200 on the health endpoint, three
+consecutive cold starts:
+
+| Sample | Cold start to healthy |
+| --- | --- |
+| 1 | 14244 ms |
+| 2 | 13835 ms |
+| 3 | 14050 ms |
+
+So ~14 s against a 5 s default — the apply was reported failed because the supervisor stopped
+waiting, not because anything failed — and ~2x headroom under the 30 s this now sets. If a host ever
+measures under 5 s, the reasoning above does not apply to it and the setting is merely harmless.
+
+One trap worth knowing when reproducing this: on a host **without IIS** the number cannot be
+measured at all, and the way it fails is misleading. The base config's
+`windowsperfcounters/iis_apppool` receiver cannot create `\APP_POOL_WAS(*)\...` counters, that
+component fails to start, the collector shuts itself down, and the supervisor restarts it in a
+loop — so the health endpoint never binds and every symptom points at the config edit instead of at
+the missing role. `poc\Run-SupervisorAgentSettingsVmLoop.ps1` now refuses to run on such a host.
 
 Verifying it locally: `agent.config_apply_timeout: 30s` present exactly once in
 `C:\Program Files\OpenTelemetry OpAMP Supervisor\config.yaml`, the service Running with an

@@ -22,6 +22,8 @@ whole environment-variable block**, so use one mechanism or the other, never bot
 | `CX_DOMAIN` | `-Domain` | Full ingress domain for a private or non-standard endpoint, taken verbatim (scheme and trailing slash stripped). Wins over `CX_REGION`. Never persisted, so its presence unambiguously means "decided for this run". |
 | `CX_ENVIRONMENT` | `-Environment` | Deployment environment label (`prod`, `staging`, …). Stamped on all signals as `deployment.environment.name`, so Coralogix can split the fleet by environment. |
 | `CX_APPLICATION` | `-Application` | Coralogix **application** name for this host. Omit it to let the application name fall back to the host's own name. |
+| `CX_TEAM` | `-Team` | Owning team for this host. Persisted as **two** machine variables with one value: `CX_TEAM` and the bare `TEAM`, the name software already on these hosts reads. Env-var only — no processor in the shipped config reads either, so it stamps nothing on telemetry; a remote Fleet Management config consumes it as `${env:CX_TEAM}`. |
+| `TEAM` | *(none — read, not forwarded)* | Accepted as **input** when neither `-Team` nor `CX_TEAM` is given, and always **written** when a team is set. `Install-Agent.ps1` reads it directly rather than through `deploy.bat`, so the fallback also applies on the arguments path — which is why it is not listed among the variables an argument makes `deploy.bat` discard. A value the host already carried therefore becomes the fleet label; the install transcript names which source it used. |
 | `CX_NO_SUPERVISOR` | `-NoSupervisor` | Install the collector without the OpAMP Supervisor. Changes only the vendor-installer arguments; detection, instrumentation and diagnostics are identical. |
 | `CX_SKIP_INSTRUMENT` | `-SkipInstrument` | Install the collector but leave IIS and Node alone. |
 | `CX_DOTNET_SERVICE_NAMES` | `-DotNetServices` | Comma-separated Windows service names to instrument as .NET services (outside IIS). Nothing is instrumented if neither is given. |
@@ -56,9 +58,11 @@ hand — the next install recomputes them, and a hand-set value shows up as drif
 | `CX_IIS_LOG_DIRS` | `Instrument-IIS.ps1` | Informational summary of every discovered log directory, including any beyond the three slots. Drives `IIS_LOGDIR_SLOTS_EXCEEDED`. |
 
 `Uninstall-Agent.ps1` clears `OTEL_RESOURCE_ATTRIBUTES`, `CORALOGIX_DOMAIN`,
-`CORALOGIX_PRIVATE_KEY`, `CX_ENVIRONMENT`, `CX_APPLICATION`, `CX_IIS_SERVICES`,
+`CORALOGIX_PRIVATE_KEY`, `CX_ENVIRONMENT`, `CX_APPLICATION`, `CX_TEAM`, `CX_IIS_SERVICES`,
 `CX_NODE_SERVICES`, `CX_DOTNET_SERVICES` and `CX_SERVICES`, restoring any value that pre-existed
-the install.
+the install. The bare `TEAM` is reversed **only** through the backup manifest — deleted if the
+install created it, restored if it did not. With no manifest it is left standing, because that
+name may have belonged to the host's own software first.
 
 ### Drift markers
 
@@ -73,6 +77,8 @@ Not variables — finding codes the doctor emits *about* the variables above. Fu
 | `CX_SERVICES_MISSING` / `CX_SERVICES_DRIFT` | The union is unset, or disagrees with its slices. |
 | `CX_ENVIRONMENT_MISSING` | Unset, so this host's telemetry is labelled `unspecified`. |
 | `CX_ENVIRONMENT_MISMATCH` | `CX_ENVIRONMENT` and the `deployment.environment.name` inside `OTEL_RESOURCE_ATTRIBUTES` disagree — one host reporting two environment identities. |
+| `CX_TEAM_MISMATCH` | `CX_TEAM` and `TEAM` hold different values. The install writes both together, so one was edited afterwards and the host's owner depends on which name the reader uses. |
+| `CX_TEAM_PARTIAL` | One of the pair is set and the other is not, so anything reading the missing name sees no team. |
 
 ## Collector runtime variables
 

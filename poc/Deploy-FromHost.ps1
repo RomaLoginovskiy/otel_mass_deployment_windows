@@ -26,6 +26,7 @@ param(
     [string] $Package     = (Join-Path $PSScriptRoot '..\coralogix-agent-deploy.zip'),
     [string] $GuestStage  = 'C:\cx-deploy',
     [string] $Environment = '',   # deployment env (staging/production/...); -> guest CX_ENVIRONMENT -> deploy.bat -Environment
+    [string] $Team        = '',   # owning team; -> guest CX_TEAM -> deploy.bat -Team -> machine CX_TEAM + TEAM
     [string] $TranscriptLog = (Join-Path $PSScriptRoot '..\poc-deploy-fromhost.log')
 )
 
@@ -68,15 +69,16 @@ try {
 
     # 5. Expand + run deploy.bat (the BatchPatch remote command).
     Write-Host "[ctl] expanding + running deploy.bat in guest (collector supervisor install + detect + IIS instr) ..."
-    $out = Invoke-Command -Session $s -ArgumentList $GuestStage, $Environment {
-        param($d, $envName)
+    $out = Invoke-Command -Session $s -ArgumentList $GuestStage, $Environment, $Team {
+        param($d, $envName, $teamName)
         $pkg = Join-Path $d 'pkg'
         if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
         Expand-Archive -Path (Join-Path $d 'coralogix-agent-deploy.zip') -DestinationPath $pkg -Force
         $bat = Join-Path $pkg 'deploy.bat'
-        # deploy.bat forwards CX_ENVIRONMENT as -Environment; set it in this process
-        # so the child cmd.exe inherits it.
-        if ($envName) { $env:CX_ENVIRONMENT = $envName }
+        # deploy.bat forwards CX_ENVIRONMENT as -Environment and CX_TEAM as -Team; set
+        # them in this process so the child cmd.exe inherits them.
+        if ($envName)  { $env:CX_ENVIRONMENT = $envName }
+        if ($teamName) { $env:CX_TEAM = $teamName }
         & cmd.exe /c "`"$bat`""
         "deploy.bat exit=$LASTEXITCODE"
     }
@@ -90,7 +92,11 @@ try {
         $health = try { (Invoke-WebRequest 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 8).StatusCode } catch { 'no' }
         $attrs = [Environment]::GetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES','Machine')
         $cxEnv = [Environment]::GetEnvironmentVariable('CX_ENVIRONMENT','Machine')
-        [pscustomobject]@{ services = ($svc -join '; '); health13133 = $health; otelResourceAttributes = $attrs; cxEnvironment = $cxEnv }
+        # Both team names, separately: the install writes them together, so reporting only
+        # one would hide exactly the half-applied state doctor.bat grades as CX_TEAM_PARTIAL.
+        $cxTeam = [Environment]::GetEnvironmentVariable('CX_TEAM','Machine')
+        $team   = [Environment]::GetEnvironmentVariable('TEAM','Machine')
+        [pscustomobject]@{ services = ($svc -join '; '); health13133 = $health; otelResourceAttributes = $attrs; cxEnvironment = $cxEnv; cxTeam = $cxTeam; team = $team }
     }
     $verify | Format-List | Out-String | Write-Host
 

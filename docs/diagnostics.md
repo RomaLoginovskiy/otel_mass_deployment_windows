@@ -39,7 +39,7 @@ could not determine the answer.
 
 | Check | What it proves |
 | --- | --- |
-| `env` | Machine-scope `CORALOGIX_PRIVATE_KEY` / `CORALOGIX_DOMAIN` / `CX_ENVIRONMENT` / `OTEL_RESOURCE_ATTRIBUTES` / `CX_IIS_SERVICES` |
+| `env` | Machine-scope `CORALOGIX_PRIVATE_KEY` / `CORALOGIX_DOMAIN` / `CX_ENVIRONMENT` / `CX_TEAM` + `TEAM` / `OTEL_RESOURCE_ATTRIBUTES` / `CX_IIS_SERVICES` |
 | `iisServiceName` | Each app's `OTEL_SERVICE_NAME` read back from the pool **or** its `web.config`, and `CX_IIS_SERVICES` compared as a **set** against them |
 | `services` | `opampsupervisor` / `otelcol-contrib` running, plus `StartType` |
 | `health` | The collector health endpoint answers |
