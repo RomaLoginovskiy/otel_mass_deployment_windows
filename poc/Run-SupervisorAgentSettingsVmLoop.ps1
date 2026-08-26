@@ -717,19 +717,40 @@ try {
                 }
                 Set-Content -LiteralPath $cfg -Value $lines -Encoding utf8
                 try { Restart-Service -Name opampsupervisor -Force -ErrorAction Stop } catch { }
-                Start-Sleep -Seconds 10
+                # NOT a fixed 10s. Cold start to healthy measured ~14s on this shape of guest, so a
+                # 10s wait ends while the collector is still coming up and the re-deploy then
+                # reinstalls over a running otelcol-contrib.exe whose binary is locked. Wait for the
+                # agent to actually settle, and report how long it took so the margin is visible.
+                $settle = 0
+                while ($settle -lt 90) {
+                    try {
+                        $r = Invoke-WebRequest -Uri 'http://127.0.0.1:13133' -UseBasicParsing -TimeoutSec 3
+                        if ($r.StatusCode -eq 200) { break }
+                    } catch { }
+                    Start-Sleep -Seconds 2; $settle += 2
+                }
                 [pscustomobject]@{
-                    Rewrote = $n
-                    Status  = [string](Get-Service opampsupervisor -ErrorAction SilentlyContinue).Status
+                    Rewrote       = $n
+                    Status        = [string](Get-Service opampsupervisor -ErrorAction SilentlyContinue).Status
+                    SettleSeconds = $settle
+                    OtelProcs     = @(Get-Process otelcol* -ErrorAction SilentlyContinue).Count
                 } | ConvertTo-Json -Compress
             } -ArgumentList @($SupCfg) -TimeoutSeconds 600
-            Assert-True 'the guest was put back on the 5s default' ([int]$broke.Rewrote -ge 1) "rewrote=$($broke.Rewrote)"
+            Assert-True 'the guest was put back on the 5s default' ([int]$broke.Rewrote -ge 1) "settled after $($broke.SettleSeconds)s, otelcol procs=$($broke.OtelProcs), rewrote=$($broke.Rewrote)"
 
             $re = Invoke-DeployInGuest -Stage $GuestStage -Key $PrivateKey -EnvBlock @{
                 CX_REGION      = $Region
                 CX_ENVIRONMENT = $Environment
             }
             if ($re) {
+                # Print the tail UNCONDITIONALLY on a non-zero exit. Passing it as an assertion
+                # Detail is not enough: Detail only surfaces when THAT assertion fails, so a failing
+                # re-deploy whose neighbouring assertions pass discards the only text that explains
+                # it. That is how this failure survived three runs undiagnosed.
+                if ([int]$re.Code -ne 0) {
+                    Write-Host "  re-deploy exit=$($re.Code); output tail:" -ForegroundColor Yellow
+                    foreach ($ln in (($re.Tail -split ' \| ') | Select-Object -Last 15)) { Write-Host "    $ln" -ForegroundColor DarkYellow }
+                }
                 Assert-Equal 'the re-deploy exited 0' 0 ([int]$re.Code)
                 Assert-True  'the re-deploy was not rolled back' (-not [bool]$re.RolledBack) $re.Tail
                 # Deliberately not asserted as "updated": the vendor installer re-runs on every
@@ -762,6 +783,10 @@ try {
                 CX_ENVIRONMENT = $Environment
             }
             if ($re2) {
+                if ([int]$re2.Code -ne 0) {
+                    Write-Host "  re-deploy exit=$($re2.Code); output tail:" -ForegroundColor Yellow
+                    foreach ($ln in (($re2.Tail -split ' \| ') | Select-Object -Last 15)) { Write-Host "    $ln" -ForegroundColor DarkYellow }
+                }
                 Assert-Equal 'the re-deploy exited 0' 0 ([int]$re2.Code)
                 # Same caveat as S9: if the vendor rewrote config.yaml this reads "added" rather
                 # than "already correct". The idempotency that matters is the file state asserted
