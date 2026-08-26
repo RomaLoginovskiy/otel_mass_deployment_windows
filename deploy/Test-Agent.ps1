@@ -8,7 +8,7 @@
   host:
 
     1. env                machine env vars (CX_IIS_SERVICES, CX_ENVIRONMENT,
-                          CORALOGIX_*, OTEL_RESOURCE_ATTRIBUTES, ...)
+                          CX_TEAM/TEAM, CORALOGIX_*, OTEL_RESOURCE_ATTRIBUTES, ...)
     2. iisServiceName     per-app OTEL_SERVICE_NAME actually readable back from
                           the app pool / web.config, vs what IIS looks like now
     3. services           opampsupervisor / otelcol-contrib + StartType
@@ -330,6 +330,35 @@ if (Use-Check 'env') {
             -Message "not set - all telemetry from this host is labelled 'unspecified'")
     } else {
         Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CX_ENVIRONMENT' -Message $environment)
+    }
+
+    # The owning team, which the install persists under TWO names with one value:
+    # CX_TEAM (ours) and TEAM (the bare name software already on these hosts reads).
+    # Neither is read by any processor in the shipped config, so an absent label is
+    # 'info', not a warning - it costs no telemetry. What IS graded is the pair being
+    # out of step: a host answering 'payments' to one name and 'billing' (or nothing) to
+    # the other has two owners depending on which variable the reader happens to use,
+    # and every install path here writes them together, so drift means something else
+    # edited one of them.
+    $team     = Get-MachineVar 'CX_TEAM'
+    $teamBare = Get-MachineVar 'TEAM'
+    if (-not $team -and -not $teamBare) {
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'info' -Target 'CX_TEAM' `
+            -Message 'not set - this host carries no owning-team label. Re-deploy with -Team <team> (or CX_TEAM) to add one.')
+    } elseif ($team -and $teamBare -and $team -eq $teamBare) {
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'pass' -Target 'CX_TEAM' `
+            -Message "$team (TEAM agrees)" -Data @{ cxTeam = $team; team = $teamBare })
+    } elseif ($team -and $teamBare) {
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_TEAM_MISMATCH' -Target 'CX_TEAM' `
+            -Message "two team identities on one host: CX_TEAM='$team' but TEAM='$teamBare'. The install writes both together, so one was changed afterwards. Re-deploy with -Team to bring them back into step." `
+            -Data @{ cxTeam = $team; team = $teamBare })
+    } else {
+        $present = if ($team) { 'CX_TEAM' } else { 'TEAM' }
+        $absent  = if ($team) { 'TEAM' } else { 'CX_TEAM' }
+        $value   = if ($team) { $team } else { $teamBare }
+        Add-F (New-Finding -Verified 'config' -Check 'env' -Severity 'warn' -Code 'CX_TEAM_PARTIAL' -Target $absent `
+            -Message "$present='$value' but $absent is not set - anything reading the other name sees no team. Re-deploy with -Team '$value' to set both." `
+            -Data @{ cxTeam = $team; team = $teamBare })
     }
 
     $attrs = Get-MachineVar 'OTEL_RESOURCE_ATTRIBUTES'

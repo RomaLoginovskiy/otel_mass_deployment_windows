@@ -27,8 +27,10 @@
   SimpleWebApp site/pool, or any IIS site/pool.
 
   If no manifest is found, it falls back to a conservative removal that only
-  touches installer-owned names (OTEL_*, CORALOGIX_*, CX_ENVIRONMENT, CX_APPLICATION) and the
-  known service names.
+  touches installer-owned names (OTEL_*, CORALOGIX_*, CX_ENVIRONMENT, CX_APPLICATION,
+  CX_TEAM) and the known service names. The bare TEAM the install also writes is left
+  alone on that path - it is a name the host may have owned first, so it is only
+  reversed when a manifest says what it was.
 
 .PARAMETER Purge
   Also delete C:\otel, C:\ProgramData\OpenTelemetry\Collector,
@@ -424,7 +426,14 @@ try {
     }
 
     # -- 3. Machine env vars ----------------------------------------------------
-    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_IIS_SERVICES','CX_NODE_SERVICES','CX_IISNODE_SERVICES','CX_DOTNET_SERVICES','CX_SERVICES')
+    # Names safe to delete on sight, because this package is the only thing that writes
+    # them. The bare TEAM that Install-CoralogixSupervisor.ps1 also sets is NOT in this
+    # list on purpose: it is a generic name that may have belonged to the host's own
+    # software before we overwrote it, and deleting it blind would take that value with
+    # it. It is reversed through the manifest instead (which restores the prior value
+    # when there was one), so a run with no manifest leaves TEAM standing rather than
+    # destroying a variable we cannot prove we created.
+    $envNames = @('OTEL_RESOURCE_ATTRIBUTES','CORALOGIX_DOMAIN','CORALOGIX_PRIVATE_KEY','CX_ENVIRONMENT','CX_APPLICATION','CX_TEAM','CX_IIS_SERVICES','CX_NODE_SERVICES','CX_IISNODE_SERVICES','CX_DOTNET_SERVICES','CX_SERVICES')
     if ($manifest -and $manifest.envVars) {
         foreach ($e in @($manifest.envVars)) {
             if (-not $e) { continue }

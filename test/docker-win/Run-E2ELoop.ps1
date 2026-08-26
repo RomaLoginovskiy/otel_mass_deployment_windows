@@ -26,6 +26,8 @@
     P4  telemetry     spans / logs / metrics actually in Coralogix
     P5  idempotency   a second deploy.bat changes nothing
     P6  environment   the environment label reaches both stores, and stays there
+    P7  team         the team label lands under BOTH names, and a bare TEAM the
+                     host already carried is accepted as input
 
   WHAT IS EXPECTED TO BE IMPERFECT, and is asserted as such rather than hidden:
   the `legacy` (ASP.NET Framework) and `nocfg` (shared pool, no web.config) apps
@@ -626,6 +628,92 @@ if (Use-Case 'P6') {
         Assert-True 'the discarded CX_ENVIRONMENT was not applied' ($b2.Out.Trim() -ne 'must-be-reported') `
             "got '$($b2.Out.Trim())'"
     }
+}
+
+# ---------------------------------------------------------------------------
+# P7. Team label propagation
+# ---------------------------------------------------------------------------
+# The team label is the only deploy input written under TWO names - CX_TEAM (ours) and
+# the bare TEAM, which software already on these hosts reads - and the only one that can
+# legitimately be READ from a variable nothing here set. Both properties are only
+# testable through the real entry point: no unit-level check of the installer can show
+# that deploy.bat forwards CX_TEAM as a flag while deliberately NOT forwarding TEAM,
+# which is what makes the bare name keep working on the arguments path.
+#
+# Every deploy below adds CX_SKIP_INSTRUMENT=1: this phase is about four env vars, and
+# re-instrumenting IIS to prove them would add minutes per case. The env writes happen
+# before the vendor installer is ever reached (same reason P1 asserts its labels outside
+# the MSI branch), so exit codes are not asserted here - only what was persisted.
+if (Use-Case 'P7') {
+    Write-Host ''
+    Write-Host '== P7. team label propagation ==' -ForegroundColor Cyan
+
+    function Get-TeamPair {
+        $a = Invoke-Exec "[Environment]::GetEnvironmentVariable('CX_TEAM','Machine')"
+        $b = Invoke-Exec "[Environment]::GetEnvironmentVariable('TEAM','Machine')"
+        return @{ CxTeam = $a.Out.Trim(); Team = $b.Out.Trim() }
+    }
+    function Clear-TeamPair {
+        param([string[]] $Names = @('CX_TEAM','TEAM'))
+        foreach ($n in $Names) {
+            $null = Invoke-Exec "[Environment]::SetEnvironmentVariable('$n',`$null,'Machine')"
+        }
+    }
+
+    # -- a. CX_TEAM in, both names out ----------------------------------------
+    Clear-TeamPair
+    $t1 = Invoke-Deploy -Env @{ CX_NO_SUPERVISOR = '1'; CX_SKIP_INSTRUMENT = '1'; CX_TEAM = 'payments-e2e' }
+    $p1 = Get-TeamPair
+    Assert-True 'CX_TEAM persisted at machine scope' ($p1.CxTeam -eq 'payments-e2e') "got '$($p1.CxTeam)'"
+    Assert-True 'the bare TEAM was persisted with the same value' ($p1.Team -eq 'payments-e2e') "got '$($p1.Team)'"
+
+    # -- b. a re-run that omits the team must not drop it ----------------------
+    # Same failure shape as the environment label in P6a: the supervisor installer only
+    # writes these variables when a value was passed, so without the inheritance chain in
+    # Install-Agent.ps1 a plain re-deploy would silently leave the host unowned.
+    $null = Invoke-Deploy -Env @{ CX_NO_SUPERVISOR = '1'; CX_SKIP_INSTRUMENT = '1' }
+    $p2 = Get-TeamPair
+    Assert-True 'CX_TEAM survives a re-run that omits it' ($p2.CxTeam -eq 'payments-e2e') "got '$($p2.CxTeam)'"
+    Assert-True 'TEAM survives a re-run that omits it' ($p2.Team -eq 'payments-e2e') "got '$($p2.Team)'"
+
+    # -- c. a bare TEAM the host already carried is accepted as input ----------
+    # Nothing forwards TEAM as a flag; Install-Agent.ps1 reads it out of the environment.
+    # The transcript must name that source, because a fleet-wide label inherited from an
+    # unrelated application is only debuggable if the run says where it came from.
+    Clear-TeamPair
+    $t3 = Invoke-Deploy -Env @{ CX_NO_SUPERVISOR = '1'; CX_SKIP_INSTRUMENT = '1'; TEAM = 'from-host-e2e' }
+    $p3 = Get-TeamPair
+    Assert-True 'a bare TEAM becomes the team when CX_TEAM is absent' ($p3.CxTeam -eq 'from-host-e2e') "CX_TEAM='$($p3.CxTeam)'"
+    Assert-True 'that value is written back to TEAM as well' ($p3.Team -eq 'from-host-e2e') "TEAM='$($p3.Team)'"
+    Assert-Case -Name 'the run names TEAM as the source it used' -Result $t3 `
+        -Expect @("using the host's existing TEAM=from-host-e2e")
+
+    # -- d. arguments given: CX_TEAM is discarded and named, TEAM is not -------
+    # deploy.bat consumes CX_TEAM, so an argument discards it and it must be named. TEAM
+    # is read further down the chain and therefore still in effect - naming it as ignored
+    # would be a lie, and the lookbehind is what makes this assertion mean anything, since
+    # 'CX_TEAM' contains 'TEAM'. No key is forwarded on this path, so the install is not
+    # expected to get far and nothing about the persisted pair is asserted here.
+    $d = Invoke-Deploy -Env @{ CX_TEAM = 'discarded-e2e' } -BatArgs @('-SkipInstrument')
+    Assert-Case -Name 'deploy.bat names CX_TEAM among the variables an argument discards' -Result $d `
+        -Expect @('are IGNORED', 'CX_TEAM')
+    $ignoredLine = ($d.Out -split "`r?`n" | Where-Object { $_ -match 'are IGNORED' }) -join ' '
+    Assert-True 'the bare TEAM is not reported as ignored' `
+        ($ignoredLine -notmatch '(?<![A-Z_])TEAM') "line was: $ignoredLine"
+
+    # -- e. the doctor grades the pair, not just its presence ------------------
+    # One name set and the other not is a real misconfiguration: every install path here
+    # writes them together, so a host in that state answers a different owner depending
+    # on which variable the reader picks.
+    Clear-TeamPair -Names @('CX_TEAM')
+    $dr1 = Invoke-Doctor -DoctorArgs @('-Only', 'env')
+    Assert-Case -Name 'doctor reports CX_TEAM_PARTIAL when only one name is set' -Result $dr1 `
+        -Expect @('CX_TEAM_PARTIAL')
+
+    $null = Invoke-Deploy -Env @{ CX_NO_SUPERVISOR = '1'; CX_SKIP_INSTRUMENT = '1'; CX_TEAM = 'payments-e2e' }
+    $dr2 = Invoke-Doctor -DoctorArgs @('-Only', 'env')
+    Assert-Case -Name 'doctor passes the team check once both names agree' -Result $dr2 `
+        -Expect @('TEAM agrees') -Reject @('CX_TEAM_PARTIAL', 'CX_TEAM_MISMATCH')
 }
 
 # ---------------------------------------------------------------------------
