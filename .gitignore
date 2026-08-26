@@ -100,6 +100,11 @@ test/docker-win/*
 # installer overwrites. A Windows container cannot cover it without iisnode in the image.
 !test/Test-IisnodeInstrumentation.ps1
 
+# Agreement between the supervisor config WRITER and the VM loop's guest-side READERS. Fixture-only,
+# lifts both halves by AST from the shipping files, and is the only thing that catches the two
+# drifting apart - which otherwise surfaces as a red assertion partway through a 40-minute VM run.
+!test/Test-SupervisorVmProbes.ps1
+
 # Offline diagnostics matrix - no keys, no network (Run-DoctorTest.ps1).
 !test/docker-win/Run-DoctorTest.ps1
 !test/docker-win/Dockerfile.doctor

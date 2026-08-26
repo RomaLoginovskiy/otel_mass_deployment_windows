@@ -32,8 +32,9 @@ param(
     [ValidateSet('Unattended','Create','Configure','Start','Stop','Snapshot','Restore','Deploy','Info','Destroy')]
     [string] $Action = 'Info',
     [string] $VmName       = 'cx-fleet-test',
-    [string] $IsoPath      = (Join-Path $PSScriptRoot '..\vm_images\26100.32230.260111-0550.lt_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'),
-    [string] $PackagePath  = (Join-Path $PSScriptRoot '..\coralogix-agent-deploy.zip'),
+    # NOT defaults: see the repair in the body. $PSScriptRoot is empty here under -File.
+    [string] $IsoPath      = $null,
+    [string] $PackagePath  = $null,
     [int]    $MemoryMB     = 4096,
     [int]    $Cpus         = 2,
     [int]    $DiskMB       = 51200,
@@ -47,6 +48,16 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# $PSScriptRoot is EMPTY while a param default is being evaluated under `powershell -File`, so
+# these two cannot be defaults in the param block: every invocation dies with "Cannot bind argument
+# to parameter 'Path' because it is an empty string" before the body runs, whatever -Action was
+# asked for. Same repair as deploy\Install-CoralogixSupervisor.ps1.
+$here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $IsoPath) {
+    $IsoPath = Join-Path $here '..\vm_images\26100.32230.260111-0550.lt_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso'
+}
+if (-not $PackagePath) { $PackagePath = Join-Path $here '..\coralogix-agent-deploy.zip' }
 
 $vbox = Join-Path $env:ProgramFiles 'Oracle\VirtualBox\VBoxManage.exe'
 if (-not (Test-Path $vbox)) { $vbox = 'VBoxManage.exe' }  # rely on PATH
