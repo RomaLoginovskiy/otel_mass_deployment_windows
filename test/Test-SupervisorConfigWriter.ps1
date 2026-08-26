@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-  Unit tests for the OpAMP Supervisor AgentDescription writer in
-  deploy\Install-CoralogixSupervisor.ps1 - the scalar encoder, the value decoder, the
-  canonicalize pass, and the insert/idempotency behaviour.
+  Unit tests for the two OpAMP Supervisor config.yaml writers in
+  deploy\Install-CoralogixSupervisor.ps1: the AgentDescription writer (the scalar encoder, the
+  value decoder, the canonicalize pass, the insert/idempotency behaviour) and the agent-settings
+  writer (agent.config_apply_timeout / agent.passthrough_logs).
 
 .DESCRIPTION
   Fixture-only. Writes throwaway config.yaml files under the user's TEMP, touches no service, no
@@ -55,7 +56,8 @@ if (-not (Test-Path -LiteralPath $installer)) { throw "not found: $installer" }
 # loudly if a function is renamed.
 $wanted = @('ConvertTo-SupervisorAttrScalar','Expand-CxBackslashEscapes','Get-SupervisorAttrValue',
             'Get-SupervisorAttrFirstPass','Test-SupervisorAttrScalarCanonical',
-            'Test-SupervisorAttrScalarNeedsFix','Set-SupervisorDescriptionAttributes')
+            'Test-SupervisorAttrScalarNeedsFix','Set-SupervisorDescriptionAttributes',
+            'Set-SupervisorAgentSettings')
 $ast   = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
 $found = @()
 foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
@@ -101,6 +103,23 @@ function Get-AttrLine {
     $l = @(Get-Content -Path $Path | Where-Object { $_ -match ("^\s*" + [regex]::Escape($Key) + ":") })
     if ($l.Count) { return $l[0].Trim() }
     return ''
+}
+# Raw (untrimmed) lines for a key, anywhere in the file. Untrimmed on purpose: the agent-settings
+# tests are entirely about which INDENT a key was written at, so trimming would erase the thing
+# under test. The count matters too - a duplicate key is a silent config bug.
+function Get-KeyLines {
+    param([string] $Path, [string] $Key)
+    @(Get-Content -Path $Path | Where-Object { $_ -match ("^\s*" + [regex]::Escape($Key) + "\s*:") })
+}
+# Everything from the first line matching $StartPattern to EOF, as one string - so a test can
+# assert a whole subtree came through byte for byte.
+function Get-Subtree {
+    param([string] $Path, [string] $StartPattern)
+    $l = @(Get-Content -Path $Path)
+    $i = 0
+    while ($i -lt $l.Count -and $l[$i] -notmatch $StartPattern) { $i++ }
+    if ($i -ge $l.Count) { return '' }
+    return (($l[$i..($l.Count - 1)]) -join "`n")
 }
 # The invariant: no ATTRIBUTE value may carry a backslash that survives the first parse in
 # non-canonical form. Scoped to the 6-space attribute indent on purpose - agent.executable also
@@ -218,6 +237,155 @@ Assert-Equal 'empty attribute string -> file untouched' $snapshot2 (Get-Content 
 $missingCfg = Join-Path $root 'does-not-exist.yaml'
 Set-SupervisorDescriptionAttributes -ConfigPath $missingCfg -Attributes $hostileAttrs 3>$null
 Assert-True 'missing config -> no file created, no throw' (-not (Test-Path $missingCfg))
+
+Write-Host "`n== agent settings: fresh insert ==" -ForegroundColor Cyan
+# What the installer passes. Ordered, because the insert order below is this order.
+$agentSettings = [ordered]@{
+    'passthrough_logs'     = 'true'
+    'config_apply_timeout' = '30s'
+}
+
+$as = New-Fixture 'agentsettings'
+$asDescBefore = Get-Subtree -Path $as -StartPattern '^\s*description:'
+Set-SupervisorAgentSettings -ConfigPath $as -Settings $agentSettings 3>$null
+Assert-Equal 'passthrough_logs written once, at the direct-child indent, UNQUOTED' `
+    '  passthrough_logs: true' (@(Get-KeyLines $as 'passthrough_logs') -join '|')
+Assert-Equal 'config_apply_timeout written once, at the direct-child indent, UNQUOTED' `
+    '  config_apply_timeout: 30s' (@(Get-KeyLines $as 'config_apply_timeout') -join '|')
+# The indent is READ from the vendor's file, never assumed - so it must equal the sibling's.
+Assert-Equal 'indent matches the sibling agent.executable' `
+    (([regex]::Match((Get-KeyLines $as 'executable')[0], '^\s*')).Value) `
+    (([regex]::Match((Get-KeyLines $as 'passthrough_logs')[0], '^\s*')).Value)
+Assert-True  'agent.executable itself untouched' `
+    ((Get-Content $as -Raw) -match [regex]::Escape('executable: C:\Program Files\OpenTelemetry Collector\otelcol-contrib.exe'))
+Assert-Equal 'the description subtree is byte-identical' $asDescBefore (Get-Subtree -Path $as -StartPattern '^\s*description:')
+
+Write-Host "`n== agent settings: re-run is idempotent ==" -ForegroundColor Cyan
+$asBefore = Get-Content $as -Raw
+Set-SupervisorAgentSettings -ConfigPath $as -Settings $agentSettings 3>$null
+Assert-Equal 'file unchanged on re-run' $asBefore (Get-Content $as -Raw)
+Assert-Equal 'still exactly one passthrough_logs' 1 (@(Get-KeyLines $as 'passthrough_logs')).Count
+Assert-Equal 'still exactly one config_apply_timeout' 1 (@(Get-KeyLines $as 'config_apply_timeout')).Count
+
+Write-Host "`n== agent settings: upgrade a host that already carries the 5s default ==" -ForegroundColor Cyan
+# The path that actually fixes a deployed host. Skip-if-present would leave 5s in place and make
+# the re-deploy a no-op - the same class of bug the canonicalize pass above exists for.
+$as5 = New-Fixture 'agentsettings5s' @'
+agent:
+  executable: C:\Program Files\OpenTelemetry Collector\otelcol-contrib.exe
+  config_apply_timeout: 5s
+  description:
+    non_identifying_attributes:
+      service.name: "coralogix-collector"
+'@
+Set-SupervisorAgentSettings -ConfigPath $as5 -Settings $agentSettings 3>$null
+Assert-Equal 'the 5s line was rewritten in place, not duplicated' `
+    '  config_apply_timeout: 30s' (@(Get-KeyLines $as5 'config_apply_timeout') -join '|')
+Assert-Equal 'and the missing key was added alongside' `
+    '  passthrough_logs: true' (@(Get-KeyLines $as5 'passthrough_logs') -join '|')
+
+Write-Host "`n== agent settings: a nested key of the same name is NOT ours ==" -ForegroundColor Cyan
+# The trap this writer must not fall into. config_apply_timeout under description: is a different
+# key at a different level; matching it would move a vendor value and leave the real
+# agent.config_apply_timeout unset while still reporting success.
+$asNest = New-Fixture 'agentsettingsnested' @'
+agent:
+  executable: C:\Program Files\OpenTelemetry Collector\otelcol-contrib.exe
+  description:
+    non_identifying_attributes:
+      service.name: "coralogix-collector"
+      config_apply_timeout: 5s
+'@
+Set-SupervisorAgentSettings -ConfigPath $asNest -Settings $agentSettings 3>$null
+Assert-True  'the nested 5s value is left exactly as it was' `
+    ((Get-KeyLines $asNest 'config_apply_timeout') -contains '      config_apply_timeout: 5s')
+Assert-True  'and ours was still added at the agent level' `
+    ((Get-KeyLines $asNest 'config_apply_timeout') -contains '  config_apply_timeout: 30s')
+Assert-Equal 'so the key appears at two distinct levels, deliberately' 2 (@(Get-KeyLines $asNest 'config_apply_timeout')).Count
+
+Write-Host "`n== agent settings: the child indent is READ, not assumed ==" -ForegroundColor Cyan
+# These are the tests that catch a broken indent derivation. The vendor's real file happens to use
+# two spaces, which is also the fallback - so a writer that never derives anything still passes
+# every assertion above. A four-space file does not let that slide.
+$asWide = New-Fixture 'agentsettingswide' @'
+agent:
+    executable: C:\Program Files\OpenTelemetry Collector\otelcol-contrib.exe
+    description:
+        non_identifying_attributes:
+            service.name: "coralogix-collector"
+'@
+Set-SupervisorAgentSettings -ConfigPath $asWide -Settings $agentSettings 3>$null
+Assert-Equal 'four-space file: keys written at four spaces' `
+    '    config_apply_timeout: 30s' (@(Get-KeyLines $asWide 'config_apply_timeout') -join '|')
+Assert-Equal 'four-space file: indent still matches the sibling executable' `
+    (([regex]::Match((Get-KeyLines $asWide 'executable')[0], '^\s*')).Value) `
+    (([regex]::Match((Get-KeyLines $asWide 'passthrough_logs')[0], '^\s*')).Value)
+
+# A comment is not a child: its indentation says nothing about the mapping's.
+$asComment = New-Fixture 'agentsettingscomment' @'
+agent:
+        # written by the vendor installer - do not edit
+  executable: C:\Program Files\OpenTelemetry Collector\otelcol-contrib.exe
+  description:
+    non_identifying_attributes:
+      service.name: "coralogix-collector"
+'@
+Set-SupervisorAgentSettings -ConfigPath $asComment -Settings $agentSettings 3>$null
+Assert-Equal 'a deeper-indented comment does not define the child indent' `
+    '  config_apply_timeout: 30s' (@(Get-KeyLines $asComment 'config_apply_timeout') -join '|')
+
+# An empty mapping has no child to learn from, so the fallback applies - and the result still has
+# to be a valid document, with the following top-level key untouched.
+$asEmptyBlock = New-Fixture 'agentsettingsemptyblock' @'
+agent:
+server:
+  endpoint: wss://example/opamp/v1
+'@
+Set-SupervisorAgentSettings -ConfigPath $asEmptyBlock -Settings $agentSettings 3>$null
+Assert-Equal 'childless agent: falls back to agent-indent + 2' `
+    '  config_apply_timeout: 30s' (@(Get-KeyLines $asEmptyBlock 'config_apply_timeout') -join '|')
+Assert-True  'and the next top-level key is still at column 0' `
+    ((Get-Content $asEmptyBlock) -contains 'server:')
+
+Write-Host "`n== agent settings: best-effort contract ==" -ForegroundColor Cyan
+$noAgent = New-Fixture 'noagent' "server:`n  endpoint: wss://example/opamp/v1`n"
+$noAgentSnap = Get-Content $noAgent -Raw
+Set-SupervisorAgentSettings -ConfigPath $noAgent -Settings $agentSettings 3>$null
+Assert-Equal 'no agent: block -> file untouched' $noAgentSnap (Get-Content $noAgent -Raw)
+
+# An inline flow mapping is a vendor template we do not recognise. Splicing lines into it would
+# produce a document that parses as something else entirely, so refuse rather than guess.
+$flowAgent = New-Fixture 'flowagent' "agent: {}`n"
+$flowSnap = Get-Content $flowAgent -Raw
+Set-SupervisorAgentSettings -ConfigPath $flowAgent -Settings $agentSettings 3>$null
+Assert-Equal 'agent: {} -> file untouched' $flowSnap (Get-Content $flowAgent -Raw)
+
+$asMissing = Join-Path $root 'agent-does-not-exist.yaml'
+Set-SupervisorAgentSettings -ConfigPath $asMissing -Settings $agentSettings 3>$null
+Assert-True 'missing config -> no file created, no throw' (-not (Test-Path $asMissing))
+
+$asEmpty = New-Fixture 'agentsettingsempty'
+$asEmptySnap = Get-Content $asEmpty -Raw
+Set-SupervisorAgentSettings -ConfigPath $asEmpty -Settings ([ordered]@{}) 3>$null
+Assert-Equal 'no settings -> file untouched' $asEmptySnap (Get-Content $asEmpty -Raw)
+
+Write-Host "`n== both writers over one file do not corrupt each other ==" -ForegroundColor Cyan
+$both = New-Fixture 'both'
+Set-SupervisorDescriptionAttributes -ConfigPath $both -Attributes $hostileAttrs 3>$null
+Set-SupervisorAgentSettings -ConfigPath $both -Settings $agentSettings 3>$null
+Assert-Equal 'attributes still canonical after the settings write' 0 (Get-NonCanonicalLines $both).Count
+Assert-Equal 'PM2_HOME still canonical' "workload.pm2.home: 'C:\\ProgramData\\pm2'" (Get-AttrLine $both 'workload.pm2.home')
+Assert-Equal 'agent settings present' '  config_apply_timeout: 30s' (@(Get-KeyLines $both 'config_apply_timeout') -join '|')
+
+# Reverse order too: the description writer must walk past the settings lines without disturbing
+# them, and its own anchor scan must not mistake them for attributes.
+$both2 = New-Fixture 'both2'
+Set-SupervisorAgentSettings -ConfigPath $both2 -Settings $agentSettings 3>$null
+Set-SupervisorDescriptionAttributes -ConfigPath $both2 -Attributes $hostileAttrs 3>$null
+Assert-Equal 'settings survive a later attribute write' '  passthrough_logs: true' (@(Get-KeyLines $both2 'passthrough_logs') -join '|')
+Assert-Equal 'and the attributes landed' "workload.pm2.owner: 'NT AUTHORITY\\LocalService'" (Get-AttrLine $both2 'workload.pm2.owner')
+Assert-True  'vendor service.name untouched by either writer' `
+    ((Get-AttrLine $both2 'service.name') -ceq 'service.name: "coralogix-collector"')
 
 Write-Host ''
 Write-Host ("{0} passed, {1} failed" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

@@ -85,6 +85,15 @@
   OMIT IT to get the default: the application name falls back to the host's own name
   (host.name). Use it only when several hosts must report under one shared application.
 
+.PARAMETER ConfigApplyTimeout
+  How long the OpAMP Supervisor waits for the collector to report healthy after it
+  applies a new remote config, written to the supervisor config as
+  agent.config_apply_timeout. The supervisor's own default is 5s; this base config is
+  large enough that the collector routinely needs longer than that on Windows, and on
+  timeout the supervisor reports RemoteConfigStatus = FAILED to Coralogix Fleet
+  Management - so the console showed the config as failed to apply while it had in fact
+  applied and telemetry was flowing. Default: 30s.
+
 .NOTES
   Run elevated (Administrator). The base config uses file_storage, so this script
   passes -EnableDynamicIISParsing to the vendor installer (otherwise the service
@@ -108,6 +117,11 @@ param(
     # Coralogix application name -> machine env var CX_APPLICATION (read by the base
     # config's transform/appname processor). Unset = fall back to host.name.
     [string] $Application = $null,
+    # How long the supervisor waits for the collector to become healthy after applying a
+    # remote config -> the supervisor config's agent.config_apply_timeout. The supervisor
+    # defaults to 5s, which this config cannot meet, and a timeout is reported upstream as
+    # a FAILED config apply.
+    [string] $ConfigApplyTimeout = '30s',
     # Comma-separated key=value selector attributes (cx.host.role, workload.*) to publish
     # in the OpAMP AgentDescription. Defaults to machine OTEL_RESOURCE_ATTRIBUTES (set by
     # Detect-Workloads.ps1) when omitted.
@@ -353,10 +367,123 @@ function Set-SupervisorDescriptionAttributes {
     Write-Host "[supervisor] published selector attributes to AgentDescription ($($insert.Count) added, $($fixed.Count) canonicalized): $($added -join ', ')"
 }
 
+function Set-SupervisorAgentSettings {
+    <#
+      Set the supervisor-side settings that live as DIRECT children of the config's `agent:`
+      mapping - config_apply_timeout and passthrough_logs.
+
+      WHY. agent.config_apply_timeout defaults to 5s: after the supervisor applies a new remote
+      config it waits that long for the collector to report healthy, and on timeout it reports
+      RemoteConfigStatus = FAILED upstream. This base config is large enough (four pipelines,
+      dynamic IIS parsing) that the collector routinely needs longer than 5s on Windows - which is
+      why the installer sleeps 6 seconds before its own health probe. The result was a FALSE RED:
+      Coralogix Fleet Management showed the remote config as failed to apply while it had applied
+      and telemetry was flowing. agent.passthrough_logs routes the collector's own stdout/stderr
+      through the supervisor, so when an apply really does fail there is something on the host that
+      says why instead of nothing at all.
+
+      THESE VALUES DELIBERATELY DO NOT GO THROUGH ConvertTo-SupervisorAttrScalar. That encoder
+      exists because the supervisor re-serializes agent.description.non_identifying_attributes into
+      the config text it composes for the collector and parses it AGAIN, so one level of backslash
+      escaping is consumed per pass (see its docblock for the measured matrix). These two keys are
+      supervisor-side settings that are never re-emitted, and neither value contains a backslash.
+      Quoting them would be a bug in the other direction: go-yaml has to read `30s` as a duration
+      and `true` as a bool, not as strings.
+
+      Matching is scoped to keys at EXACTLY the direct-child indent of `agent:`. That is what keeps
+      `description:` and everything nested under it out of scope - including a key that happens to
+      share a name with one of ours.
+
+      Best-effort, the same contract as the description writer: a vendor template we do not
+      recognise is a warning and no write, never a failed install.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $ConfigPath,
+        $Settings
+    )
+
+    if (-not $Settings -or $Settings.Count -eq 0) { return }
+    if (-not (Test-Path $ConfigPath)) {
+        Write-Warning "[supervisor] supervisor config not found at $ConfigPath; cannot set agent settings"
+        return
+    }
+
+    # @() matters: Get-Content on a one-line file returns a STRING, and the splice below would
+    # then index characters instead of lines.
+    $lines  = @(Get-Content -Path $ConfigPath)
+    $anchor = -1; $agentIndent = ''
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^(\s*)agent:\s*$') { $anchor = $i; $agentIndent = $Matches[1]; break }
+    }
+    if ($anchor -lt 0) {
+        # Also the `agent: {}` case: an inline flow mapping does not match, and rewriting one
+        # blind would be a guess at the vendor's intent.
+        Write-Warning "[supervisor] no 'agent:' block found in $ConfigPath (vendor template changed?); skipping agent settings"
+        return
+    }
+
+    # Find where the block ends and what indent its direct children use. The indent is READ from
+    # the file rather than assumed to be two spaces - this is the vendor's file, not ours.
+    $childIndent = $null
+    $end = $lines.Count
+    for ($j = $anchor + 1; $j -lt $lines.Count; $j++) {
+        if ($lines[$j] -match '^\s*$')  { continue }
+        if ($lines[$j] -match '^\s*#')  { continue }
+        # A positive match, deliberately: -notmatch DOES populate $Matches when the pattern
+        # matches, but depending on that reads like a bug even when it is not.
+        if ($lines[$j] -match '^(\s+)\S') {
+            $ind = $Matches[1]
+            if ($ind.Length -le $agentIndent.Length) { $end = $j; break }
+            if (-not $childIndent) { $childIndent = $ind }
+        } else {
+            $end = $j; break            # a line at column 0 ends the block
+        }
+    }
+    if (-not $childIndent) { $childIndent = $agentIndent + '  ' }
+
+    $insert = @(); $added = @(); $updated = @()
+    foreach ($k in @($Settings.Keys)) {
+        $want  = [string]$Settings[$k]
+        # Anchored at the exact child indent, so a key nested deeper (under description:) or a
+        # longer key that merely starts with the same text cannot match.
+        $keyRe = '^' + [regex]::Escape($childIndent) + [regex]::Escape($k) + '\s*:\s*(.*?)\s*$'
+        $hit = -1; $have = $null
+        for ($j = $anchor + 1; $j -lt $end; $j++) {
+            if ($lines[$j] -match $keyRe) { $hit = $j; $have = $Matches[1]; break }
+        }
+        if ($hit -ge 0) {
+            if (([string]$have) -ceq $want) { continue }
+            $lines[$hit] = "{0}{1}: {2}" -f $childIndent, $k, $want
+            $updated += $k
+            continue
+        }
+        $insert += ("{0}{1}: {2}" -f $childIndent, $k, $want)
+        $added  += $k
+    }
+
+    if ($insert.Count -eq 0 -and $updated.Count -eq 0) {
+        Write-Host "[supervisor] agent settings already correct: $(@($Settings.Keys) -join ', ')"
+        return
+    }
+
+    $new = @($lines[0..$anchor]) + $insert
+    if (($anchor + 1) -le ($lines.Count - 1)) { $new += $lines[($anchor + 1)..($lines.Count - 1)] }
+    Set-Content -Path $ConfigPath -Value $new -Encoding utf8
+
+    $what = @()
+    if ($added.Count)   { $what += ("added "   + ($added   -join ', ')) }
+    if ($updated.Count) { $what += ("updated " + ($updated -join ', ')) }
+    Write-Host "[supervisor] agent settings written to $($ConfigPath | Split-Path -Leaf): $($what -join '; ')"
+}
+
 function Publish-SupervisorAgentDescription {
     <#
-      Inject the selector attributes into the supervisor's config.yaml and leave the service
-      RUNNING - or leave the config as it was.
+      Apply BOTH of our edits to the supervisor's config.yaml - the selector attributes and the
+      agent settings - and leave the service RUNNING, or leave the config as it was.
+
+      The two writers share one window on purpose. A single verified restart proves that go-yaml
+      accepted both edits, and the single .pre-agentdesc copy rolls both back together. Restarting
+      twice would double the time the agent is off the air for no extra information.
 
       This is a function rather than inline install steps for one reason: it is the only
       place in the deploy that can take a working agent off the air, and the rollback branch
@@ -368,10 +495,15 @@ function Publish-SupervisorAgentDescription {
 
       Returns a result object ($_.Applied / $_.RolledBack / $_.Reason) so a caller - or the
       VM loop - can assert on the outcome instead of parsing host output.
+
+      -Attributes may legitimately be empty (no OTEL_RESOURCE_ATTRIBUTES on this host): the
+      description writer warns and returns without writing, and the agent settings are still
+      applied and still restarted. They are independent edits that happen to share a window.
     #>
     param(
         [Parameter(Mandatory)] [string] $ConfigPath,
-        [string] $Attributes
+        [string] $Attributes,
+        $AgentSettings
     )
 
     $result = [pscustomobject]@{ Applied = $false; RolledBack = $false; Reason = $null; ServiceRunning = $false }
@@ -383,6 +515,7 @@ function Publish-SupervisorAgentDescription {
     if (Test-Path $ConfigPath) { Copy-Item $ConfigPath $preEditCopy -Force -ErrorAction SilentlyContinue }
 
     Set-SupervisorDescriptionAttributes -ConfigPath $ConfigPath -Attributes $Attributes
+    Set-SupervisorAgentSettings -ConfigPath $ConfigPath -Settings $AgentSettings
 
     try {
         if (-not (Get-Service -Name 'opampsupervisor' -ErrorAction SilentlyContinue)) {
@@ -406,20 +539,20 @@ function Publish-SupervisorAgentDescription {
         # hand. A config we just wrote that the supervisor will not load is our bug, so roll it
         # back rather than leave the host with no agent.
         if (Restart-SupervisorVerified) {
-            Write-Host "[supervisor] restarted opampsupervisor and confirmed Running (AgentDescription attributes applied)"
+            Write-Host "[supervisor] restarted opampsupervisor and confirmed Running (AgentDescription attributes and agent settings applied)"
             Remove-Item $preEditCopy -Force -ErrorAction SilentlyContinue
             $result.Applied = $true; $result.ServiceRunning = $true
             return $result
         }
 
         $result.Reason = Get-SupervisorStartError
-        Write-Warning "[supervisor] opampsupervisor did not start after the AgentDescription edit$(if ($result.Reason) { ": $($result.Reason)" })"
+        Write-Warning "[supervisor] opampsupervisor did not start after the config.yaml edit$(if ($result.Reason) { ": $($result.Reason)" })"
         if (Test-Path $preEditCopy) {
             Copy-Item $preEditCopy $ConfigPath -Force
             $result.RolledBack = $true
             if (Restart-SupervisorVerified) {
                 $result.ServiceRunning = $true
-                Write-Warning "[supervisor] rolled back $ConfigPath to the pre-edit copy; service is running WITHOUT the selector attributes (Fleet Management grouping by cx.host.role/workload.* will not work on this host)"
+                Write-Warning "[supervisor] rolled back $ConfigPath to the pre-edit copy; service is running WITHOUT the selector attributes (no Fleet Management grouping by cx.host.role/workload.*) and WITHOUT the agent settings (Fleet Management will keep reporting this host's config as failed to apply)"
             } else {
                 Write-Warning "[supervisor] rollback did not start the service either - the failure predates our edit. Inspect: Get-EventLog -LogName Application -Source opampsupervisor -Newest 20"
             }
@@ -762,13 +895,27 @@ if ($NoSupervisor) {
         }
     } catch { Write-Warning "[collector] could not configure otelcol-contrib: $_" }
 } else {
-    # ---- Publish selector attributes to the OpAMP AgentDescription ----------------
-    # The vendor installer writes only static service.name/cx.agent.type into the supervisor
-    # config's agent.description. Inject the detected cx.host.role/workload.* so Coralogix
-    # Fleet Management can group / assign config by them, then restart to apply.
+    # ---- Patch the supervisor's own config.yaml ------------------------------------
+    # Two independent edits, one restart:
+    #
+    #   * The vendor installer writes only static service.name/cx.agent.type into the
+    #     supervisor config's agent.description. Inject the detected cx.host.role/workload.*
+    #     so Coralogix Fleet Management can group / assign config by them.
+    #   * agent.config_apply_timeout / agent.passthrough_logs. The supervisor's 5s default is
+    #     shorter than this config's startup, so every apply was reported upstream as FAILED
+    #     while it had in fact succeeded; passthrough_logs is what makes a genuine failure
+    #     diagnosable on the host instead of invisible.
+    #
+    # passthrough_logs is not configurable: there is no host on which swallowing the
+    # collector's own logs is the better outcome.
     $supervisorConfig = Join-Path ${env:ProgramFiles} 'OpenTelemetry OpAMP Supervisor\config.yaml'
     if ($Session) { Backup-DeployFile -Session $Session -Path $supervisorConfig | Out-Null }
-    Publish-SupervisorAgentDescription -ConfigPath $supervisorConfig -Attributes $ResourceAttributes | Out-Null
+    $agentSettings = [ordered]@{
+        'passthrough_logs'     = 'true'
+        'config_apply_timeout' = $ConfigApplyTimeout
+    }
+    Publish-SupervisorAgentDescription -ConfigPath $supervisorConfig `
+        -Attributes $ResourceAttributes -AgentSettings $agentSettings | Out-Null
 }
 
 # ---- Verify -------------------------------------------------------------------
