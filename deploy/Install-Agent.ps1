@@ -43,6 +43,15 @@
   Optional Coralogix application name for this host (machine env var CX_APPLICATION).
   Omit it to let the application name fall back to the host's own name (host.name).
 
+.PARAMETER Team
+  Optional owning team for this host. Persisted as TWO machine env vars, CX_TEAM and
+  TEAM - the bare name because software already deployed on these hosts reads it.
+  When omitted, the value is taken from CX_TEAM in the environment, then from a bare
+  TEAM (a value the host already carried), then from a persisted machine CX_TEAM, so a
+  re-run without the flag keeps the label rather than dropping it.
+  Nothing in the shipped collector config reads either variable - the label exists for
+  a remote Fleet Management config, or the host's own software, to consume.
+
 .PARAMETER NoSupervisor
   Install the collector WITHOUT the OpAMP Supervisor, i.e. as the plain
   'otelcol-contrib' Windows service reading a local config.
@@ -70,6 +79,10 @@ param(
     [string] $PrivateKey        = $null,
     [string] $Environment       = $null,
     [string] $Application       = $null,
+    # Owning team -> machine env vars CX_TEAM and TEAM. Also readable from either of
+    # those variables (see the fallback chain below), so a host that already carries a
+    # bare TEAM does not need the flag threaded through deploy.bat.
+    [string] $Team              = $null,
     [switch] $NoSupervisor,
     [switch] $SkipInstrument,
     # Comma-separated .NET Windows services (outside IIS) to instrument, e.g. 'cxworkersvc,billing'.
@@ -156,6 +169,28 @@ try {
         }
     }
 
+    # Owning team. Four sources, most explicit first, and the source is always named in
+    # the log: unlike -Environment this label can come from a variable NOBODY here set
+    # (a bare TEAM the host's own software carries), and a fleet-wide label that turns
+    # out to have been inherited from an unrelated app is only debuggable if the
+    # transcript says where it came from. The persisted machine read is last and is not
+    # redundant with $env:CX_TEAM - a shell started before the first install has no
+    # CX_TEAM in its own environment block while the machine value is set.
+    if (-not $Team) {
+        if ($env:CX_TEAM) {
+            $Team = $env:CX_TEAM
+            Write-Host "[agent] -Team not given; using CX_TEAM=$Team from the environment"
+        } elseif ($env:TEAM) {
+            $Team = $env:TEAM
+            Write-Host "[agent] -Team and CX_TEAM not given; using the host's existing TEAM=$Team"
+        } else {
+            $Team = [Environment]::GetEnvironmentVariable('CX_TEAM', 'Machine')
+            if ($Team) {
+                Write-Host "[agent] -Team not given; inheriting persisted CX_TEAM=$Team"
+            }
+        }
+    }
+
     $extra = @{}
     if ($Environment) { $extra['deployment.environment.name'] = $Environment }
     $roles = & (Join-Path $here 'Detect-Workloads.ps1') -SetEnv $true -ExtraAttributes $extra -Session $session
@@ -192,6 +227,10 @@ try {
     # Persist CX_APPLICATION (machine) so transform/appname stamps service.namespace.
     # Unset = the transform is skipped and the exporter falls back to host.name.
     if ($Application) { $supArgs['Application'] = $Application }
+    # Persist CX_TEAM + TEAM (machine) as the host's ownership label. Deliberately NOT
+    # added to $extra above: the label is env-var-only by design, so it changes no
+    # resource attribute and no shipped processor reads it.
+    if ($Team) { $supArgs['Team'] = $Team }
     # Publish the detected selector attributes in the OpAMP AgentDescription (Fleet Mgmt).
     if ($roles.OtelResourceAttributes) { $supArgs['ResourceAttributes'] = $roles.OtelResourceAttributes }
     $supArgs['Session'] = $session

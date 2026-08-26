@@ -13,6 +13,7 @@ REM  Run by hand instead of through BatchPatch? Every Install-Agent.ps1 flag can
 REM  passed straight through:
 REM      deploy.bat -Domain eu2.coralogix.com -KeyFile C:\secrets\SendDataKey.txt
 REM      deploy.bat -Region eu2 -Environment staging
+REM      deploy.bat -Team payments
 REM  Arguments and the environment variables below are EXCLUSIVE: typing any argument
 REM  skips the env-var block entirely (see the note above the block for why).
 REM
@@ -22,6 +23,18 @@ REM  command:
 REM      set CX_ENVIRONMENT=staging && set CORALOGIX_PRIVATE_KEY=cxtp_xxx && deploy.bat
 REM  CX_ENVIRONMENT labels this host's telemetry (production/staging/dev/...) so
 REM  Coralogix can split it by environment in Infra Explorer.
+REM
+REM      set CX_TEAM=payments && deploy.bat       label the owning team
+REM  The owning team for this host. The install persists it as TWO machine env vars,
+REM  CX_TEAM and TEAM - the second because software already on these hosts reads that
+REM  bare name. Nothing in the shipped collector config reads either variable: this is
+REM  a host-level label for a remote Fleet Management config (or the host's own
+REM  software) to consume as ${env:CX_TEAM}, which is why no telemetry attribute
+REM  changes just because it is set.
+REM  A bare TEAM already present on the host is also accepted as INPUT when neither
+REM  -Team nor CX_TEAM is given - see Install-Agent.ps1, which reads it directly rather
+REM  than through this file (same "read it, do not flag it" pattern as
+REM  CX_RUNTIME_OVERRIDES_JSON) so the fallback also works on the arguments path below.
 REM
 REM      set CX_REGION=eu2 && deploy.bat          ship to the eu2 account
 REM  Coralogix region code (eu1/eu2/us1/us2/us3/ap1/ap2/ap3). It becomes the collector's
@@ -126,6 +139,11 @@ if defined CORALOGIX_PRIVATE_KEY set ARGS=%ARGS% -PrivateKey "%CORALOGIX_PRIVATE
 if defined CX_REGION set ARGS=%ARGS% -Region "%CX_REGION%"
 if defined CX_DOMAIN set ARGS=%ARGS% -Domain "%CX_DOMAIN%"
 if defined CX_ENVIRONMENT set ARGS=%ARGS% -Environment "%CX_ENVIRONMENT%"
+REM Only CX_TEAM is forwarded as a flag. A bare TEAM is read straight out of the
+REM environment by Install-Agent.ps1 instead, so it still applies when arguments were
+REM typed and this whole block was skipped - and so that forwarding it can never
+REM collide with an explicit -Team on the command line.
+if defined CX_TEAM set ARGS=%ARGS% -Team "%CX_TEAM%"
 if defined CX_NO_SUPERVISOR set ARGS=%ARGS% -NoSupervisor
 if defined CX_SKIP_INSTRUMENT set ARGS=%ARGS% -SkipInstrument
 goto :runargs
@@ -139,6 +157,10 @@ if defined CORALOGIX_PRIVATE_KEY set "IGNORED=%IGNORED% CORALOGIX_PRIVATE_KEY"
 if defined CX_REGION set "IGNORED=%IGNORED% CX_REGION"
 if defined CX_DOMAIN set "IGNORED=%IGNORED% CX_DOMAIN"
 if defined CX_ENVIRONMENT set "IGNORED=%IGNORED% CX_ENVIRONMENT"
+REM CX_TEAM is consumed by the block above, so it IS discarded here and must be named.
+REM TEAM deliberately is not: Install-Agent.ps1 reads it directly, so it is still in
+REM effect on this path and naming it as ignored would be a lie.
+if defined CX_TEAM set "IGNORED=%IGNORED% CX_TEAM"
 if defined CX_NO_SUPERVISOR set "IGNORED=%IGNORED% CX_NO_SUPERVISOR"
 if defined CX_SKIP_INSTRUMENT set "IGNORED=%IGNORED% CX_SKIP_INSTRUMENT"
 if defined IGNORED echo WARNING: command-line arguments were given, so these environment variables are IGNORED:%IGNORED% 1>&2
