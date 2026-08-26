@@ -282,9 +282,16 @@ try {
     Write-PhaseHeader 'S0' 'transport and guest baseline'
     Assert-True 'VBoxManage present' ((VBoxSoft --version) -match '^\d')
     [void](Initialize-VmLoop -VmName $VmName -User $User -Password $Password -GuestStage $GuestStage)
-    Assert-True "VM '$VmName' is registered" (Test-VmExists)
+    # Bail before the long wait, not after it. Wait-GuestReady polls for 20 minutes; against a VM
+    # that is not registered or would not start, every one of those polls is guaranteed to fail, so
+    # a mistyped -VmName used to buy 20 minutes of silence before the loop said anything useful.
+    $exists = Test-VmExists
+    Assert-True "VM '$VmName' is registered" $exists
+    if (-not $exists) { throw "no VM named '$VmName' - check the name against: VBoxManage list vms" }
     if (-not (Test-VmRunning)) { [void](Start-VmHeadless) }
-    Assert-True "VM '$VmName' is running" (Test-VmRunning)
+    $running = Test-VmRunning
+    Assert-True "VM '$VmName' is running" $running
+    if (-not $running) { throw "'$VmName' would not start - nothing else can be asserted" }
 
     $ready = Wait-GuestReady -TimeoutSeconds 1200
     Assert-True 'guestcontrol reaches the guest' $ready 'Guest Additions not answering, or wrong -User/-Password'
