@@ -809,7 +809,11 @@ try {
     # ---- S11 : reboot survival -------------------------------------------------
     if (Want 'S11') {
         Write-PhaseHeader 'S11' 'the settings and the service survive a reboot'
-        Assert-True 'guest came back from the reboot' (Restart-Guest -ReadyTimeoutSeconds 1200)
+        # 2400s, not 1200. Measured on this guest: a reboot took 24.4 MINUTES to restore the
+        # guestcontrol transport, so 1200 expired while the guest was still coming back and S11
+        # failed for a reason that has nothing to do with the settings it is meant to check - then
+        # aborted the loop, so S12 never ran either.
+        Assert-True 'guest came back from the reboot' (Restart-Guest -ReadyTimeoutSeconds 2400)
         # Poll rather than sleeping a fixed interval: the supervisor is delayed-auto-start, so it
         # legitimately appears well after the guest answers.
         $up = Invoke-GuestJson -Script {
