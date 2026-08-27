@@ -6,7 +6,7 @@ Step-by-step guide for **`install-supervisor-by-apptype.sh`**.
 
 This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector** so you can manage collector configuration **remotely from Fleet Management**. Fleet Management owns the live config via `/var/lib/opampsupervisor/effective.yaml`.
 
-**What changed vs `install-supervisor-default.sh`:** credentials and endpoints are **scoped by `APP_TYPE`**. You only pass the env vars for that role (e.g. Postgres-only hosts need Postgres vars; Redis-only hosts need Redis vars). The script does **not** fail if unrelated DB env vars are omitted.
+**What changed vs `../install-supervisor-default.sh`:** credentials and endpoints are **scoped by `APP_TYPE`**. You only pass the env vars for that role (e.g. Postgres-only hosts need Postgres vars; Redis-only hosts need Redis vars). The script does **not** fail if unrelated DB env vars are omitted.
 
 ---
 
@@ -21,12 +21,12 @@ This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector*
 | 5 | Patches `/etc/opampsupervisor/config.yaml` so those env vars are passed into the collector child (`agent.env`) |
 | 6 | Restarts `opampsupervisor` and checks it is active |
 
-**Why credentials are needed:** when you later Activate a remote config that includes Redis / Valkey / PostgreSQL / Elasticsearch receivers, the collector needs the matching endpoint/password env vars. Without them the collector crash-loops and you see no metrics on `:8888`.
+**Why credentials are needed:** when you later Activate a remote config that includes Redis / Valkey / PostgreSQL / Elasticsearch receivers, the collector needs the matching endpoint/username/password env vars. Without them the collector crash-loops and you see no metrics on `:8888`.
 
 **What it does not do:**
 
 - Does not install Redis / Valkey / PostgreSQL / Elasticsearch
-- Does not push a full local `config.yaml` as base config (Fleet remote config is the goal)
+- Does not push the full mixed `../config.yaml` as base config (Fleet remote config is the goal)
 - Does not require every DB env var on every host — only those for the chosen `APP_TYPE`
 
 ---
@@ -165,12 +165,14 @@ sudo env \
   APP_TYPE="elasticsearch" \
   ENV_TYPE="prod" \
   ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+  ELASTICSEARCH_USERNAME="elastic" \
+  ELASTICSEARCH_PASSWORD="<elasticsearch_password>" \
   ./install-supervisor-by-apptype.sh
 ```
 
 #### Mixed / all databases on one host (`APP_TYPE=databases`)
 
-Requires Postgres password plus the other endpoints (same idea as the older default installer):
+Requires Postgres password plus the other endpoints (same idea as `../install-supervisor-default.sh`):
 
 ```bash
 sudo env \
@@ -185,8 +187,12 @@ sudo env \
   REDIS_ENDPOINT="localhost:6379" \
   VALKEY_ENDPOINT="localhost:6380" \
   ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+  ELASTICSEARCH_USERNAME="" \
+  ELASTICSEARCH_PASSWORD="" \
   ./install-supervisor-by-apptype.sh
 ```
+
+For `APP_TYPE=databases`, Elasticsearch username/password are optional and may stay empty for an unauthenticated endpoint.
 
 ### Step 4 — Verify the Supervisor locally
 
@@ -230,7 +236,7 @@ If the agent does not appear within a few minutes:
     - Valkey → `redis_valkey.yaml`
     - PostgreSQL → `postgress.yaml`
     - Elasticsearch → `elasticsearch.yaml`
-    - Mixed → `config.yaml`
+    - Mixed → `../config.yaml`
 5. Use **Preview → Agent list** and confirm only the intended hosts match
 6. **Activate** the configuration
 7. On the agent, ensure **Remote configuration** is enabled
@@ -282,10 +288,10 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | `postgresql` | `POSTGRES_OTEL_PASSWORD` (required); `POSTGRES_ENDPOINT`, `POSTGRES_OTEL_USER`, `POSTGRES_OTEL_DATABASE` (optional, have defaults) |
 | `redis` | `REDIS_ENDPOINT` (default `localhost:6379`); `REDIS_PASSWORD` (optional, may be empty) |
 | `valkey` | `VALKEY_ENDPOINT` (default `localhost:6380`); `VALKEY_PASSWORD` (optional, may be empty) |
-| `elasticsearch` | `ELASTICSEARCH_ENDPOINT` (default `http://localhost:9200`) |
-| `databases` | All of the above; `POSTGRES_OTEL_PASSWORD` required |
+| `elasticsearch` | `ELASTICSEARCH_USERNAME`, `ELASTICSEARCH_PASSWORD` (required); `ELASTICSEARCH_ENDPOINT` (default `http://localhost:9200`) |
+| `databases` | All endpoints and credentials above; `POSTGRES_OTEL_PASSWORD` required; Elasticsearch username/password optional and may be empty |
 
-### Receiver endpoint defaults (when that APP_TYPE uses them)
+### Receiver defaults (when that APP_TYPE uses them)
 
 | Variable | Default |
 | --- | --- |
@@ -297,6 +303,8 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | `POSTGRES_OTEL_USER` | `otel_monitor` |
 | `POSTGRES_OTEL_DATABASE` | `appdb` |
 | `ELASTICSEARCH_ENDPOINT` | `http://localhost:9200` |
+| `ELASTICSEARCH_USERNAME` | empty unless `APP_TYPE=elasticsearch` (then required) |
+| `ELASTICSEARCH_PASSWORD` | empty unless `APP_TYPE=elasticsearch` (then required) |
 
 ---
 
@@ -316,7 +324,7 @@ Example:
 | Valkey nodes | `valkey` | `prod` | `linux-valkey-prod` | `redis_valkey.yaml` |
 | Postgres nodes | `postgresql` | `prod` | `linux-postgres-prod` | `postgress.yaml` |
 | Elasticsearch nodes | `elasticsearch` | `prod` | `linux-es-prod` | `elasticsearch.yaml` |
-| Mixed DB host | `databases` | `prod` | `linux-databases-prod` | `config.yaml` |
+| Mixed DB host | `databases` | `prod` | `linux-databases-prod` | `../config.yaml` |
 
 ---
 
@@ -327,6 +335,7 @@ Example:
 | `/usr/bin/env: ‘bash\r’: No such file or directory` | Windows CRLF line endings | `sed -i 's/\r$//' ./install-supervisor-by-apptype.sh` then re-run |
 | `CORALOGIX_PRIVATE_KEY: Set CORALOGIX_PRIVATE_KEY` under sudo | `sudo` dropped env | Use `sudo env VAR=... ./install-supervisor-by-apptype.sh` |
 | `POSTGRES_OTEL_PASSWORD is required when APP_TYPE=postgresql` | Password not passed for that role | Include `POSTGRES_OTEL_PASSWORD=...` for `postgresql` / `databases` |
+| `ELASTICSEARCH_USERNAME is required when APP_TYPE=elasticsearch` or matching password error | Elasticsearch credentials not passed for that role | Include non-empty `ELASTICSEARCH_USERNAME` and `ELASTICSEARCH_PASSWORD` |
 | Agent not in Fleet Management | Wrong domain/key/network | Check OpAMP endpoint + supervisor log for connect/auth errors |
 | `missing password` / collector exit code 1 | Credentials not passed to collector, or remote YAML expects a DB this host did not configure | Re-run with the correct `APP_TYPE` vars; Activate a YAML that matches that role |
 | `journald` / `_SYSTEMD_UNIT` error | Remote YAML includes `journald` on a host that rejects it | Use role YAML without `journald` (e.g. updated `redis.yaml`) |
@@ -351,10 +360,10 @@ curl -s http://127.0.0.1:8888/metrics | head -30
 | File | Purpose |
 | --- | --- |
 | `install-supervisor-by-apptype.sh` | **This** installer (APP_TYPE-scoped credentials) |
-| `install-supervisor-default.sh` | Older installer that expects all DB env vars together |
+| `../install-supervisor-default.sh` | Default installer that expects all DB env vars together |
 | `redis.yaml` / `redis_valkey.yaml` / `postgress.yaml` / `elasticsearch.yaml` | Role-specific remote configs to Activate in Fleet |
-| `config.yaml` | Mixed metrics/logs remote config |
-| `install-otel-collector.sh` | Alternate path: Supervisor + local `config.yaml` base config |
+| `../config.yaml` | Mixed metrics/logs remote config |
+| `install-otel-collector.sh` | Alternate path: Supervisor + local `../config.yaml` base config |
 
 ---
 

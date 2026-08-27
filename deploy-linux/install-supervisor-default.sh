@@ -18,7 +18,7 @@
 #   sudo env \
 #     CORALOGIX_PRIVATE_KEY="<key>" \
 #     CORALOGIX_DOMAIN="app.coralogix.in" \
-#     APP_TYPE="postgresql" ENV_TYPE="prod" \
+#     APP_TYPE="databases" ENV_TYPE="prod" \
 #     POSTGRES_OTEL_PASSWORD="<password>" \
 #     POSTGRES_OTEL_USER="otel_monitor" \
 #     POSTGRES_OTEL_DATABASE="appdb" \
@@ -26,6 +26,8 @@
 #     REDIS_ENDPOINT="localhost:6379" \
 #     VALKEY_ENDPOINT="localhost:6380" \
 #     ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+#     ELASTICSEARCH_USERNAME="" \
+#     ELASTICSEARCH_PASSWORD="" \
 #     ./install-supervisor-default.sh
 #
 set -euo pipefail
@@ -52,6 +54,21 @@ ENV_TYPE="${ENV_TYPE:-databases}"
 : "${POSTGRES_OTEL_USER:=otel_monitor}"
 : "${POSTGRES_OTEL_DATABASE:=appdb}"
 : "${ELASTICSEARCH_ENDPOINT:=http://localhost:9200}"
+: "${ELASTICSEARCH_USERNAME:=}"
+: "${ELASTICSEARCH_PASSWORD:=}"
+
+require_pair_or_empty() {
+  local first_name="$1"
+  local second_name="$2"
+
+  if [[ (-n "${!first_name:-}" && -z "${!second_name:-}") ||
+        (-z "${!first_name:-}" && -n "${!second_name:-}") ]]; then
+    echo "ERROR: ${first_name} and ${second_name} must both be empty or both be non-empty." >&2
+    exit 1
+  fi
+}
+
+require_pair_or_empty ELASTICSEARCH_USERNAME ELASTICSEARCH_PASSWORD
 
 # Strip accidental protocol / trailing slash
 CORALOGIX_DOMAIN="${CORALOGIX_DOMAIN#https://}"
@@ -64,6 +81,44 @@ SUPERVISOR_ENV="/etc/opampsupervisor/opampsupervisor.conf"
 CRED_MARKER_BEGIN="# BEGIN install-supervisor-default credentials"
 CRED_MARKER_END="# END install-supervisor-default credentials"
 
+systemd_env_entry() {
+  local key="$1"
+  local value="$2"
+
+  # Unix environment variables cannot contain NUL; reject line delimiters here.
+  if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+    echo "ERROR: ${key} contains CR/LF and cannot be stored in an EnvironmentFile." >&2
+    return 1
+  fi
+
+  # In systemd double quotes, backslash escapes \, ", $, and `.
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '%s="%s"\n' "${key}" "${value}"
+}
+
+MANAGED_KEYS=(
+  APP_TYPE
+  ENV_TYPE
+  REDIS_ENDPOINT
+  REDIS_PASSWORD
+  VALKEY_ENDPOINT
+  VALKEY_PASSWORD
+  POSTGRES_ENDPOINT
+  POSTGRES_OTEL_USER
+  POSTGRES_OTEL_PASSWORD
+  POSTGRES_OTEL_DATABASE
+  ELASTICSEARCH_ENDPOINT
+  ELASTICSEARCH_USERNAME
+  ELASTICSEARCH_PASSWORD
+)
+SYSTEMD_ENV_ENTRIES=()
+for key in "${MANAGED_KEYS[@]}"; do
+  SYSTEMD_ENV_ENTRIES+=("$(systemd_env_entry "${key}" "${!key}")")
+done
+
 echo "==> Installing Coralogix OTel Collector in Supervisor mode (installer defaults, no base config)"
 echo "    Domain  : ${CORALOGIX_DOMAIN}"
 echo "    app.type: ${APP_TYPE}"
@@ -71,7 +126,11 @@ echo "    env.type: ${ENV_TYPE}"
 echo "    Postgres: ${POSTGRES_ENDPOINT} user=${POSTGRES_OTEL_USER} db=${POSTGRES_OTEL_DATABASE}"
 echo "    Redis   : ${REDIS_ENDPOINT}"
 echo "    Valkey  : ${VALKEY_ENDPOINT}"
-echo "    ES      : ${ELASTICSEARCH_ENDPOINT}"
+if [[ -n "${ELASTICSEARCH_PASSWORD}" ]]; then
+  echo "    ES      : ${ELASTICSEARCH_ENDPOINT} user=${ELASTICSEARCH_USERNAME} password=******"
+else
+  echo "    ES      : ${ELASTICSEARCH_ENDPOINT} user=${ELASTICSEARCH_USERNAME} password=<empty>"
+fi
 
 CORALOGIX_PRIVATE_KEY="${CORALOGIX_PRIVATE_KEY}" \
 CORALOGIX_DOMAIN="${CORALOGIX_DOMAIN}" \
@@ -87,47 +146,34 @@ fi
 # Persist credentials for systemd / supervisor
 # -----------------------------------------------------------------------------
 echo "==> Writing receiver credentials to ${SUPERVISOR_ENV}"
-touch "${SUPERVISOR_ENV}"
-# Drop our previous block (and any loose duplicates of these keys)
-if grep -q "${CRED_MARKER_BEGIN}" "${SUPERVISOR_ENV}" 2>/dev/null; then
-  awk -v start="${CRED_MARKER_BEGIN}" -v end="${CRED_MARKER_END}" '
-    $0 == start {skip=1; next}
-    $0 == end {skip=0; next}
-    !skip {print}
-  ' "${SUPERVISOR_ENV}" >"${SUPERVISOR_ENV}.tmp"
-  mv "${SUPERVISOR_ENV}.tmp" "${SUPERVISOR_ENV}"
-fi
-sed -i \
-  -e '/^APP_TYPE=/d' \
-  -e '/^ENV_TYPE=/d' \
-  -e '/^REDIS_ENDPOINT=/d' \
-  -e '/^REDIS_PASSWORD=/d' \
-  -e '/^VALKEY_ENDPOINT=/d' \
-  -e '/^VALKEY_PASSWORD=/d' \
-  -e '/^POSTGRES_ENDPOINT=/d' \
-  -e '/^POSTGRES_OTEL_USER=/d' \
-  -e '/^POSTGRES_OTEL_PASSWORD=/d' \
-  -e '/^POSTGRES_OTEL_DATABASE=/d' \
-  -e '/^ELASTICSEARCH_ENDPOINT=/d' \
-  "${SUPERVISOR_ENV}"
+(
+  umask 077
+  touch "${SUPERVISOR_ENV}"
+  chmod 0600 "${SUPERVISOR_ENV}"
+  # Drop our previous block (and any loose duplicates of these keys)
+  if grep -q "${CRED_MARKER_BEGIN}" "${SUPERVISOR_ENV}" 2>/dev/null; then
+    rewrite_tmp="$(mktemp "${SUPERVISOR_ENV}.tmp.XXXXXX")"
+    trap 'rm -f -- "${rewrite_tmp}"' EXIT
+    awk -v start="${CRED_MARKER_BEGIN}" -v end="${CRED_MARKER_END}" '
+      $0 == start {skip=1; next}
+      $0 == end {skip=0; next}
+      !skip {print}
+    ' "${SUPERVISOR_ENV}" >"${rewrite_tmp}"
+    mv "${rewrite_tmp}" "${SUPERVISOR_ENV}"
+    trap - EXIT
+  fi
+  for key in "${MANAGED_KEYS[@]}"; do
+    sed -i -e "/^${key}=/d" "${SUPERVISOR_ENV}"
+  done
 
-{
-  echo ""
-  echo "${CRED_MARKER_BEGIN}"
-  echo "APP_TYPE=${APP_TYPE}"
-  echo "ENV_TYPE=${ENV_TYPE}"
-  echo "REDIS_ENDPOINT=${REDIS_ENDPOINT}"
-  echo "REDIS_PASSWORD=${REDIS_PASSWORD}"
-  echo "VALKEY_ENDPOINT=${VALKEY_ENDPOINT}"
-  echo "VALKEY_PASSWORD=${VALKEY_PASSWORD}"
-  echo "POSTGRES_ENDPOINT=${POSTGRES_ENDPOINT}"
-  echo "POSTGRES_OTEL_USER=${POSTGRES_OTEL_USER}"
-  echo "POSTGRES_OTEL_PASSWORD=${POSTGRES_OTEL_PASSWORD}"
-  echo "POSTGRES_OTEL_DATABASE=${POSTGRES_OTEL_DATABASE}"
-  echo "ELASTICSEARCH_ENDPOINT=${ELASTICSEARCH_ENDPOINT}"
-  echo "${CRED_MARKER_END}"
-} >>"${SUPERVISOR_ENV}"
-chmod 0600 "${SUPERVISOR_ENV}"
+  {
+    echo ""
+    echo "${CRED_MARKER_BEGIN}"
+    printf '%s\n' "${SYSTEMD_ENV_ENTRIES[@]}"
+    echo "${CRED_MARKER_END}"
+  } >>"${SUPERVISOR_ENV}"
+  chmod 0600 "${SUPERVISOR_ENV}"
+)
 
 # -----------------------------------------------------------------------------
 # Patch supervisor config: Fleet attrs + pass env vars into collector child
@@ -172,6 +218,8 @@ PASS_THROUGH = [
     "POSTGRES_OTEL_PASSWORD",
     "POSTGRES_OTEL_DATABASE",
     "ELASTICSEARCH_ENDPOINT",
+    "ELASTICSEARCH_USERNAME",
+    "ELASTICSEARCH_PASSWORD",
 ]
 
 def upsert_agent_env(text: str, key: str) -> str:

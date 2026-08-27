@@ -236,31 +236,13 @@ processors:
       - delete_key(resource.attributes, "net.host.name")
       - delete_key(resource.attributes, "net.host.port")
 receivers:
-  redis:
-    endpoint: ${env:REDIS_ENDPOINT:-localhost:6379}
-    password: ${env:REDIS_PASSWORD:-}
+  elasticsearch:
+    endpoint: ${env:ELASTICSEARCH_ENDPOINT:-http://localhost:9200}
+    username: ${env:ELASTICSEARCH_USERNAME:-}
+    password: ${env:ELASTICSEARCH_PASSWORD:-}
     collection_interval: 15s
-    transport: tcp
-  # redis/valkey:
-  #   endpoint: ${env:VALKEY_ENDPOINT:-localhost:6380}
-  #   password: ${env:VALKEY_PASSWORD:-}
-  #   collection_interval: 15s
-  #   transport: tcp
-  # postgresql:
-  #   endpoint: ${env:POSTGRES_ENDPOINT:-localhost:5432}
-  #   transport: tcp
-  #   username: ${env:POSTGRES_OTEL_USER:-otel_monitor}
-  #   password: ${env:POSTGRES_OTEL_PASSWORD}
-  #   databases:
-  #     - ${env:POSTGRES_OTEL_DATABASE:-appdb}
-  #   collection_interval: 15s
-  #   tls:
-  #     insecure: true
-  # elasticsearch:
-  #   endpoint: ${env:ELASTICSEARCH_ENDPOINT:-http://localhost:9200}
-  #   collection_interval: 15s
-  #   nodes: ["_all"]
-  #   skip_cluster_metrics: false
+    nodes: ["_all"]
+    skip_cluster_metrics: false
   hostmetrics:
     collection_interval: 10s
     root_path: /
@@ -325,9 +307,6 @@ receivers:
         mute_process_exe_error: true
         mute_process_name_error: true
         mute_process_user_error: true
-  # journald removed: on some Ubuntu hosts otelcol 0.155.0 fails to start with
-  #   'journalctl _SYSTEMD_UNIT' is not a valid Systemd field name
-  # Re-add only after verifying: journalctl --version && id (needs journal read access)
   otlp:
     protocols:
       grpc:
@@ -398,7 +377,7 @@ service:
       - transform/reduce
       - batch
       receivers:
-      - redis
+      - elasticsearch
   telemetry:
     logs:
       encoding: json

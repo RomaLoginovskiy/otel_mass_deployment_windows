@@ -28,7 +28,7 @@ flowchart LR
 | `poc/` | VirtualBox harness to validate the package on a throwaway Windows Server 2025 VM before fleet rollout. |
 | `SimpleWebApp/` | A minimal ASP.NET Core 8 app (with a SQL Server call) used as an instrumentation target for testing. |
 | `scripts/` | Single-host / test helpers: `deploy-app.ps1` (build + zero-code instrument `SimpleWebApp` on IIS in one pass), `generate-load.ps1` (emit test traffic). See [`scripts/README.md`](scripts/README.md). |
-| `deploy-linux/` | **Linux** path: OpAMP Supervisor install for Linux DB hosts (Redis/Valkey/PostgreSQL/Elasticsearch), managed via Fleet Management. See [`deploy-linux/README.md`](deploy-linux/README.md). |
+| `deploy-linux/` | **Linux** path: combined/default install at folder root; individual APP_TYPE-scoped install and per-role configs under [`deploy-linux/templates/`](deploy-linux/templates/README.md). |
 
 ## Two paths
 
@@ -85,12 +85,16 @@ For Linux DB servers (Redis, Valkey, PostgreSQL, Elasticsearch), follow
 Coralogix **OpAMP Supervisor + OTel Collector** so config is owned remotely by
 Fleet Management — same pattern as the Windows fleet path.
 
+Use root `deploy-linux/` files for combined/default installs. For individual
+roles, use [`deploy-linux/templates/install-supervisor-by-apptype.sh`](deploy-linux/templates/install-supervisor-by-apptype.sh)
+with matching per-role config; see [`deploy-linux/templates/README.md`](deploy-linux/templates/README.md).
+
 ```bash
-# Copy the installer to the host, then run it with Fleet labels + DB credentials:
+# Run the combined/default installer with Fleet labels + DB credentials:
 sudo env \
   CORALOGIX_PRIVATE_KEY="<send-your-data-key>" \
   CORALOGIX_DOMAIN="<region-domain>" \
-  APP_TYPE="postgresql" \
+  APP_TYPE="databases" \
   ENV_TYPE="prod" \
   POSTGRES_OTEL_PASSWORD="<otel_monitor_password>" \
   ./install-supervisor-default.sh
@@ -100,7 +104,7 @@ sudo env \
 ```
 
 The Supervisor tags each agent with `app.type` / `env.type` for Fleet grouping;
-`deploy-linux/config.yaml` is a metrics/logs starting point to Activate
+`deploy-linux/config.yaml` is the mixed metrics/logs starting point to Activate
 remotely. Full env-var reference, verification steps, and troubleshooting live in
 that folder's README.
 
