@@ -6,7 +6,7 @@ Step-by-step guide for **`install-supervisor-by-apptype.sh`**.
 
 This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector** so you can manage collector configuration **remotely from Fleet Management**. Fleet Management owns the live config via `/var/lib/opampsupervisor/effective.yaml`.
 
-**What changed vs `install-supervisor-default.sh`:** credentials and endpoints are **scoped by `APP_TYPE`**. You only pass the env vars for that role (e.g. Postgres-only hosts need Postgres vars; Redis-only hosts need Redis vars). The script does **not** fail if unrelated DB env vars are omitted.
+**What changed vs `../install-supervisor-default.sh`:** credentials and endpoints are **scoped by `APP_TYPE`**. You only pass the env vars for that role (e.g. Postgres-only hosts need Postgres vars; Redis-only hosts need Redis vars). The script does **not** fail if unrelated DB env vars are omitted.
 
 ---
 
@@ -26,7 +26,7 @@ This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector*
 **What it does not do:**
 
 - Does not install Redis / Valkey / PostgreSQL / Elasticsearch
-- Does not push a full local `config.yaml` as base config (Fleet remote config is the goal)
+- Does not push the full mixed `../config.yaml` as base config (Fleet remote config is the goal)
 - Does not require every DB env var on every host — only those for the chosen `APP_TYPE`
 
 ---
@@ -172,7 +172,7 @@ sudo env \
 
 #### Mixed / all databases on one host (`APP_TYPE=databases`)
 
-Requires Postgres password plus the other endpoints (same idea as the older default installer):
+Requires Postgres password plus the other endpoints (same idea as `../install-supervisor-default.sh`):
 
 ```bash
 sudo env \
@@ -236,7 +236,7 @@ If the agent does not appear within a few minutes:
     - Valkey → `redis_valkey.yaml`
     - PostgreSQL → `postgress.yaml`
     - Elasticsearch → `elasticsearch.yaml`
-    - Mixed → `config.yaml`
+    - Mixed → `../config.yaml`
 5. Use **Preview → Agent list** and confirm only the intended hosts match
 6. **Activate** the configuration
 7. On the agent, ensure **Remote configuration** is enabled
@@ -324,7 +324,7 @@ Example:
 | Valkey nodes | `valkey` | `prod` | `linux-valkey-prod` | `redis_valkey.yaml` |
 | Postgres nodes | `postgresql` | `prod` | `linux-postgres-prod` | `postgress.yaml` |
 | Elasticsearch nodes | `elasticsearch` | `prod` | `linux-es-prod` | `elasticsearch.yaml` |
-| Mixed DB host | `databases` | `prod` | `linux-databases-prod` | `config.yaml` |
+| Mixed DB host | `databases` | `prod` | `linux-databases-prod` | `../config.yaml` |
 
 ---
 
@@ -360,10 +360,10 @@ curl -s http://127.0.0.1:8888/metrics | head -30
 | File | Purpose |
 | --- | --- |
 | `install-supervisor-by-apptype.sh` | **This** installer (APP_TYPE-scoped credentials) |
-| `install-supervisor-default.sh` | Older installer that expects all DB env vars together |
+| `../install-supervisor-default.sh` | Default installer that expects all DB env vars together |
 | `redis.yaml` / `redis_valkey.yaml` / `postgress.yaml` / `elasticsearch.yaml` | Role-specific remote configs to Activate in Fleet |
-| `config.yaml` | Mixed metrics/logs remote config |
-| `install-otel-collector.sh` | Alternate path: Supervisor + local `config.yaml` base config |
+| `../config.yaml` | Mixed metrics/logs remote config |
+| `install-otel-collector.sh` | Alternate path: Supervisor + local `../config.yaml` base config |
 
 ---
 
