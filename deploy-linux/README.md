@@ -20,7 +20,7 @@ This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector*
 | 5 | Patches `/etc/opampsupervisor/config.yaml` so those env vars are passed into the collector child (`agent.env`) |
 | 6 | Restarts `opampsupervisor` and checks it is active |
 
-**Why credentials are needed:** when you later Activate a remote config that includes Redis / Valkey / PostgreSQL / Elasticsearch receivers (for example this repo’s `config.yaml`), the collector needs `POSTGRES_OTEL_PASSWORD` and related endpoints. Without them the collector crash-loops and you see no metrics on `:8888`.
+**Why credentials are needed:** when you later Activate a remote config that includes Redis / Valkey / PostgreSQL / Elasticsearch receivers (for example this repo’s `config.yaml`), the collector needs `POSTGRES_OTEL_PASSWORD`, related endpoints, and optional Elasticsearch credentials. Without matching values the collector crash-loops or cannot authenticate, and you see no database metrics.
 
 **What it does not do:**
 
@@ -114,7 +114,7 @@ Defaults if unset: both `databases`.
 sudo env \
   CORALOGIX_PRIVATE_KEY="<your-send-your-data-key>" \
   CORALOGIX_DOMAIN="app.coralogix.in" \
-  APP_TYPE="postgresql" \
+  APP_TYPE="databases" \
   ENV_TYPE="prod" \
   POSTGRES_OTEL_PASSWORD="<otel_monitor_password>" \
   POSTGRES_OTEL_USER="otel_monitor" \
@@ -123,8 +123,12 @@ sudo env \
   REDIS_ENDPOINT="localhost:6379" \
   VALKEY_ENDPOINT="localhost:6380" \
   ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+  ELASTICSEARCH_USERNAME="" \
+  ELASTICSEARCH_PASSWORD="" \
   ./install-supervisor-default.sh
 ```
+
+Set `ELASTICSEARCH_USERNAME` and `ELASTICSEARCH_PASSWORD` to non-empty values when Elasticsearch requires authentication. Leave both empty for an unauthenticated endpoint.
 
 ### Step 4 — Verify the Supervisor locally
 
@@ -213,7 +217,7 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | `APP_TYPE` | `databases` | `app.type` |
 | `ENV_TYPE` | `databases` | `env.type` |
 
-### Receiver endpoints (optional overrides)
+### Receiver settings (optional overrides)
 
 | Variable | Default |
 | --- | --- |
@@ -225,6 +229,8 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | `POSTGRES_OTEL_USER` | `otel_monitor` |
 | `POSTGRES_OTEL_DATABASE` | `appdb` |
 | `ELASTICSEARCH_ENDPOINT` | `http://localhost:9200` |
+| `ELASTICSEARCH_USERNAME` | empty |
+| `ELASTICSEARCH_PASSWORD` | empty |
 
 ---
 
@@ -253,6 +259,7 @@ Example:
 | `CORALOGIX_PRIVATE_KEY: Set CORALOGIX_PRIVATE_KEY` under sudo | `sudo` dropped env | Use `sudo env VAR=... ./install-supervisor-default.sh` |
 | Agent not in Fleet Management | Wrong domain/key/network | Check OpAMP endpoint + supervisor log for connect/auth errors |
 | `missing password` / collector exit code 1 | Credentials not passed to collector | Re-run script with `POSTGRES_OTEL_PASSWORD` |
+| Elasticsearch authentication error | Elasticsearch credentials missing or invalid | Re-run with matching `ELASTICSEARCH_USERNAME` and `ELASTICSEARCH_PASSWORD`; leave both empty only for unauthenticated Elasticsearch |
 | `effective.yaml` empty / `AllowNoPipelines` | No remote config Activated | Create + Activate a Configuration; enable Remote configuration |
 | `:8888/metrics` empty | Collector not running pipelines | Fix credentials + Activate remote config; confirm collector child stays up |
 | Metrics missing in UI but local `:8888` works | Exporter/domain/key issue in remote YAML | Align `domain` and key in the Activated config with your account |

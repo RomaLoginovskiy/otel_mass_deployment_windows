@@ -21,7 +21,7 @@ This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector*
 | 5 | Patches `/etc/opampsupervisor/config.yaml` so those env vars are passed into the collector child (`agent.env`) |
 | 6 | Restarts `opampsupervisor` and checks it is active |
 
-**Why credentials are needed:** when you later Activate a remote config that includes Redis / Valkey / PostgreSQL / Elasticsearch receivers, the collector needs the matching endpoint/password env vars. Without them the collector crash-loops and you see no metrics on `:8888`.
+**Why credentials are needed:** when you later Activate a remote config that includes Redis / Valkey / PostgreSQL / Elasticsearch receivers, the collector needs the matching endpoint/username/password env vars. Without them the collector crash-loops and you see no metrics on `:8888`.
 
 **What it does not do:**
 
@@ -165,6 +165,8 @@ sudo env \
   APP_TYPE="elasticsearch" \
   ENV_TYPE="prod" \
   ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+  ELASTICSEARCH_USERNAME="elastic" \
+  ELASTICSEARCH_PASSWORD="<elasticsearch_password>" \
   ./install-supervisor-by-apptype.sh
 ```
 
@@ -185,8 +187,12 @@ sudo env \
   REDIS_ENDPOINT="localhost:6379" \
   VALKEY_ENDPOINT="localhost:6380" \
   ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+  ELASTICSEARCH_USERNAME="" \
+  ELASTICSEARCH_PASSWORD="" \
   ./install-supervisor-by-apptype.sh
 ```
+
+For `APP_TYPE=databases`, Elasticsearch username/password are optional and may stay empty for an unauthenticated endpoint.
 
 ### Step 4 — Verify the Supervisor locally
 
@@ -282,10 +288,10 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | `postgresql` | `POSTGRES_OTEL_PASSWORD` (required); `POSTGRES_ENDPOINT`, `POSTGRES_OTEL_USER`, `POSTGRES_OTEL_DATABASE` (optional, have defaults) |
 | `redis` | `REDIS_ENDPOINT` (default `localhost:6379`); `REDIS_PASSWORD` (optional, may be empty) |
 | `valkey` | `VALKEY_ENDPOINT` (default `localhost:6380`); `VALKEY_PASSWORD` (optional, may be empty) |
-| `elasticsearch` | `ELASTICSEARCH_ENDPOINT` (default `http://localhost:9200`) |
-| `databases` | All of the above; `POSTGRES_OTEL_PASSWORD` required |
+| `elasticsearch` | `ELASTICSEARCH_USERNAME`, `ELASTICSEARCH_PASSWORD` (required); `ELASTICSEARCH_ENDPOINT` (default `http://localhost:9200`) |
+| `databases` | All endpoints and credentials above; `POSTGRES_OTEL_PASSWORD` required; Elasticsearch username/password optional and may be empty |
 
-### Receiver endpoint defaults (when that APP_TYPE uses them)
+### Receiver defaults (when that APP_TYPE uses them)
 
 | Variable | Default |
 | --- | --- |
@@ -297,6 +303,8 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | `POSTGRES_OTEL_USER` | `otel_monitor` |
 | `POSTGRES_OTEL_DATABASE` | `appdb` |
 | `ELASTICSEARCH_ENDPOINT` | `http://localhost:9200` |
+| `ELASTICSEARCH_USERNAME` | empty unless `APP_TYPE=elasticsearch` (then required) |
+| `ELASTICSEARCH_PASSWORD` | empty unless `APP_TYPE=elasticsearch` (then required) |
 
 ---
 
@@ -327,6 +335,7 @@ Example:
 | `/usr/bin/env: ‘bash\r’: No such file or directory` | Windows CRLF line endings | `sed -i 's/\r$//' ./install-supervisor-by-apptype.sh` then re-run |
 | `CORALOGIX_PRIVATE_KEY: Set CORALOGIX_PRIVATE_KEY` under sudo | `sudo` dropped env | Use `sudo env VAR=... ./install-supervisor-by-apptype.sh` |
 | `POSTGRES_OTEL_PASSWORD is required when APP_TYPE=postgresql` | Password not passed for that role | Include `POSTGRES_OTEL_PASSWORD=...` for `postgresql` / `databases` |
+| `ELASTICSEARCH_USERNAME is required when APP_TYPE=elasticsearch` or matching password error | Elasticsearch credentials not passed for that role | Include non-empty `ELASTICSEARCH_USERNAME` and `ELASTICSEARCH_PASSWORD` |
 | Agent not in Fleet Management | Wrong domain/key/network | Check OpAMP endpoint + supervisor log for connect/auth errors |
 | `missing password` / collector exit code 1 | Credentials not passed to collector, or remote YAML expects a DB this host did not configure | Re-run with the correct `APP_TYPE` vars; Activate a YAML that matches that role |
 | `journald` / `_SYSTEMD_UNIT` error | Remote YAML includes `journald` on a host that rejects it | Use role YAML without `journald` (e.g. updated `redis.yaml`) |

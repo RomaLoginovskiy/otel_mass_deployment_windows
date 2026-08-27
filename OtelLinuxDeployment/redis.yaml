@@ -258,6 +258,8 @@ receivers:
   #     insecure: true
   # elasticsearch:
   #   endpoint: ${env:ELASTICSEARCH_ENDPOINT:-http://localhost:9200}
+  #   username: ${env:ELASTICSEARCH_USERNAME:-}
+  #   password: ${env:ELASTICSEARCH_PASSWORD:-}
   #   collection_interval: 15s
   #   nodes: ["_all"]
   #   skip_cluster_metrics: false

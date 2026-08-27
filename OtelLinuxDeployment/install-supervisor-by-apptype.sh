@@ -30,6 +30,16 @@
 #     REDIS_PASSWORD="" \
 #     ./install-supervisor-by-apptype.sh
 #
+#   # Elasticsearch host — username and password required
+#   sudo env \
+#     CORALOGIX_PRIVATE_KEY="<key>" \
+#     CORALOGIX_DOMAIN="eu2.coralogix.com" \
+#     APP_TYPE="elasticsearch" ENV_TYPE="prod" \
+#     ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+#     ELASTICSEARCH_USERNAME="elastic" \
+#     ELASTICSEARCH_PASSWORD="<password>" \
+#     ./install-supervisor-by-apptype.sh
+#
 set -euo pipefail
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -50,6 +60,17 @@ require_var() {
   local name="$1"
   if [[ -z "${!name:-}" ]]; then
     echo "ERROR: ${name} is required when APP_TYPE=${APP_TYPE}." >&2
+    exit 1
+  fi
+}
+
+require_pair_or_empty() {
+  local first_name="$1"
+  local second_name="$2"
+
+  if [[ (-n "${!first_name:-}" && -z "${!second_name:-}") ||
+        (-z "${!first_name:-}" && -n "${!second_name:-}") ]]; then
+    echo "ERROR: ${first_name} and ${second_name} must both be empty or both be non-empty." >&2
     exit 1
   fi
 }
@@ -93,8 +114,12 @@ case "${APP_TYPE_NORM}" in
   elasticsearch|elastic|es)
     APP_TYPE="elasticsearch"
     : "${ELASTICSEARCH_ENDPOINT:=http://localhost:9200}"
+    require_var ELASTICSEARCH_USERNAME
+    require_var ELASTICSEARCH_PASSWORD
     CRED_KEYS=(
       ELASTICSEARCH_ENDPOINT
+      ELASTICSEARCH_USERNAME
+      ELASTICSEARCH_PASSWORD
     )
     ;;
   databases|all|mixed)
@@ -107,7 +132,10 @@ case "${APP_TYPE_NORM}" in
     : "${POSTGRES_OTEL_USER:=otel_monitor}"
     : "${POSTGRES_OTEL_DATABASE:=appdb}"
     : "${ELASTICSEARCH_ENDPOINT:=http://localhost:9200}"
+    : "${ELASTICSEARCH_USERNAME:=}"
+    : "${ELASTICSEARCH_PASSWORD:=}"
     require_var POSTGRES_OTEL_PASSWORD
+    require_pair_or_empty ELASTICSEARCH_USERNAME ELASTICSEARCH_PASSWORD
     CRED_KEYS=(
       REDIS_ENDPOINT
       REDIS_PASSWORD
@@ -118,6 +146,8 @@ case "${APP_TYPE_NORM}" in
       POSTGRES_OTEL_PASSWORD
       POSTGRES_OTEL_DATABASE
       ELASTICSEARCH_ENDPOINT
+      ELASTICSEARCH_USERNAME
+      ELASTICSEARCH_PASSWORD
     )
     ;;
   *)
@@ -139,6 +169,30 @@ SUPERVISOR_CONFIG="/etc/opampsupervisor/config.yaml"
 SUPERVISOR_ENV="/etc/opampsupervisor/opampsupervisor.conf"
 CRED_MARKER_BEGIN="# BEGIN install-supervisor-by-apptype credentials"
 CRED_MARKER_END="# END install-supervisor-by-apptype credentials"
+
+systemd_env_entry() {
+  local key="$1"
+  local value="$2"
+
+  # Unix environment variables cannot contain NUL; reject line delimiters here.
+  if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+    echo "ERROR: ${key} contains CR/LF and cannot be stored in an EnvironmentFile." >&2
+    return 1
+  fi
+
+  # In systemd double quotes, backslash escapes \, ", $, and `.
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '%s="%s"\n' "${key}" "${value}"
+}
+
+MANAGED_KEYS=("APP_TYPE" "ENV_TYPE" "${CRED_KEYS[@]}")
+SYSTEMD_ENV_ENTRIES=()
+for key in "${MANAGED_KEYS[@]}"; do
+  SYSTEMD_ENV_ENTRIES+=("$(systemd_env_entry "${key}" "${!key}")")
+done
 
 echo "==> Installing Coralogix OTel Collector in Supervisor mode (installer defaults, no base config)"
 echo "    Domain  : ${CORALOGIX_DOMAIN}"
@@ -167,36 +221,35 @@ fi
 # Persist credentials for systemd / supervisor (APP_TYPE-scoped only)
 # -----------------------------------------------------------------------------
 echo "==> Writing receiver credentials to ${SUPERVISOR_ENV}"
-touch "${SUPERVISOR_ENV}"
-if grep -q "${CRED_MARKER_BEGIN}" "${SUPERVISOR_ENV}" 2>/dev/null; then
-  awk -v start="${CRED_MARKER_BEGIN}" -v end="${CRED_MARKER_END}" '
-    $0 == start {skip=1; next}
-    $0 == end {skip=0; next}
-    !skip {print}
-  ' "${SUPERVISOR_ENV}" >"${SUPERVISOR_ENV}.tmp"
-  mv "${SUPERVISOR_ENV}.tmp" "${SUPERVISOR_ENV}"
-fi
+(
+  umask 077
+  touch "${SUPERVISOR_ENV}"
+  chmod 0600 "${SUPERVISOR_ENV}"
+  if grep -q "${CRED_MARKER_BEGIN}" "${SUPERVISOR_ENV}" 2>/dev/null; then
+    rewrite_tmp="$(mktemp "${SUPERVISOR_ENV}.tmp.XXXXXX")"
+    trap 'rm -f -- "${rewrite_tmp}"' EXIT
+    awk -v start="${CRED_MARKER_BEGIN}" -v end="${CRED_MARKER_END}" '
+      $0 == start {skip=1; next}
+      $0 == end {skip=0; next}
+      !skip {print}
+    ' "${SUPERVISOR_ENV}" >"${rewrite_tmp}"
+    mv "${rewrite_tmp}" "${SUPERVISOR_ENV}"
+    trap - EXIT
+  fi
 
-# Drop keys we manage so re-runs stay clean
-sed -i \
-  -e '/^APP_TYPE=/d' \
-  -e '/^ENV_TYPE=/d' \
-  "${SUPERVISOR_ENV}"
-for key in "${CRED_KEYS[@]}"; do
-  sed -i -e "/^${key}=/d" "${SUPERVISOR_ENV}"
-done
-
-{
-  echo ""
-  echo "${CRED_MARKER_BEGIN}"
-  echo "APP_TYPE=${APP_TYPE}"
-  echo "ENV_TYPE=${ENV_TYPE}"
-  for key in "${CRED_KEYS[@]}"; do
-    printf '%s=%s\n' "${key}" "${!key}"
+  # Drop keys we manage so re-runs stay clean
+  for key in "${MANAGED_KEYS[@]}"; do
+    sed -i -e "/^${key}=/d" "${SUPERVISOR_ENV}"
   done
-  echo "${CRED_MARKER_END}"
-} >>"${SUPERVISOR_ENV}"
-chmod 0600 "${SUPERVISOR_ENV}"
+
+  {
+    echo ""
+    echo "${CRED_MARKER_BEGIN}"
+    printf '%s\n' "${SYSTEMD_ENV_ENTRIES[@]}"
+    echo "${CRED_MARKER_END}"
+  } >>"${SUPERVISOR_ENV}"
+  chmod 0600 "${SUPERVISOR_ENV}"
+)
 
 # -----------------------------------------------------------------------------
 # Patch supervisor config: Fleet attrs + pass only relevant env vars to collector
