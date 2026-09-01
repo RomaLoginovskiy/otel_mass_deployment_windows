@@ -1,41 +1,39 @@
-# Fleet Deployment Runbook — Coralogix OTel Collector (Supervisor Mode) for Linux machines
+# Coralogix OTel Collector on Linux (Supervisor mode)
 
-# Supervisor default install — customer guide
+Installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector** on a Linux host so
+collector configuration is owned remotely by Fleet Management. Fleet Management holds the
+live config; the Supervisor writes it to `/var/lib/opampsupervisor/effective.yaml`.
 
+This is the Linux counterpart to the Windows fleet path in
+[`../docs/fleet-deployment.md`](../docs/fleet-deployment.md).
 
-Step-by-step guide for **`install-supervisor-default.sh`**.
+## Choose an installer
 
-This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector** so you can manage collector configuration **remotely from Fleet Management**. Fleet Management owns the live config via `/var/lib/opampsupervisor/effective.yaml`.
+| Installer | Use when | Credentials it expects |
+| --- | --- | --- |
+| [`install-supervisor-default.sh`](install-supervisor-default.sh) | One host runs several databases, or you want a single command for the whole estate | All database settings together. `POSTGRES_OTEL_PASSWORD` is **always** required |
+| [`templates/install-supervisor-by-apptype.sh`](templates/install-supervisor-by-apptype.sh) | Each host runs one database role | Only the selected `APP_TYPE`'s variables. Unrelated ones may be omitted |
 
-## Choose a workflow
-
-- **Combined/default:** use [`install-supervisor-default.sh`](install-supervisor-default.sh) with mixed [`config.yaml`](config.yaml). It accepts all database settings together.
-- **Individual role:** use [`templates/install-supervisor-by-apptype.sh`](templates/install-supervisor-by-apptype.sh) with a matching role config from [`templates/`](templates/). See the [APP_TYPE-scoped runbook](templates/README.md).
-
----
-
-## What this script does
+Both do the same six things:
 
 | Step | Action |
 | --- | --- |
-| 1 | Runs Coralogix’s official installer with `--supervisor` only (empty/default local base config) |
-| 2 | Tags the agent for Fleet grouping: `app.type`, `env.type` |
-| 3 | Loads DB receiver credentials (from env or `/opt/{YOUR-APPLICATION-FOLDER}/otel-monitor.env`) |
-| 4 | Writes credentials to `/etc/opampsupervisor/opampsupervisor.conf` |
-| 5 | Patches `/etc/opampsupervisor/config.yaml` so those env vars are passed into the collector child (`agent.env`) |
-| 6 | Restarts `opampsupervisor` and checks it is active |
+| 1 | Run Coralogix's official installer with `--supervisor` (empty/default local base config) |
+| 2 | Tag the agent for Fleet grouping: `app.type`, `env.type` |
+| 3 | Collect and validate receiver credentials |
+| 4 | Write them to `/etc/opampsupervisor/opampsupervisor.conf` (mode `0600`) |
+| 5 | Patch `/etc/opampsupervisor/config.yaml` so those vars reach the collector child (`agent.env`) |
+| 6 | Restart `opampsupervisor` and check it is active |
 
-**Why credentials are needed:** when you later Activate a remote config that includes Redis / Valkey / PostgreSQL / Elasticsearch receivers (for example this repo’s `config.yaml`), the collector needs `POSTGRES_OTEL_PASSWORD`, related endpoints, and optional Elasticsearch credentials. Without matching values the collector crash-loops or cannot authenticate, and you see no database metrics.
+Neither installer installs the databases themselves, and neither pushes a full local
+`config.yaml` as base config — a Fleet remote config is the goal.
 
-**What it does not do:**
+**Why credentials are needed at install time.** When you later Activate a remote config
+containing Redis / Valkey / PostgreSQL / Elasticsearch receivers, the collector needs the
+matching endpoint and password variables. Without them it crash-loops or fails to
+authenticate, and no database metrics appear.
 
-- Does not install Redis / Valkey / PostgreSQL / Elasticsearch
-- Does not install the sample app
-- Does not push a full local `config.yaml` as base config (Fleet remote config is the goal)
-
----
-
-## Architecture (after install)
+## Architecture
 
 ```
 ┌─────────────────────┐     OpAMP      ┌──────────────────────────┐
@@ -53,10 +51,8 @@ This script installs the **Coralogix OpAMP Supervisor + OpenTelemetry Collector*
 | --- | --- |
 | `/etc/opampsupervisor/config.yaml` | Supervisor settings (OpAMP endpoint, Fleet attributes, env pass-through) |
 | `/etc/opampsupervisor/opampsupervisor.conf` | Secrets / endpoints (mode `0600`) |
-| `/etc/opampsupervisor/collector.yaml` | Local base (kept minimal by default install) |
-| `/var/lib/opampsupervisor/effective.yaml` | **Live** config after Fleet Activate |
-
----
+| `/etc/opampsupervisor/collector.yaml` | Local base config (kept minimal) |
+| `/var/lib/opampsupervisor/effective.yaml` | **Live** config after a Fleet Activate |
 
 ## Prerequisites
 
@@ -65,62 +61,45 @@ On each target host:
 - Linux with **systemd**, root / `sudo`
 - Outbound HTTPS to Coralogix (`ingress.<your-domain>`)
 - `curl`, `python3`
-- Databases already running (or endpoints reachable), if your remote config scrapes them
+- The databases the remote config scrapes already running, or their endpoints reachable
 
 From Coralogix:
 
 - A **Send-Your-Data** API key
-- Correct domain for your region (examples below)
+- The domain for your region
 - Access to **Integrations → Fleet Management**
-- Permission to manage remote configuration (`REMOTE-CONFIGURATION:MANAGE` for Activate)
+- `REMOTE-CONFIGURATION:MANAGE` permission to Activate a configuration
 
-### Domain cheat sheet
+### Domain reference
 
-| Region / UI | `CORALOGIX_DOMAIN`  |
+| Region / UI | `CORALOGIX_DOMAIN` |
 | --- | --- |
 | India | `app.coralogix.in` |
 | US1 | `coralogix.com` |
 | EU2 | `eu2.coralogix.com` |
 
-Use the value that matches your Coralogix account. Wrong domain → agent never appears in Fleet Management.
+The OpAMP endpoint becomes `https://ingress.<CORALOGIX_DOMAIN>/opamp/v1`. A wrong domain
+means the agent never appears in Fleet Management.
 
-OpAMP endpoint becomes: `https://ingress.<CORALOGIX_DOMAIN>/opamp/v1`
+## Install
 
----
-
-## Customer implementation (step by step)
-
-### Step 1 — Prepare the host
-
-Copy the script onto the server (example):
+Copy the script to the host and make it executable:
 
 ```bash
 scp install-supervisor-default.sh ubuntu@<host>:~/
 ssh ubuntu@<host>
+sed -i 's/\r$//' ./install-supervisor-default.sh   # only if you hit `bash\r` errors (CRLF)
 chmod +x ~/install-supervisor-default.sh
 ```
 
-### Step 2 — Choose Fleet labels for this host
+Use `sudo env ...` so the variables are not dropped by `sudo`.
 
-Pick values that match how you want to group servers:
-
-| Variable | Meaning | Examples |
-| --- | --- | --- |
-| `APP_TYPE` | Combined workflow label | `databases` |
-| `ENV_TYPE` | Environment | `prod`, `staging`, `dev` |
-
-For individual role labels (`redis`, `valkey`, `postgresql`, or `elasticsearch`), use the role-specific templates documented in [`templates/README.md`](templates/README.md).
-
-Defaults if unset: both `databases`.
-
-### Step 3 — Run the install script
-
-#### Pass credentials explicitly
+### Combined — all databases on one host
 
 ```bash
 sudo env \
   CORALOGIX_PRIVATE_KEY="<your-send-your-data-key>" \
-  CORALOGIX_DOMAIN="app.coralogix.in" \
+  CORALOGIX_DOMAIN="eu2.coralogix.com" \
   APP_TYPE="databases" \
   ENV_TYPE="prod" \
   POSTGRES_OTEL_PASSWORD="<otel_monitor_password>" \
@@ -135,87 +114,47 @@ sudo env \
   ./install-supervisor-default.sh
 ```
 
-Set `ELASTICSEARCH_USERNAME` and `ELASTICSEARCH_PASSWORD` to non-empty values when Elasticsearch requires authentication. Leave both empty for an unauthenticated endpoint.
+Elasticsearch username and password are optional here; leave both empty for an
+unauthenticated endpoint. Set both to non-empty values when Elasticsearch requires
+authentication — supplying only one is rejected.
 
-### Step 4 — Verify the Supervisor locally
+### Per-role — one database per host
 
-```bash
-sudo systemctl status opampsupervisor
-sudo grep endpoint /etc/opampsupervisor/config.yaml
-sudo grep -A6 non_identifying_attributes /etc/opampsupervisor/config.yaml
-sudo tail -n 50 /var/log/opampsupervisor/opampsupervisor.log
-```
-
-You want to see:
-
-- Service **active (running)**
-- Endpoint like `https://ingress.app.coralogix.in/opamp/v1`
-- Attributes `app.type: "databases"` and `env.type: "prod"` (your values)
-- Log line similar to: `Connected to the OpAMP server.`
-
-### Step 5 — Confirm the agent in Coralogix
-
-1. Open Coralogix (same account/region as the key + domain).
-2. Go to **Integrations → Fleet Management → Agents**.
-3. Find this hostname.
-4. Use **Group by** → `app.type` or `env.type`.
-
-If the agent does not appear within a few minutes:
-
-- Domain wrong (e.g. `coralogix.in` instead of `app.coralogix.in`)
-- API key wrong / wrong account
-- Outbound 443 blocked
-- Check supervisor log for `401` / `403` / connection errors
-
-### Step 6 — Create and Activate a remote configuration
-
-1. **Integrations → Fleet Management → Configurations**
-2. **Create** a configuration group (example name: `linux-databases-prod`)
-3. **Agent selector:** match your labels, e.g.
-    - `app.type` = `databases`
-    - `env.type` = `prod`
-4. Paste or upload your collector YAML (this repo’s `config.yaml` is a metrics/logs starting point)
-5. Use **Preview → Agent list** and confirm only the intended hosts match
-6. **Activate** the configuration
-7. On the agent, ensure **Remote configuration** is enabled
-
-<img width="1136" height="702" alt="image" src="https://github.com/user-attachments/assets/394b3031-2bf4-448a-aa0e-b4a41eeeb467" />
-<img width="1888" height="814" alt="image" src="https://github.com/user-attachments/assets/fb229f3f-bc98-44da-833f-0cdeffc82a0a" />
-
-
-After Activate, on the host:
+Use `templates/install-supervisor-by-apptype.sh` and pass only that role's variables.
 
 ```bash
-sudo wc -l /var/lib/opampsupervisor/effective.yaml
-sudo head -n 40 /var/lib/opampsupervisor/effective.yaml
+# PostgreSQL
+sudo env CORALOGIX_PRIVATE_KEY="<key>" CORALOGIX_DOMAIN="eu2.coralogix.com" \
+  APP_TYPE="postgresql" ENV_TYPE="prod" \
+  POSTGRES_OTEL_PASSWORD="<otel_monitor_password>" \
+  ./install-supervisor-by-apptype.sh
+
+# Redis
+sudo env CORALOGIX_PRIVATE_KEY="<key>" CORALOGIX_DOMAIN="eu2.coralogix.com" \
+  APP_TYPE="redis" ENV_TYPE="prod" REDIS_ENDPOINT="localhost:6379" \
+  ./install-supervisor-by-apptype.sh
+
+# Valkey
+sudo env CORALOGIX_PRIVATE_KEY="<key>" CORALOGIX_DOMAIN="eu2.coralogix.com" \
+  APP_TYPE="valkey" ENV_TYPE="prod" VALKEY_ENDPOINT="localhost:6380" \
+  ./install-supervisor-by-apptype.sh
+
+# Elasticsearch (credentials required for this role)
+sudo env CORALOGIX_PRIVATE_KEY="<key>" CORALOGIX_DOMAIN="eu2.coralogix.com" \
+  APP_TYPE="elasticsearch" ENV_TYPE="prod" \
+  ELASTICSEARCH_ENDPOINT="http://localhost:9200" \
+  ELASTICSEARCH_USERNAME="elastic" ELASTICSEARCH_PASSWORD="<password>" \
+  ./install-supervisor-by-apptype.sh
 ```
 
-`effective.yaml` should be non-empty and contain your pipelines.
+## Environment variables
 
-### Step 7 — Verify metrics
-
-```bash
-# Collector self-metrics (should return Prometheus text, not empty)
-curl -s http://127.0.0.1:8888/metrics | head -30
-
-# Service health
-sudo systemctl status opampsupervisor
-# Child process should stay up (not restarting every few seconds)
-```
-
-In Coralogix **Explore → Metrics**, search for series from your remote config (e.g. `redis.*`, `postgresql.*`, host metrics).
-
----
-
-## Environment variables reference
-
-### Required
+### Always required
 
 | Variable | Description |
 | --- | --- |
 | `CORALOGIX_PRIVATE_KEY` | Send-Your-Data API key |
-| `CORALOGIX_DOMAIN` | Region domain, e.g. `app.coralogix.in` |
-| `POSTGRES_OTEL_PASSWORD` | Required unless present in `otel-monitor.env` |
+| `CORALOGIX_DOMAIN` | Region domain, e.g. `eu2.coralogix.com` |
 
 ### Fleet labels
 
@@ -224,150 +163,177 @@ In Coralogix **Explore → Metrics**, search for series from your remote config 
 | `APP_TYPE` | `databases` | `app.type` |
 | `ENV_TYPE` | `databases` | `env.type` |
 
-### Receiver settings (optional overrides)
+`ENV_TYPE` defaults to `databases`, not to an environment name. Set it explicitly.
 
-| Variable | Default |
-| --- | --- |
-| `REDIS_ENDPOINT` | `localhost:6379` |
-| `REDIS_PASSWORD` | empty |
-| `VALKEY_ENDPOINT` | `localhost:6380` |
-| `VALKEY_PASSWORD` | empty |
-| `POSTGRES_ENDPOINT` | `localhost:5432` |
-| `POSTGRES_OTEL_USER` | `otel_monitor` |
-| `POSTGRES_OTEL_DATABASE` | `appdb` |
-| `ELASTICSEARCH_ENDPOINT` | `http://localhost:9200` |
-| `ELASTICSEARCH_USERNAME` | empty |
-| `ELASTICSEARCH_PASSWORD` | empty |
+`APP_TYPE` accepts `postgresql` (or `postgres`), `redis`, `valkey`, `elasticsearch` (or
+`elastic`, `es`), and `databases` (or `all`, `mixed`).
 
----
+### Receiver credentials
 
-## How to roll out across many servers (customer pattern)
+`install-supervisor-by-apptype.sh` requires only the rows matching the selected
+`APP_TYPE`. `install-supervisor-default.sh` always requires `POSTGRES_OTEL_PASSWORD`.
 
-1. Run the root default installer on each host with `APP_TYPE=databases` and the target environment, such as `ENV_TYPE=prod`.
-2. In Fleet Management, create a group such as `linux-databases-prod` with selectors `app.type=databases` and `env.type=prod`.
-3. Preview matching agents, then Activate the configuration.
-4. New hosts with the same labels automatically match the active selector.
+| Variable | Default | Required for `APP_TYPE` |
+| --- | --- | --- |
+| `POSTGRES_OTEL_PASSWORD` | — | `postgresql`, `databases` |
+| `POSTGRES_ENDPOINT` | `localhost:5432` | optional |
+| `POSTGRES_OTEL_USER` | `otel_monitor` | optional |
+| `POSTGRES_OTEL_DATABASE` | `appdb` | optional |
+| `REDIS_ENDPOINT` | `localhost:6379` | optional |
+| `REDIS_PASSWORD` | empty | optional |
+| `VALKEY_ENDPOINT` | `localhost:6380` | optional |
+| `VALKEY_PASSWORD` | empty | optional |
+| `ELASTICSEARCH_ENDPOINT` | `http://localhost:9200` | optional |
+| `ELASTICSEARCH_USERNAME` | empty | `elasticsearch` |
+| `ELASTICSEARCH_PASSWORD` | empty | `elasticsearch` |
 
-For individual Redis, Valkey, PostgreSQL, or Elasticsearch roles, use the [APP_TYPE-scoped runbook](templates/README.md).
+For `APP_TYPE=databases`, the Elasticsearch credentials are optional but must be supplied
+as a pair — both set, or both empty.
 
----
+## Fleet Management
+
+### Create and Activate a remote configuration
+
+1. **Integrations → Fleet Management → Configurations**
+2. **Create** a configuration group, e.g. `linux-redis-prod`
+3. **Agent selector:** match the labels set at install time, e.g. `app.type = redis` and
+   `env.type = prod`
+4. Paste or upload the collector YAML for that role:
+
+   | `APP_TYPE` | Remote config to Activate |
+   | --- | --- |
+   | `redis` | [`templates/redis.yaml`](templates/redis.yaml) |
+   | `valkey` | [`templates/redis_valkey.yaml`](templates/redis_valkey.yaml) |
+   | `postgresql` | [`templates/postgress.yaml`](templates/postgress.yaml) |
+   | `elasticsearch` | [`templates/elasticsearch.yaml`](templates/elasticsearch.yaml) |
+   | `databases` | [`config.yaml`](config.yaml) |
+
+5. Use **Preview → Agent list** and confirm only the intended hosts match
+6. **Activate**, then ensure **Remote configuration** is enabled on the agent
+
+> **Valkey.** OpenTelemetry has no dedicated Valkey receiver. Valkey is scraped with the
+> `redis` receiver and therefore emits Redis metric names. `redis_valkey.yaml` stamps
+> `valkey=true` and `db.system=valkey` via its `resource/valkey` processor, so filter on
+> `db_system=valkey` to separate Valkey series from Redis.
+
+## Verify
+
+### On the host
+
+```bash
+sudo systemctl status opampsupervisor
+sudo grep endpoint /etc/opampsupervisor/config.yaml
+sudo grep -A6 non_identifying_attributes /etc/opampsupervisor/config.yaml
+sudo tail -n 50 /var/log/opampsupervisor/opampsupervisor.log
+```
+
+Expect the service **active (running)**, an endpoint like
+`https://ingress.eu2.coralogix.com/opamp/v1`, the `app.type` / `env.type` attributes you
+passed, and a `Connected to the OpAMP server.` log line.
+
+After Activating a configuration:
+
+```bash
+sudo wc -l /var/lib/opampsupervisor/effective.yaml   # non-empty
+sudo head -n 40 /var/lib/opampsupervisor/effective.yaml
+curl -s http://127.0.0.1:8888/metrics | head -30     # Prometheus text, not empty
+```
+
+The collector child should stay up rather than restarting every few seconds.
+
+### In Coralogix
+
+1. **Integrations → Fleet Management → Agents** — find the hostname, then **Group by**
+   `app.type` or `env.type`.
+2. **Explore → Metrics** — search for series from the Activated config, e.g. `redis.*`,
+   `postgresql.*`, `elasticsearch.*`, or host metrics.
+
+If the agent does not appear within a few minutes, check the domain, the API key and the
+account it belongs to, outbound 443, and the supervisor log for `401` / `403`.
+
+## Rollout
+
+1. Decide the label scheme — `APP_TYPE` for the database role, `ENV_TYPE` for environment.
+2. Install on each host with the correct labels and only that role's credentials.
+3. Create one Fleet configuration group per label combination you want to control
+   independently.
+4. Preview the matching agents, then Activate.
+5. New hosts joining with the same labels match the active selector automatically.
+
+| Host role | `APP_TYPE` | `ENV_TYPE` | Fleet config group | Remote config |
+| --- | --- | --- | --- | --- |
+| Redis nodes | `redis` | `prod` | `linux-redis-prod` | `templates/redis.yaml` |
+| Valkey nodes | `valkey` | `prod` | `linux-valkey-prod` | `templates/redis_valkey.yaml` |
+| Postgres nodes | `postgresql` | `prod` | `linux-postgres-prod` | `templates/postgress.yaml` |
+| Elasticsearch nodes | `elasticsearch` | `prod` | `linux-es-prod` | `templates/elasticsearch.yaml` |
+| Mixed DB host | `databases` | `prod` | `linux-databases-prod` | `config.yaml` |
 
 ## Troubleshooting
 
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
-| `CORALOGIX_PRIVATE_KEY: Set CORALOGIX_PRIVATE_KEY` under sudo | `sudo` dropped env | Use `sudo env VAR=... ./install-supervisor-default.sh` |
-| Agent not in Fleet Management | Wrong domain/key/network | Check OpAMP endpoint + supervisor log for connect/auth errors |
-| `missing password` / collector exit code 1 | Credentials not passed to collector | Re-run script with `POSTGRES_OTEL_PASSWORD` |
-| Elasticsearch authentication error | Elasticsearch credentials missing or invalid | Re-run with matching `ELASTICSEARCH_USERNAME` and `ELASTICSEARCH_PASSWORD`; leave both empty only for unauthenticated Elasticsearch |
-| `effective.yaml` empty / `AllowNoPipelines` | No remote config Activated | Create + Activate a Configuration; enable Remote configuration |
-| `:8888/metrics` empty | Collector not running pipelines | Fix credentials + Activate remote config; confirm collector child stays up |
-| Metrics missing in UI but local `:8888` works | Exporter/domain/key issue in remote YAML | Align `domain` and key in the Activated config with your account |
-
-Useful commands:
+| `/usr/bin/env: 'bash\r': No such file or directory` | Windows CRLF line endings | `sed -i 's/\r$//' ./<script>.sh`, then re-run |
+| `CORALOGIX_PRIVATE_KEY: Set CORALOGIX_PRIVATE_KEY` under sudo | `sudo` dropped the environment | Use `sudo env VAR=... ./<script>.sh` |
+| `POSTGRES_OTEL_PASSWORD is required when APP_TYPE=postgresql` | Password not passed for that role | Include `POSTGRES_OTEL_PASSWORD` for `postgresql` and `databases` |
+| `ELASTICSEARCH_USERNAME is required when APP_TYPE=elasticsearch` | Elasticsearch credentials not passed | Supply non-empty username **and** password |
+| Agent not in Fleet Management | Wrong domain, key or network | Check the OpAMP endpoint and the supervisor log for connect/auth errors |
+| `missing password` / collector exit code 1 | Credentials not reaching the collector, or the remote YAML expects a database this host did not configure | Re-run with the correct `APP_TYPE` variables; Activate a YAML matching that role |
+| Elasticsearch authentication error | Credentials missing or invalid | Re-run with matching username and password; leave both empty only for an unauthenticated endpoint |
+| `journald` / `_SYSTEMD_UNIT` error | Remote YAML includes `journald` on a host that rejects it | Use a role YAML without `journald` |
+| `effective.yaml` empty / `AllowNoPipelines` | No remote config Activated | Create and Activate a configuration; enable Remote configuration |
+| `:8888/metrics` empty | Collector not running pipelines | Fix credentials, Activate a remote config, confirm the collector child stays up |
+| Metrics missing in the UI but local `:8888` works | Exporter domain/key mismatch in the remote YAML | Align `domain` and key in the Activated config with your account |
 
 ```bash
 sudo systemctl status opampsupervisor
 sudo journalctl -u opampsupervisor -n 100 --no-pager
 sudo tail -n 100 /var/log/opampsupervisor/opampsupervisor.log
-sudo cat /var/lib/opampsupervisor/effective.yaml | head -80
+sudo head -80 /var/lib/opampsupervisor/effective.yaml
 curl -s http://127.0.0.1:8888/metrics | head -30
 ```
 
----
+## Security
 
-## Related files in this repo
+- Prefer `sudo env ...`; do not paste API keys into tickets or chat.
+- `/etc/opampsupervisor/opampsupervisor.conf` is mode `0600` (root-only).
+- Rotate any key that was exposed.
+- Demo stacks often disable Elasticsearch security. Do not carry that into a production
+  remote config unchanged.
+
+## Reference files
 
 | File | Purpose |
 | --- | --- |
-| `install-supervisor-default.sh` | This installer |
-| `config.yaml` | Suggested remote collector config (metrics/logs; activate via Fleet) |
-| `templates/install-supervisor-by-apptype.sh` | APP_TYPE-scoped installer for individual roles |
-| `templates/README.md` | Individual-role workflow and per-role config guide |
-| `install-otel-collector.sh` | Alternate path: Supervisor + local `config.yaml` base config |
+| `install-supervisor-default.sh` | Combined installer; expects all database variables together |
+| `templates/install-supervisor-by-apptype.sh` | `APP_TYPE`-scoped installer; expects only that role's variables |
+| `config.yaml` | Mixed metrics/logs remote config, for `APP_TYPE=databases` |
+| `templates/redis.yaml`, `redis_valkey.yaml`, `postgress.yaml`, `elasticsearch.yaml` | Role-specific remote configs to Activate in Fleet |
 
----
+## Screenshots
 
-## Security notes
+Expected Coralogix UI after install, remote-config Activate, and metrics flowing.
 
-- Prefer `sudo env ...` and avoid pasting API keys into tickets or chat.
-- `/etc/opampsupervisor/opampsupervisor.conf` is mode `0600` (root-only).
-- Rotate any key that was exposed.
-- Keep Elasticsearch / DB auth appropriate for production; demo stacks often disable ES security — do not copy that into production remote configs unchanged.
+**Fleet Management → Configurations.** A configuration group with version history; *Active*
+marks the version matching agents should run. The green/amber/red counts show how many
+agents applied it. Activate a new version to roll out a change; keep older versions
+inactive for rollback.
 
-## Example screenshots (How it looks like)
+<img alt="Fleet Management Configurations list showing a configuration group with three versions and per-agent status counts" src="https://github.com/user-attachments/assets/1c745c4f-e2bc-4278-8e6a-e41ca221c087" />
 
-Screenshots show the expected Coralogix UI after Supervisor install + remote config Activate + metrics flowing.
+**Agent selector and preview.** Selector rules (left/centre) and the hosts currently
+matching them (right). Always check Preview before Activate so a config does not reach the
+wrong fleet.
 
-### 1. Fleet Management — Configurations list
+<img alt="Configuration editor showing agent selector rules alongside a preview list of matching agents" src="https://github.com/user-attachments/assets/e247dc5a-d97b-4687-9b66-9e7098492b73" />
+<img alt="Fleet Management configuration group with agent selector and OTel YAML editor" src="https://github.com/user-attachments/assets/394b3031-2bf4-448a-aa0e-b4a41eeeb467" />
+<img alt="Fleet Management agent list showing live agents with version and pipeline columns" src="https://github.com/user-attachments/assets/fb229f3f-bc98-44da-833f-0cdeffc82a0a" />
 
-Fleet Management Configurations list
+**Explore → Metrics, Valkey.** A Redis-named metric carrying `db_system=valkey` and
+`valkey=true`, which is how Valkey series are told apart from Redis.
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/1c745c4f-e2bc-4278-8e6a-e41ca221c087" />
+<img alt="Metrics Explore showing a Redis-named metric labelled db_system=valkey" src="https://github.com/user-attachments/assets/87502577-ff03-4f0f-925e-53dcceec5170" />
 
+**Explore → Metrics, PostgreSQL.** A PostgreSQL connection metric with a stable series,
+confirming the collector scrapes Postgres with the credentials passed at install time.
 
-**What you are looking at**
-
-- **Integrations → Fleet Management → Configurations**
-- A configuration group (example: `otel-database1`) with version history (Version 1 / 2 / 3)
-- **Active** on the latest version means that YAML is what matching agents should run
-- Agent status counts (green / amber / red) show how many agents applied the config successfully vs warning/error
-
-**Why it matters**
-
-This is where you control updates for a group of database hosts. Activate a new version to roll out a collector change; keep older versions Inactive for rollback.
-
----
-
-### 2. Fleet Management — Agent selector + preview
-
-Configuration editor with Agent selector and preview
-
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/e247dc5a-d97b-4687-9b66-9e7098492b73" />
-
-
-**What you are looking at**
-
-- Left: versions of the same configuration group
-- Center: **Agent selector** rules (example: `host.name` **and** `app.type == databases`) plus the OTel YAML (Coralogix exporter `domain`, etc.)
-- Right: **Preview → Agent list** — hosts that currently match the selector (status **Live**, agent type `standalone`, version, pipelines)
-
-**Why it matters**
-
-Selectors target combined database hosts or environments — using the `APP_TYPE=databases` / `ENV_TYPE` tags set by `install-supervisor-default.sh`. Always check Preview before Activate so you do not push config to the wrong fleet.
-
----
-
-### 3. Explore → Metrics — Valkey identified
-
-Metrics Explore showing Valkey labels on Redis-named metrics. 
-
-**IMPORTANT NOTE: otel doesn’t have separate receiver for valkey, so we are using the redis receiver instead. The metrics for redis and valkey are same and below is how identify the valkey metirc.**
-
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/87502577-ff03-4f0f-925e-53dcceec5170" />
-
-**What you are looking at**
-
-- **Explore → Metrics** with a Redis-compatible metric (example: `redis_clients_blocked…`) filtered by `host_name`
-- Labels on the series include `app_type`, host, and — importantly — `db_system=valkey` and `valkey=true`
-
-**Why it matters**
-
-Valkey is scraped with the Redis receiver (same metric names). The remote config should stamp Valkey scrapes with `valkey` / `db.system=valkey` so you can filter Valkey vs Redis in Coralogix instead of mixing them.
-
----
-
-### 4. Explore → Metrics — PostgreSQL flowing
-
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/ec2682b7-4508-4290-a13f-f54e04c426a8" />
-
-Metrics Explore showing PostgreSQL connection metric
-
-**What you are looking at**
-
-- A PostgreSQL metric (example: `postgresql_connection_max…`) with a stable time series
-- Resource labels such as `cx_application_name`, `cx_subsystem_name`, and `host_name`
-
-**Why it matters**
-
-Confirms the collector can scrape Postgres with the credentials you passed at install time (`POSTGRES_OTEL_*`) and that data reaches Coralogix after the remote config is Active. Use similar queries for `redis.*`, `elasticsearch.*`, and host metrics from your Activated YAML.
+<img alt="Metrics Explore showing a PostgreSQL connection metric time series" src="https://github.com/user-attachments/assets/ec2682b7-4508-4290-a13f-f54e04c426a8" />

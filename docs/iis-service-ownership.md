@@ -2,7 +2,7 @@
 
 How this repo populates the **Service** ownership attribute for a Windows/IIS host in
 Coralogix Infrastructure Explorer, which resource-attribute keys are used, and the exact
-value format — with the empirical test results that chose them.
+value format.
 
 ## What it does
 
@@ -18,8 +18,8 @@ the value is a multi-item list so each app appears as a distinct Service value.
 
 ## Which keys are used
 
-Stamped by the `transform/iis_service_labels` processor (7 keys). All were **verified to
-resolve to Service ownership and to split a multi-value array into distinct items**:
+Stamped by the `transform/iis_service_labels` processor. All seven resolve to Service
+ownership and split a multi-value array into distinct items:
 
 | Key | Resolves to Service ownership | Multi-app array splits |
 | --- | --- | --- |
@@ -104,7 +104,7 @@ items, so APM ↔ infrastructure resource correlation can select a single servic
 - The `transform/iis_service_labels` processor is delivered via the **Coralogix Fleet
   Management remote config** (OpAMP), which the supervisor merges on top of the local base.
 - The repo collector YAMLs (`deploy/config.supervisor.yaml`,
-  `SimpleWebApp/coralogix/config.yaml`) and `iis-service-ownership.collector.yaml` are the
+  `SimpleWebApp/coralogix/config.yaml`) are the
   **reference source** to copy the processor + pipeline wiring into the remote config. The
   automation does **not** push or manage that config; the supervisor's base-stage →
   pull-remote → merge flow is left unchanged.
@@ -156,22 +156,8 @@ Wired into the two logs pipelines immediately after `resource/environment`:
       processors: [ ..., resource/environment, transform/iis_service_labels, resourcedetection/entity, resourcedetection/region, transform/entity-event ]
 ```
 
-The full reference collector config is in
-[`iis-service-ownership.collector.yaml`](./iis-service-ownership.collector.yaml).
-
-## How it was verified
-
-A per-key proof-of-concept ran 18 disposable Linux collector containers (Docker), each a
-distinct Coralogix host entity stamping exactly **one** candidate key:
-
-- 9 `own-<key>` hosts — single unique value per key → which key drives Service ownership.
-- 9 `multi-<key>` hosts — a 3-element array per key → whether the array splits into multiple
-  Service items.
-
-Result: the 7 keys above populated ownership and split arrays into 3 items; bare `cx_service`
-and `CX_SERVICE_NAME` produced no ownership. Data landing was confirmed by DataPrime / PromQL
-query against the ingested telemetry; ownership resolution was read from Infrastructure
-Explorer.
+The full reference collector config is
+[`deploy/config.supervisor.yaml`](../deploy/config.supervisor.yaml).
 
 ## Operational notes
 

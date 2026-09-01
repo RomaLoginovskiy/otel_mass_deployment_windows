@@ -1,13 +1,16 @@
-> 📡 This runbook covers installing the OpenTelemetry (OTel) Collector as a Windows service and wiring up zero-code instrumentation for .NET apps on IIS so they report to Coralogix. It is based on the integration session walkthrough and uses the attached `config.yaml` as the reference collector configuration.
-> 
+# OTel Collector + zero-code .NET instrumentation on Windows/IIS
+
+Install the OpenTelemetry (OTel) Collector as a Windows service and wire up zero-code
+instrumentation for .NET apps on IIS so they report to Coralogix. Single-host runbook;
+for the scripted fleet path see [`fleet-deployment.md`](./fleet-deployment.md).
 
 ## Overview
 
 There are two moving parts, and both are needed before Coralogix shows APM data.
 
-First, the **OTel Collector** runs as a Windows service on each host. It receives telemetry over OTLP from your apps, scrapes host and IIS metrics on its own, and ships everything to Coralogix. The attached `config.yaml` configures this collector.
+First, the **OTel Collector** runs as a Windows service on each host. It receives telemetry over OTLP from your apps, scrapes host and IIS metrics on its own, and ships everything to Coralogix. Part 2 covers the config that drives it.
 
-Second, the **application instrumentation** is what makes each app emit traces. Apps fall into two groups. Some teams already added the OpenTelemetry SDK to their code, so they emit OTLP directly and only need the collector running. Other teams have no SDK in their code, so they need zero-code (also called no-code) auto-instrumentation, which is installed separately on the box. The session focused on the second case for .NET on IIS.
+Second, the **application instrumentation** is what makes each app emit traces. Apps fall into two groups. Some teams already added the OpenTelemetry SDK to their code, so they emit OTLP directly and only need the collector running. Other teams have no SDK in their code, so they need zero-code (also called no-code) auto-instrumentation, which is installed separately on the box. Part 3 covers the second case for .NET on IIS.
 
 Data flow:
 
@@ -36,13 +39,21 @@ This guide targets bare Windows hosts running .NET on IIS. It does not use Kuber
 
 ### 1. Prepare the config file
 
-The installer requires a config file. Start from the attached `config.yaml` (the full text is in the toggle at the bottom of this page) and save it on the machine, for example `C:\otel\config.yaml`.
+The installer requires a config file. Start from
+[`SimpleWebApp/coralogix/config.yaml`](../SimpleWebApp/coralogix/config.yaml) and save it on
+the machine, for example `C:\otel\config.yaml`.
 
 Before installing, update these values for your environment:
 
-- `exporters.coralogix.domain`: set to your Coralogix domain. The attached file uses `eu1.coralogix.com`.
-- `exporters.coralogix.application_name` and `subsystem_name`: set these to meaningful names. The attached file uses `iis-instrumentation-test` and `SimpleWebApp`, which are placeholders from testing.
-- `private_key` is read from the `CORALOGIX_PRIVATE_KEY` environment variable, which the installer sets for you. Do not paste the key into the file.
+- `domain`: your Coralogix region domain. The shipped file uses `eu1.coralogix.com` in
+  **three** places — both `coralogix` exporters and the `opamp` endpoint.
+- `resource/service` → `service.namespace`: your application grouping. The shipped file
+  uses `iis-instrumentation-test`.
+- `private_key` is read from the `CORALOGIX_PRIVATE_KEY` environment variable, which the
+  installer sets for you. Do not paste the key into the file.
+
+[`SimpleWebApp/coralogix/INSTALL.md`](../SimpleWebApp/coralogix/INSTALL.md) documents every
+value to change, with a click-through install for operators who prefer not to use the CLI.
 
 ### 2. Run the installer
 
@@ -96,8 +107,7 @@ The config exposes a health check on `127.0.0.1:13133` and internal collector me
 & $f -Version 0.144.0
 ```
 
-> ⚠️ The attached config listens on `127.0.0.1` only, which is correct when the instrumented apps run on the same host. If apps run on other machines, install that collector as a gateway with `-ListenInterface 0.0.0.0`.
-> 
+> ⚠️ The shipped config listens on `127.0.0.1` only, which is correct when the instrumented apps run on the same host. If apps run on other machines, install that collector as a gateway with `-ListenInterface 0.0.0.0`.
 
 ### 5. Service management
 
@@ -109,48 +119,67 @@ Start-Service otelcol-contrib
 
 ---
 
-## Part 2: What the example config enables
+## Part 2: What the collector config collects
 
-The attached config is a single per-host agent that both collects local signals and receives app telemetry, then ships directly to Coralogix. Each block maps to a specific capability in the product.
+The repo ships two collector configs. They are **not** interchangeable:
 
-### Receivers (what data comes in)
+| Config | Deployment mode | `opamp` extension |
+| --- | --- | --- |
+| [`SimpleWebApp/coralogix/config.yaml`](../SimpleWebApp/coralogix/config.yaml) | Standalone Windows service (Part 1 of this guide) | Present — the collector holds the OpAMP connection itself |
+| [`deploy/config.supervisor.yaml`](../deploy/config.supervisor.yaml) | Under the OpAMP Supervisor (fleet, see [`fleet-deployment.md`](./fleet-deployment.md)) | Absent — the Supervisor owns that connection |
 
-The `otlp` receiver listens on `127.0.0.1:4317` (gRPC) and `127.0.0.1:4318` (HTTP). This is the entry point for traces and metrics from your instrumented apps.
+Adding an `opamp` extension to the Supervisor base config makes the collector fail to
+start. For a click-through install of the standalone config, see
+[`SimpleWebApp/coralogix/INSTALL.md`](../SimpleWebApp/coralogix/INSTALL.md).
 
-The `hostmetrics` receiver scrapes CPU, memory, disk, filesystem, network, paging, and process metrics every 30 seconds. This powers the host dashboards in Infrastructure Explorer, including the Process tab. The process scraper is off by default upstream and is turned on here, with read errors muted to avoid noise.
+Either config is a single per-host agent: it collects local signals, receives app
+telemetry over OTLP, and ships to Coralogix.
 
-The `windowsperfcounters` receiver pulls Windows and .NET counters and maps them to clean metric names: IIS request rate and current connections, ASP.NET request rate, execution time and queue length, .NET CLR time in GC and exceptions per second, and worker process CPU and private bytes. If you run multiple app pools, add `w3wp#1`, `w3wp#2` and so on to the Process object instances.
-
-The `windowseventlog` receivers collect the Application and System event logs. The `filelog/iis` receiver tails the W3C IIS logs under `C:\inetpub\logs\LogFiles\W3SVC*\*.log` and drops the header and comment lines.
-
-### Connector: span metrics (this is what drives APM)
-
-The `spanmetrics` connector generates RED metrics (Request rate, Error rate, Duration) from every span. It runs on the agent so it sees 100% of spans before any downstream sampling. This is what fills the APM Service Catalog and the latency, error, and Apdex widgets. The extra dimensions unlock specific features: `service.version` enables group-by-version, `http.response.status_code` enables error tracking, and `db.system` with `db.namespace` enable Dependencies and Database Monitoring. Exemplars are enabled so you can jump from a metric to a representative trace.
-
-> Version note: the `aggregation_cardinality_limit` on span metrics needs collector v0.130.0 or later, and the Prometheus pull reader used for internal telemetry needs v0.123 or later.
-> 
-
-### Processors (how data is shaped)
-
-`memory_limiter` caps collector memory. `resourcedetection/system` adds `host.name` (plus `os.type`, `host.id`, `host.arch`) to every signal, including the app spans. This is the key to correlation: matching `host.name` on both spans and host metrics is what lets Coralogix tie a service to the host it runs on, and it gives each host's span metrics a unique resource so multi-host aggregation adds up instead of overwriting. `resource` stamps `service.namespace = windows-iis` on everything. `batch` groups signals into efficient payloads.
-
-### Exporter and pipelines
-
-The `coralogix` exporter ships to your Coralogix domain using the key from the environment, with a sending queue and retry on failure. The pipelines wire it together: traces flow to both the span-metrics connector and Coralogix, the generated span metrics go to Coralogix, and host, Windows, and app metrics plus all logs go to Coralogix.
-
-> The header comment in the file describes an alternative topology where the agent forwards to a gateway that owns the credentials. As written, the file ships directly to Coralogix. If you adopt a gateway later, point the exporter at the gateway instead.
-> 
-
-### Summary: config section to Coralogix feature
-
-| Config section | What you get in Coralogix |
+| Component | What you get in Coralogix |
 | --- | --- |
-| `otlp` receiver | Traces and metrics from your apps |
-| `spanmetrics` connector | APM Service Catalog, latency / error / Apdex, group-by-version, dependencies |
-| `hostmetrics` | Infrastructure Explorer host dashboards, Process tab |
-| `windowsperfcounters` | IIS, ASP.NET, and .NET CLR metrics |
-| `windowseventlog`  • `filelog/iis` | Windows event logs and IIS access logs |
-| `resourcedetection` (`host.name`) | Service-to-host correlation, correct multi-host aggregation |
+| `otlp` receiver — `:4317` gRPC, `:4318` HTTP, bound to `${env:OTEL_LISTEN_INTERFACE:-127.0.0.1}` | Entry point for app traces, metrics, and logs |
+| `spanmetrics` connector (+ `/compact`, `/db`, `/db_compact`) | APM Service Catalog, RED metrics, latency / error / Apdex, Dependencies and Database Monitoring |
+| `hostmetrics` — cpu, memory, disk, filesystem, network, paging, process; 10s | Infrastructure Explorer host dashboards, including the Process tab |
+| `iis` receiver | IIS request and connection metrics |
+| `windowseventlog/application`, `/security`, `/system` | Windows event logs |
+| `filelog/iis` | IIS W3C access logs, with `#Fields:` header parsing |
+| `prometheus` — scrapes the collector's own `:8888` | Collector self-monitoring |
+| `resourcedetection/entity`, `/env`, `/region` | Host-entity correlation; `/env` promotes `OTEL_RESOURCE_ATTRIBUTES` into Fleet Management selector attributes |
+| `resource/environment` | Per-environment split, from `CX_ENVIRONMENT` |
+| `transform/iis_service_labels` | IIS Service ownership — see [`iis-service-ownership.md`](./iis-service-ownership.md) |
+| `coralogix` + `coralogix/resource_catalog` exporters | Telemetry ingest, and the Infrastructure Explorer host entity |
+
+### Span metrics drive APM
+
+The `spanmetrics` connector generates RED metrics (Request rate, Error rate, Duration)
+from every span. It runs on the agent, so it sees 100% of spans before any downstream
+sampling. Its dimensions unlock specific features: `service.version` enables
+group-by-version, `http.response.status_code` and `rpc.grpc.status_code` enable error
+tracking, and `db.system` / `db.namespace` / `db.operation.name` enable Dependencies and
+Database Monitoring.
+
+> Version floors: `aggregation_cardinality_limit` on span metrics needs collector
+> v0.130.0 or later; the Prometheus pull reader used for internal telemetry needs v0.123
+> or later.
+
+### Host correlation
+
+`resourcedetection` adds `host.name` to every signal, including app spans arriving over
+OTLP. Matching `host.name` on both spans and host metrics is what lets Coralogix tie a
+service to the host it runs on, and it gives each host's span metrics a distinct resource
+so multi-host aggregation adds up instead of overwriting.
+
+Neither config inserts a hard-coded `service.name` — on a multi-app host that would stamp
+one app's name onto every shared signal. Per-app `service.name` arrives from each app's
+`OTEL_SERVICE_NAME` (Part 3); signals without one fall back to the exporter's
+`subsystem_name`.
+
+> ⚠️ **`host.cpu.*` and SMBIOS.** `SimpleWebApp/coralogix/config.yaml` enables six
+> `host.cpu.*` resource attributes. Reading them requires SMBIOS Type 4, which VirtualBox
+> and some cloud VMs do not expose; on collector v0.155.0 the mere presence of a
+> `host.cpu.*` key initialises the SMBIOS reader and crash-loops the collector
+> (`failed getting host cpuinfo: SMBIOS processor information not found`).
+> `deploy/config.supervisor.yaml` omits them for that reason. Real hardware is unaffected.
 
 ---
 
@@ -177,12 +206,10 @@ Register-OpenTelemetryForIIS
 
 `Register-OpenTelemetryForIIS` restarts IIS by default. Use `-NoReset` to skip the restart and recycle later.
 
-> This maps to what happened on the call: import the module, install core, then register IIS. The early errors ("could not find path to OpenTelemetry") came from running the register step before the module and core files were in place.
-> 
 
 ### 2. ASP.NET Core app pools need "No Managed Code"
 
-For ASP.NET Core apps hosted in IIS, set the application pool's .NET CLR Version to "No Managed Code". If this is wrong, no telemetry is generated at all. .NET Framework apps do not need this. This is the practical difference behind the Framework versus Core confusion during the session.
+For ASP.NET Core apps hosted in IIS, set the application pool's .NET CLR Version to "No Managed Code". If this is wrong, no telemetry is generated at all. .NET Framework apps do not need this.
 
 ### 3. Point the apps at the collector and set a service name
 
@@ -238,7 +265,7 @@ There are three places to set these, in increasing order of scope.
 </configuration>
 ```
 
-**Per app, ASP.NET Framework.** Use `appSettings` in that app's `Web.config`, for example `<add key="OTEL_SERVICE_NAME" value="wallet-api" />`. If you do not set a service name, one is generated as `SiteName\VirtualDirectoryPath`, which is why some services showed up automatically during the session but were not named the way you want.
+**Per app, ASP.NET Framework.** Use `appSettings` in that app's `Web.config`, for example `<add key="OTEL_SERVICE_NAME" value="wallet-api" />`. If you do not set a service name, one is generated as `SiteName\VirtualDirectoryPath`. Services therefore appear in APM even with no configuration, under a name you did not choose — set it explicitly.
 
 **For all apps at once (host-wide).** Set the variables on the `W3SVC` and `WAS` Windows services in the registry. `Register-OpenTelemetryForIIS` already writes the profiler variables here, so you append the OTLP settings to the same multi-string value.
 
@@ -268,7 +295,7 @@ After changing config, recycle so the workers pick up the new environment.
 # Full IIS restart
 iisreset.exe
 
-# Or target the W3SVC service (stop, restart, start, as done on the call)
+# Or target the W3SVC service directly
 Stop-Service -Name W3SVC -Force
 Restart-Service -Name W3SVC
 Start-Service -Name W3SVC
@@ -303,7 +330,7 @@ blocks IIS start (see the note above).
 
 ## Part 4: Configuring shared IIS application pools
 
-The recurring question on the call was how to set the OTLP variables once for many apps instead of editing every `web.config`. IIS lets you set environment variables at the application pool level, and every app assigned to that pool inherits them. This is the practical set-once answer for pools that several apps share.
+To set the OTLP variables once for many apps instead of editing every `web.config`: IIS lets you set environment variables at the application pool level, and every app assigned to that pool inherits them. This is the set-once answer for pools that several apps share.
 
 ### Where the variables can live, and what wins
 
@@ -319,10 +346,8 @@ There are four levels, from broadest to most specific. A more specific level ove
 For OpenTelemetry specifically, a pool-level variable takes precedence over the host-wide W3SVC registration. The clean pattern is to put the shared values (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL`, and shared resource attributes such as `deployment.environment`) at the pool-defaults or pool level, and keep only `OTEL_SERVICE_NAME` per app when a pool hosts more than one service.
 
 > ⚠️ Inheritance rule: if a pool defines its own `<environmentVariables>` collection, it does NOT inherit anything from `<applicationPoolDefaults>`. Every variable that pool needs must be listed on the pool itself. Defaults only reach pools that have no `<environmentVariables>` of their own.
-> 
 
 > Requirement: per-pool environment variables need IIS 10.0 (Windows Server 2016 or Windows 10) or later. On older IIS, use the host-wide W3SVC and WAS registry approach from Part 3, or run the pool under a dedicated identity whose user environment carries the variables.
-> 
 
 ### Option A: Set defaults for all pools
 
@@ -413,9 +438,9 @@ Restart-WebAppPool -Name "SharedAppPool"
 
 ## Part 5: Rolling this out across the fleet
 
-The session tested this on a small group of servers first, which is the right approach: prove it on a handful, then automate. Two options for scale:
+Pilot on a handful of servers first, then automate. Two options for scale:
 
-**Existing Windows tooling.** The customer uses BatchPatch to push agents and run PowerShell across many servers, the same way the New Relic and the reference agent agents were deployed. Both the collector installer and the auto-instrumentation steps are PowerShell, so they fit that model. Configuring IIS pool or registry variables can be scripted the same way.
+**Existing Windows tooling.** Both the collector installer and the auto-instrumentation steps are PowerShell, so any tool that pushes files and runs remote PowerShell across many servers (for example BatchPatch) can deploy them. Configuring IIS pool or registry variables scripts the same way.
 
 **Central configuration management.** Use Coralogix Fleet Management (the OpAMP Supervisor). Install the collector with `-Supervisor` and set `CORALOGIX_DOMAIN` as well as the key. In this mode the collector config is managed remotely and merged with a local base config. The config must not contain an `opamp` extension, because the supervisor owns that connection. This is the cleaner path when you have around 100 or more hosts to keep consistent.
 
@@ -427,7 +452,7 @@ $u='https://github.com/coralogix/telemetry-shippers/releases/latest/download/cor
 
 ## Troubleshooting
 
-**Spans arrive but the APM Service Catalog or span metrics stay empty.** This is the exact issue hit at the end of the session: trace data was visible under tracing, but APM metrics were not generating. Likely causes: the `service.name` contains dots or hyphens that need normalizing, or the span-metrics connector is not producing metrics. Confirm the `spanmetrics` connector is in the traces pipeline, check that spans carry `http.response.status_code` (semantic conventions 1.21 or later) for error tracking, and review the service naming. Give it a few minutes after a change, since span metrics flush on an interval.
+**Spans arrive but the APM Service Catalog or span metrics stay empty.** Traces are visible in the tracing view, but no APM metrics are generated. Likely causes: the `service.name` contains dots or hyphens that need normalizing, or the span-metrics connector is not producing metrics. Confirm the `spanmetrics` connector is in the traces pipeline, check that spans carry `http.response.status_code` (semantic conventions 1.21 or later) for error tracking, and review the service naming. Give it a few minutes after a change, since span metrics flush on an interval.
 
 **"Could not find path to OpenTelemetry" or the module is not found.** The register or install step ran before the module was imported or the core files were installed. Run the steps in order: download, `Import-Module`, `Install-OpenTelemetryCore`, then `Register-OpenTelemetryForIIS`.
 
@@ -445,7 +470,7 @@ $u='https://github.com/coralogix/telemetry-shippers/releases/latest/download/cor
 
 ## Choosing the right setup (template matrix)
 
-The goal from the session was a small set of repeatable templates keyed to what a box runs. This guide is the Windows / IIS / .NET case. The others for reference:
+Use a small set of repeatable templates keyed to what each host runs. This guide covers the Windows / IIS / .NET case. The others, for reference:
 
 | Scenario | What to use |
 | --- | --- |
@@ -453,277 +478,8 @@ The goal from the session was a small set of repeatable templates keyed to what 
 | Windows, standalone .NET service (EXE), no SDK | Collector + `Register-OpenTelemetryForWindowsService -WindowsServiceName <svc> -OTelServiceName <name>` |
 | App already has the OpenTelemetry SDK in code | Collector only; point the app at `localhost:4317` or `4318` |
 | Linux box (for example with Redis) | Separate Linux collector config with the matching receivers; not covered here |
-| Node.js front end | Node.js auto-instrumentation; a separate template, to be validated |
+| Node.js front end | Node.js auto-instrumentation; separate template, not covered here |
 
-Redis and similar components are optional add-ons rather than a baseline, so keep them as separate template fragments layered on the vanilla config only where that component actually runs.
+Component receivers (Redis, SQL Server, Elasticsearch and so on) are add-ons, not part of the baseline. Layer them as separate config fragments only on hosts that actually run that component.
 
----
 
-- Full example config (config.yaml)
-    
-    ```yaml
-    # This agent runs on each Windows host and exports OTLP to the GATEWAY. It does
-    # NOT talk to Coralogix directly; the gateway owns the Coralogix credentials.
-    #
-    # Fleet Management is a DEPLOYMENT mode (run under the OpAMP Supervisor), NOT a
-    # block in this file. Do not add an opamp extension here. See the note at the
-    # bottom of the file.
-    #
-    
-    # =============================================================================
-    
-    receivers:
-      otlp:
-        protocols:
-          grpc:
-            endpoint: "127.0.0.1:4317"
-          http:
-            endpoint: "127.0.0.1:4318"
-    
-      hostmetrics:
-        collection_interval: 30s
-        scrapers:
-          cpu: {}
-          memory: {}
-          disk: {}
-          filesystem: {}
-          network: {}
-          paging: {}
-          # The process scraper powers the Process tab of the Infrastructure
-          # Explorer host dashboard. Off by default upstream; enable it here.
-          # Errors for processes the service cannot read are muted to avoid noise.
-          process:
-            mute_process_name_error: true
-            mute_process_exe_error: true
-            mute_process_io_error: true
-    
-      windowsperfcounters:
-        collection_interval: 30s
-        metrics:
-          iis.request.rate:
-            description: "Total IIS method requests per second"
-            unit: "{request}/s"
-            gauge: {}
-          iis.connection.current:
-            description: "Current IIS connections"
-            unit: "{connection}"
-            gauge: {}
-          aspnet.request.rate:
-            description: "ASP.NET requests per second"
-            unit: "{request}/s"
-            gauge: {}
-          aspnet.request.execution_time:
-            description: "ASP.NET request execution time"
-            unit: "ms"
-            gauge: {}
-          aspnet.queue.length:
-            description: "ASP.NET requests queued"
-            unit: "{request}"
-            gauge: {}
-          dotnet.clr.gc.time_percent:
-            description: "Percent of time spent in garbage collection"
-            unit: "%"
-            gauge: {}
-          dotnet.clr.exceptions.rate:
-            description: "CLR exceptions thrown per second"
-            unit: "{exception}/s"
-            gauge: {}
-          process.cpu.percent:
-            description: "Worker process processor time percent"
-            unit: "%"
-            gauge: {}
-          process.memory.private_bytes:
-            description: "Worker process private bytes"
-            unit: "By"
-            gauge: {}
-        perfcounters:
-          - object: "Web Service"
-            instances: ["_Total"]
-            counters:
-              - name: "Total Method Requests/sec"
-                metric: iis.request.rate
-              - name: "Current Connections"
-                metric: iis.connection.current
-          - object: "ASP.NET Applications"
-            instances: ["__Total__"]
-            counters:
-              - name: "Requests/Sec"
-                metric: aspnet.request.rate
-              - name: "Request Execution Time"
-                metric: aspnet.request.execution_time
-              - name: "Requests In Application Queue"
-                metric: aspnet.queue.length
-          - object: ".NET CLR Memory"
-            instances: ["_Global_"]
-            counters:
-              - name: "% Time in GC"
-                metric: dotnet.clr.gc.time_percent
-          - object: ".NET CLR Exceptions"
-            instances: ["_Global_"]
-            counters:
-              - name: "# of Exceps Thrown / sec"
-                metric: dotnet.clr.exceptions.rate
-          - object: "Process"
-            instances: ["w3wp"]   # add w3wp#1, w3wp#2... for multiple app pools
-            counters:
-              - name: "% Processor Time"
-                metric: process.cpu.percent
-              - name: "Private Bytes"
-                metric: process.memory.private_bytes
-    
-      windowseventlog/application:
-        channel: Application
-      windowseventlog/system:
-        channel: System
-    
-      filelog/iis:
-        include:
-          - 'C:\inetpub\logs\LogFiles\W3SVC*\*.log'
-        start_at: end
-        operators:
-          - type: filter
-            expr: 'body matches "^#"'   # drop W3C header/comment lines
-    
-    connectors:
-      # ---- APM: RED (Request, Error, Duration) span metrics --------------------
-      # Generated on the agent so they cover 100% of spans BEFORE any tail sampling
-      # downstream. This powers the APM Service Catalog and the latency / error /
-      # Apdex widgets. The extra dimensions unlock specific APM features:
-      #   service.version            -> "group by version"
-      #   http.response.status_code  -> error tracking (semantic conventions 1.21+)
-      #   db.system, db.namespace    -> Dependencies and Database Monitoring
-      # host.name (added by resourcedetection on the spans) keeps each host's
-      # metrics on a distinct resource so they aggregate instead of overwriting.
-      spanmetrics:
-        histogram:
-          explicit:
-            buckets: [100us, 1ms, 2ms, 6ms, 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
-        dimensions:
-          - name: service.version
-          - name: http.response.status_code
-          - name: db.system
-          - name: db.namespace
-        exemplars:
-          enabled: true
-        metrics_flush_interval: 60s
-        # Per-service per-metric cardinality cap. Requires collector v0.130.0+.
-        aggregation_cardinality_limit: 100000
-    
-    processors:
-      memory_limiter:
-        check_interval: 1s
-        limit_mib: 512
-        spike_limit_mib: 128
-    
-      # Adds host.name (and os.type, host.id, host.arch...) to EVERY signal,
-      # including the app spans arriving over OTLP. host.name on both spans and host
-      # metrics is what lets Coralogix correlate a service with its host (APM and
-      # Infrastructure Explorer), and it gives each host's span metrics a unique
-      # resource so multi-host aggregation works correctly.
-      resourcedetection/system:
-        detectors: ["system", "env"]
-        system:
-          hostname_sources: ["os"]
-        override: false
-    
-      # Only service.namespace is inserted (never a hard-coded service.name), so a
-      # multi-app host does not stamp one app's name onto shared signals. Per-app
-      # service.name arrives from each app's OTEL_SERVICE_NAME; signals without one
-      # fall back to the exporter's subsystem_name below.
-      resource:
-        attributes:
-          - key: service.namespace
-            value: "windows-iis"
-            action: insert
-    
-      batch:
-        send_batch_size: 1024
-        send_batch_max_size: 2048
-        timeout: 1s
-    
-    exporters:
-      # Ship directly to Coralogix (eu1). private_key is injected by the installer as an
-      # environment variable (CORALOGIX_PRIVATE_KEY) for the collector service.
-      coralogix:
-        domain: "eu1.coralogix.com"
-        private_key: "${env:CORALOGIX_PRIVATE_KEY}"
-        application_name: "iis-instrumentation-test"
-        # Neutral fallback subsystem for signals with no service.name (host/infra).
-        # Per-app telemetry keeps its own service.name -> subsystem via *_attributes.
-        subsystem_name: "windows"
-        timeout: 30s
-        sending_queue:
-          enabled: true
-          num_consumers: 10
-          queue_size: 5000
-        retry_on_failure:
-          enabled: true
-          initial_interval: 5s
-          max_interval: 30s
-          max_elapsed_time: 300s
-    
-    extensions:
-      health_check:
-        endpoint: "127.0.0.1:13133"
-      # Do NOT add the opamp extension here. With Fleet Management, the OpAMP
-      # Supervisor (a separate process) owns the OpAMP connection.
-    
-    service:
-      extensions: [health_check]
-      pipelines:
-        # Raw spans go to the gateway AND fork into the span-metrics connector.
-        traces:
-          receivers: [otlp]
-          processors: [memory_limiter, resourcedetection/system, resource, batch]
-          exporters: [spanmetrics, coralogix]
-        # RED metrics produced by the connector, forwarded to Coralogix.
-        metrics/spanmetrics:
-          receivers: [spanmetrics]
-          processors: [memory_limiter, batch]
-          exporters: [coralogix]
-        # Host, Windows, and application metrics.
-        metrics:
-          receivers: [otlp, hostmetrics, windowsperfcounters]
-          processors: [memory_limiter, resourcedetection/system, resource, batch]
-          exporters: [coralogix]
-        logs:
-          receivers: [otlp, windowseventlog/application, windowseventlog/system, filelog/iis]
-          processors: [memory_limiter, resourcedetection/system, resource, batch]
-          exporters: [coralogix]
-      telemetry:
-        logs:
-          level: info
-        metrics:
-          level: basic
-          # Collector v0.123+ removed `address`; expose internal metrics via a
-          # Prometheus pull reader instead (otelcol metrics on 127.0.0.1:8888).
-          readers:
-            - pull:
-                exporter:
-                  prometheus:
-                    host: "127.0.0.1"
-                    port: 8888
-    
-    # =============================================================================
-    # FLEET MANAGEMENT (OpAMP) - deployment note, not config in this file
-    # -----------------------------------------------------------------------------
-    # Fleet Management is enabled by running this collector UNDER the OpenTelemetry
-    # Supervisor, installed by the Coralogix Windows installer with -Supervisor:
-    #
-    #   $env:CORALOGIX_DOMAIN='eu2.coralogix.com'
-    #   $env:CORALOGIX_PRIVATE_KEY='<send-your-data-key>'
-    #   & .\coralogix-otel-collector.ps1 -Supervisor `
-    #       -SupervisorMsi 'C:\path\to\opampsupervisor.msi' `
-    #       -SupervisorCollectorBaseConfig 'C:\otel\config.yaml'   # this file
-    #
-    # The Supervisor config points at wss://opamp-server.<CORALOGIX_DOMAIN> with an
-    # Authorization Bearer key. Recommended mode is remote-only (Fleet Manager is
-    # the source of truth); this file then serves as the base config that is merged
-    # with the remote config. Either way, the collector config must NOT contain an
-    # opamp extension. The same applies if you Fleet-manage the gateway.
-    # =============================================================================
-    ```
-    
-
-> 📝 Session notes: The customer runs at very high volume and deliberately avoids Kubernetes and autoscalers. Telemetry into Coralogix APM must be OTLP. Some teams (for example the core API team) already emit OTLP from their own SDK; others rely on the agent-installed no-code instrumentation. During the call, installing the .NET auto-instrumentation started producing span data on the target host even before the environment variables were fully in place, because a service name is auto-generated when it is not set explicitly.
->

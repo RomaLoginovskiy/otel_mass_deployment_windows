@@ -21,14 +21,16 @@ flowchart LR
 
 | Path | What it is |
 | --- | --- |
-| `docs/iis-instrumentation.md` | **Start here.** Single-host runbook: install the collector, zero-code .NET/IIS instrumentation, shared app-pool config, troubleshooting, full reference `config.yaml`. |
+| `docs/iis-instrumentation.md` | **Start here.** Single-host runbook: install the collector, zero-code .NET/IIS instrumentation, shared app-pool config, troubleshooting. |
 | `docs/fleet-deployment.md` | Fleet-scale runbook: build a package, push with BatchPatch, Supervisor mode, workload detection → selector attributes, Fleet Management. |
+| `docs/iis-service-ownership.md` | Which resource-attribute keys populate Infrastructure Explorer **Service** ownership for an IIS host, and the value format. |
 | `deploy/` | The deployment package payload (see below). |
 | `Build-DeploymentPackage.ps1` | Zips `deploy/` into `coralogix-agent-deploy.zip`. |
 | `poc/` | VirtualBox harness to validate the package on a throwaway Windows Server 2025 VM before fleet rollout. |
 | `SimpleWebApp/` | A minimal ASP.NET Core 8 app (with a SQL Server call) used as an instrumentation target for testing. |
 | `scripts/` | Single-host / test helpers: `deploy-app.ps1` (build + zero-code instrument `SimpleWebApp` on IIS in one pass), `generate-load.ps1` (emit test traffic). See [`scripts/README.md`](scripts/README.md). |
-| `deploy-linux/` | **Linux** path: combined/default install at folder root; individual APP_TYPE-scoped install and per-role configs under [`deploy-linux/templates/`](deploy-linux/templates/README.md). |
+| `test/docker-win/` | Windows-container end-to-end test for the IIS Service-ownership path. |
+| `deploy-linux/` | **Linux** path: Supervisor install for database hosts, combined or `APP_TYPE`-scoped, with per-role remote configs under `deploy-linux/templates/`. See [`deploy-linux/README.md`](deploy-linux/README.md). |
 
 ## Two paths
 
@@ -85,9 +87,9 @@ For Linux DB servers (Redis, Valkey, PostgreSQL, Elasticsearch), follow
 Coralogix **OpAMP Supervisor + OTel Collector** so config is owned remotely by
 Fleet Management — same pattern as the Windows fleet path.
 
-Use root `deploy-linux/` files for combined/default installs. For individual
-roles, use [`deploy-linux/templates/install-supervisor-by-apptype.sh`](deploy-linux/templates/install-supervisor-by-apptype.sh)
-with matching per-role config; see [`deploy-linux/templates/README.md`](deploy-linux/templates/README.md).
+Use the root `deploy-linux/` files for combined installs. For one database role per host,
+use [`deploy-linux/templates/install-supervisor-by-apptype.sh`](deploy-linux/templates/install-supervisor-by-apptype.sh)
+with the matching per-role config from `deploy-linux/templates/`.
 
 ```bash
 # Run the combined/default installer with Fleet labels + DB credentials:
@@ -122,7 +124,7 @@ that folder's README.
 | `Resolve-IISServiceNames.ps1` | Per-app `OTEL_SERVICE_NAME` mapping + `web.config` read/write helpers (dot-sourced by the install + uninstall scripts). |
 | `Backup-Config.ps1` | Backup + manifest helper; snapshots every config the install mutates before it changes it. |
 | `config.supervisor.yaml` | Base config = reference `config.yaml` **minus the `opamp` extension** (the Supervisor owns that connection). |
-| `SendDataKey.txt` | Send-Your-Data key (baked in via `-KeyFile`, or supplied at deploy time). |
+| `SendDataKey.txt` | Send-Your-Data key, written into the package by `Build-DeploymentPackage.ps1 -KeyFile` (the repo carries only `SendDataKey.txt.example`), or supplied at deploy time. |
 
 ## POC (VirtualBox)
 
@@ -137,10 +139,6 @@ cd poc
 ..\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx.key
 .\Run-TestVM.ps1 -Action Deploy                # copy + expand + run deploy.bat
 ```
-
-Validated end-to-end on Windows Server 2025 (2026-07-14 and 2026-07-15): supervisor
-registered with Fleet Management, collector healthy, selector attributes published,
-IIS zero-code instrumentation configured.
 
 > **VM-only gotcha:** VirtualBox exposes no SMBIOS Type 4, so `resourcedetection`
 > `host.cpu.*` attributes crash-loop the collector. The base config drops them; a
