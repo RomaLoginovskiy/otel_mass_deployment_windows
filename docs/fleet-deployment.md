@@ -31,7 +31,7 @@ flowchart LR
   S -->|OTLP/HTTPS| CX["Coralogix"]
 ```
 
-Two ideas do the heavy lifting:
+Two mechanisms do the work:
 
 1. **Supervisor mode.** The collector runs under the OpAMP **Supervisor**, which
    holds the OpAMP connection to Coralogix. A local **base config**
@@ -68,11 +68,10 @@ Two ideas do the heavy lifting:
 | `Resolve-IISServiceNames.ps1` | Per-app service-name mapping + `web.config` read/write helpers |
 | `Backup-Config.ps1` | Backup + manifest helper; snapshots every config the install mutates |
 | `config.supervisor.yaml` | Base config = repo `config.yaml` **minus the opamp extension** |
-| `SendDataKey.txt` | Send-Your-Data key (or supply at deploy time — see below) |
+| `SendDataKey.txt` | Send-Your-Data key, written by `Build-DeploymentPackage.ps1 -KeyFile` (the repo carries only `SendDataKey.txt.example`). Or supply the key at deploy time — see below |
 
 `Build-DeploymentPackage.ps1` (repo root) zips these into
-`coralogix-agent-deploy.zip`. `batchpatch.zip` in the repo is the BatchPatch.exe
-tool itself — **not** this package.
+`coralogix-agent-deploy.zip`.
 
 ---
 
@@ -109,9 +108,6 @@ BatchPatch has no atomic "copy + run" object, so we ship one folder and one
    the row failed**. Per-host logs land next to the scripts:
    `install-agent.log`, `install-agent-status.json`, `detect-workloads.json`.
 5. Review the pilot, then widen to the full fleet.
-
-> The same model matches how New Relic / the reference agent agents were pushed — both the
-> collector install and the instrumentation are PowerShell.
 
 ## Step 3 — Assign remote config in Coralogix Fleet Management
 
@@ -166,8 +162,8 @@ with the service(s) it runs. Split across automation and (remote) config:
 - **Config — remote.** The `transform/iis_service_labels` processor lives in the **remote Fleet
   Management config**. It splits `${env:CX_IIS_SERVICES}` into an array and stamps **7 keys**
   onto the **logs-related pipelines only** (`logs` + `logs/resource_catalog`, the host entity
-  that drives ownership). The repo collector YAMLs +
-  [`iis-service-ownership.collector.yaml`](./iis-service-ownership.collector.yaml) are the
+  that drives ownership). The repo collector YAMLs
+  ([`deploy/config.supervisor.yaml`](../deploy/config.supervisor.yaml)) are the
   **reference source** to copy into the remote config — the automation does **not** push config,
   and the supervisor's base-stage → pull-remote → merge flow is unchanged.
 
@@ -249,142 +245,40 @@ Reminders from `iis-instrumentation.md`:
 
 ---
 
-## POC validation with VirtualBox (throwaway)
+## Pre-rollout validation (VirtualBox, optional)
 
-`poc/Run-TestVM.ps1` spins up a disposable Windows target to validate the package
-before fleet rollout. `vm_images/` holds a Windows Server 2025 **EVAL ISO**.
-
-**Fully scripted path (preferred — no interactive steps).** `-Action Unattended`
-drives Windows Setup from an answer file and installs Guest Additions automatically,
-so the whole cycle is hands-off and `VBoxManage guestcontrol` works afterwards:
+`poc/Run-TestVM.ps1` spins up a disposable Windows Server 2025 target to validate the
+package before touching real servers. Place a Windows Server 2025 evaluation ISO in
+`vm_images/` (gitignored). POC only — production targets are reached with BatchPatch.
 
 ```powershell
 cd poc
-.\Run-TestVM.ps1 -Action Unattended                 # auto Windows install + Guest Additions (~20-40 min)
-# WAIT for the guest to finish installing AND reach the desktop before continuing.
-# Guest Additions run level can read 3 while the guest is still in OOBE and the
-# guestcontrol EXEC service is NOT ready yet; a first-boot reboot settles it.
-# Poll with an EXIT-CODE check (a string match is unreliable - VBoxManage echoes the
-# command back inside its error text, so grepping the token gives false positives):
-#   do { $null = VBoxManage guestcontrol cx-fleet-test --username Administrator `
-#          --password 'Otel!Passw0rd2026' run --exe C:\Windows\System32\cmd.exe `
-#          --wait-stdout -- /c echo READY; Start-Sleep 15 } until ($LASTEXITCODE -eq 0)
+.\Run-TestVM.ps1 -Action Unattended                 # scripted Windows install + Guest Additions (~20-40 min)
 .\Run-TestVM.ps1 -Action Snapshot -SnapshotName baseline
 .\Run-TestVM.ps1 -Action Configure                  # enable IIS + WinRM/firewall in guest
 ..\Build-DeploymentPackage.ps1 -KeyFile C:\secrets\cx.key
-.\Run-TestVM.ps1 -Action Deploy                     # copyto + expand + run deploy.bat
-# reset and repeat (restore powers off first, then Start again):
+.\Run-TestVM.ps1 -Action Deploy                     # copy + expand + run deploy.bat
+
+# reset and repeat (Restore powers off first, so Start again after):
 .\Run-TestVM.ps1 -Action Restore -SnapshotName baseline
 .\Run-TestVM.ps1 -Action Start
 ```
 
-**Manual path (fallback).** If unattended install misbehaves, `-Action Create` then
-`-Action Start -Gui` lets you install Windows + Guest Additions by hand, then snapshot.
+> **Wait for the guest to reach the desktop before `Configure`.** Guest Additions can
+> report run level 3 while the guest is still in OOBE and the `guestcontrol` exec service
+> is not yet up; a first-boot reboot settles it. Poll on the **exit code** of a
+> `guestcontrol run … echo` command, not on a string match — `VBoxManage` echoes the
+> command back inside its own error text, so grepping for the token gives false positives.
 
-**Keyboard-injection fallback (no guestcontrol).** If Guest Additions never come up
-(older ISOs / GA install failures), the guest can't be driven by `guestcontrol`.
-`poc/Guest-PullDeploy.ps1` is pushed via `VBoxManage controlvm keyboardputstring`:
-the guest pulls `coralogix-agent-deploy.zip` from a host HTTP server and runs
-`deploy.bat`, exfiltrating logs through its IIS wwwroot.
+If Guest Additions never come up, `guestcontrol` cannot drive the guest. Fall back to
+`poc/Guest-PullDeploy.ps1`, pushed via `VBoxManage controlvm keyboardputstring`: the guest
+pulls the deploy zip from a host HTTP server and runs `deploy.bat` itself.
 
-This is POC-only; production targets are reached with BatchPatch, not VirtualBox.
-
-### POC run results (validated 2026-07-14)
-
-The package was validated end-to-end on a VirtualBox Windows Server 2025 guest
-(`cx-fleet-test`). Confirmed on the target:
-
-- `opampsupervisor` running and **registered with Coralogix Fleet Management**
-  over OpAMP (`Connected to the OpAMP server`, `ingress.eu1.coralogix.com`,
-  `accepts_remote_config: true`, effective config = the base merged).
-- `otelcol-contrib` running, health `127.0.0.1:13133` → **200 `Server available`**,
-  internal metrics on `:8888`.
-- Selector attributes published:
-  `cx.host.role=iis,workload.iis=true,workload.dotnet=true,workload.dotnet.version=4.8.09032`.
-- IIS zero-code instrumentation configured (`Register-OpenTelemetryForIIS` + pool
-  OTLP defaults + `iisreset`), `install-agent-status.json` → `result: success`.
-
-**Environment note on the push mechanism.** BatchPatch is a GUI app with no CLI, so
-in a headless POC it can't be driven programmatically. On the 2026-07-14 run Guest
-Additions had not installed, so the payload was pushed via
-**`VBoxManage controlvm keyboardputstring`** injection (guest pulls the zip from a
-host HTTP server and runs `deploy.bat` — see `poc/Guest-PullDeploy.ps1`). On the
-2026-07-15 re-run the **`-Action Unattended`** install brought Guest Additions up
-cleanly, so `guestcontrol` copy + run worked directly (`-Action Configure` /
-`-Action Deploy`). Either way, on a real fleet BatchPatch performs the same copy +
-remote-command step from its GUI; `poc/Deploy-FromHost.ps1` shows the WinRM
-equivalent for scripted pushes.
-
-### POC re-validation (2026-07-15, fresh VM from scratch)
-
-A brand-new `cx-fleet-test` VM was provisioned from the ISO via `-Action Unattended`
-and deployed end-to-end over `guestcontrol`. Confirmed:
-
-- Detection → `cx.host.role=iis,workload.iis=true,workload.dotnet=true,workload.dotnet.version=4.8.09032`.
-- `opampsupervisor` v0.155.0 running and **`Connected to the OpAMP server`** (Fleet
-  Management eu1); collector exported metric points + logs to the `coralogix` exporter.
-- IIS zero-code instrumentation configured (`Register-OpenTelemetryForIIS` + pool
-  OTLP defaults + `iisreset`), `deploy.bat` exit code 0.
-- The **base config runs healthy standalone** (`otelcol-contrib --config collector.yaml`
-  → health `127.0.0.1:13133` → 200, "Everything is ready") after the `host.cpu.*` fix.
-
-**Known POC limitation — collector crash-loop under a Fleet-Management remote config.**
-On this VM the collector crash-looped (`health` → 503) whenever a **remote config was
-assigned in Fleet Management**. Root cause: the assigned remote config re-introduces
-`resourcedetection/entity` with `host.cpu.*` attributes; collector v0.155.0 then reads
-**SMBIOS Type 4** (processor info), which VirtualBox does not expose, so the component
-fails to start (`failed getting host cpuinfo: SMBIOS processor information not found`)
-and the whole collector restarts in a loop. The OpAMP Supervisor merges the **remote
-config on top of the base**, so removing `host.cpu.*` from the base
-(`config.supervisor.yaml`) is **not** sufficient once a remote config re-adds them.
-This is **VM-only**: real fleet hardware exposes SMBIOS, so the same config runs fine
-in production. To exercise a Fleet-Management-managed agent on a SMBIOS-less VM, the
-**assigned remote config** must also omit `host.cpu.*` (or the `system` detector).
-
-### Fixes found during POC (already applied)
-
-1. **`deploy.bat` must use an absolute `-File` path.** With a relative path,
-   `$PSScriptRoot` is empty and `Install-Agent.ps1` throws at parameter binding
-   (`Join-Path : ... empty string`). Fixed: `deploy.bat` calls
-   `"%~dp0Install-Agent.ps1"` and `Install-Agent.ps1` falls back to
-   `$MyInvocation.MyCommand.Definition`.
-2. **`resourcedetection/entity` `host.cpu.*` require SMBIOS Type 4.** VirtualBox
-   (and some cloud VMs) don't expose it, so the system detector fails to start
-   (`failed getting host cpuinfo: SMBIOS processor information not found`) and
-   crash-loops the whole collector. On collector **v0.155.0**, merely *listing* a
-   `host.cpu.*` key — even `enabled: false` — initializes the SMBIOS reader and
-   triggers the fatal read, so *disabling* them (the original 2026-07-14 fix) is
-   **not** enough. Fixed in `config.supervisor.yaml`: the `host.cpu.*` keys are now
-   **removed entirely** (they are disabled by default; host.id/ip/mac/os.description
-   are retained). The sister `resourcedetection/env` detector lists no `host.cpu.*`
-   and never crashed — that confirmed the root cause. Verified: the base config now
-   runs healthy standalone on the VM (health 13133 → 200). NOTE: a Fleet-Management
-   **remote config** that re-adds `host.cpu.*` overrides the base and re-triggers the
-   crash on SMBIOS-less hosts — see the Known POC limitation above.
-3. **Updating an already-installed supervisor's base config.** Re-running the
-   vendor installer does **not** overwrite the supervisor's `collector.yaml`. To
-   change the base on an existing host, replace
-   `C:\Program Files\OpenTelemetry OpAMP Supervisor\collector.yaml`, clear
-   `C:\ProgramData\opampsupervisor\state\effective.yaml` +
-   `last_recv_remote_config.dat`, and restart `opampsupervisor` — or push the
-   change through Coralogix Fleet Management (the intended path).
-4. **`Run-TestVM.ps1` `Destroy`/`Restore` threw on an already-off VM.** `controlvm
-   poweroff` returns non-zero ("not currently running") and the `VBox` wrapper turned
-   that into a terminating error, so `Destroy` never reached `unregistervm`. Fixed:
-   a tolerant `VBoxSoft` helper swallows the poweroff exit code (under
-   `$ErrorActionPreference='Stop'` PS 5.1 also turns a native stderr write into a
-   terminating error even with `2>$null`, so the helper wraps the call in try/catch).
-5. **`Run-TestVM.ps1` `Configure`/`Deploy` guestcontrol calls dropped the `--`.**
-   PowerShell strips a bare `--` token (its end-of-parameters marker) before it
-   reaches `VBoxManage`, which then parsed `-NoProfile` as its own option and failed
-   (`Unknown option: -NoProfile`). Fixed: quote it as `'--'` and drop the redundant
-   leading `powershell` arg (args after `--` go straight to the `--exe` binary).
-6. **`Install-Agent.ps1` step 4 restarted a non-existent service.** In Supervisor
-   mode there is no `otelcol-contrib` *service* (the collector is a child of
-   `opampsupervisor`), so the "restart to apply `OTEL_RESOURCE_ATTRIBUTES`" step was
-   a no-op and the single immediate health probe reported a false `health=False`.
-   Fixed: restart `opampsupervisor` (fall back to `otelcol-contrib` for local mode)
-   and retry the health check for up to ~60 s.
+> **Known VM-only limitation.** A Fleet Management remote config that re-adds
+> `host.cpu.*` (or the `system` detector) crash-loops the collector on a host without
+> SMBIOS Type 4, which VirtualBox does not expose. The base config omits those keys, but
+> the remote config is merged **on top of** the base, so the assigned remote config must
+> omit them too. Real fleet hardware is unaffected.
 
 ---
 

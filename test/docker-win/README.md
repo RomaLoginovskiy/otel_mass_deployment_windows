@@ -33,8 +33,8 @@ values **aligned to the per-app `OTEL_SERVICE_NAME`**.
   ```powershell
   & 'C:\Program Files\Docker\Docker\DockerCli.exe' -SwitchWindowsEngine
   ```
-  > If this returns *"windows containers have been disabled for this installation"* (as on the
-  > dev box used to author this), re-run the Docker Desktop installer / enable Windows containers
+  > If this returns *"windows containers have been disabled for this installation"*,
+  > re-run the Docker Desktop installer / enable Windows containers
   > first, or use a Windows host/VM with them enabled. The base image is a multi-GB first pull.
 - Coralogix **send key** at `SimpleWebApp/coralogix/SendDataKey.txt` and **query key** at
   `querydata_key.txt` (both gitignored).
@@ -57,20 +57,10 @@ values **aligned to the per-app `OTEL_SERVICE_NAME`**.
 - **Infrastructure Explorer → Hosts → `<hostname>` → Ownership → Service** lists one item per IIS
   app (`shop`, `wallet`, `blog`, `Default Web Site`) — server-side, ~15 min.
 
-## Validation status — PASSED
+## Known limitations (container only)
 
-Ran here on 2026-07-23 (Windows containers enabled, Hyper-V isolation):
-
-- `[names] aligned: True` — `CX_IIS_SERVICES = Default Web Site,shop,wallet,blog` == the set of
-  per-app `OTEL_SERVICE_NAME`.
-- Collector healthy (`:13133` = 200), exporting to Coralogix eu1: `sent_log_records{coralogix}`
-  climbing + `{coralogix/resource_catalog}` (host entity), `send_failed` = 0.
-- **Coralogix host logs (`host.name = cx-owner-test.lan`) carry all 7 keys as 4-element arrays**
-  = `["Default Web Site","shop","wallet","blog"]` (`service`, `tags.{service,cx_svc,CX_SERVICE_NAME}`,
-  `cx.infra.labels.{service,cx_svc,CX_SERVICE_NAME}`), confirmed by DataPrime query.
-- Final Service-ownership (multi-item) resolves in Infrastructure Explorer server-side (~15 min).
-
-Two container-only notes (not product issues; the `cx-fleet-test` VM ran the true supervisor path):
-the vendor supervisor installer's GitHub MSI download fails in Server Core (so the collector is
-baked in and run directly — hybrid base config), and the `resourcedetection/region` cloud detectors
-time out (~13s) before the collector reaches ready.
+- The vendor supervisor installer's GitHub MSI download fails inside a minimal Server Core
+  container, so the collector binary is baked into the image and run directly against the
+  base config. Real hosts install the full supervisor.
+- The `resourcedetection/region` cloud detectors time out (~13s) before the collector
+  reaches ready.
